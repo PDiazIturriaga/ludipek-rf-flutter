@@ -840,7 +840,7 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Icon(Icons.account_circle_rounded, size: 80, color: isDark ? Colors.white : const Color(0xFF1D4ED8)),
+                Icon(Icons.pets_rounded, size: 80, color: isDark ? Colors.white : const Color(0xFF1D4ED8)),
                 const SizedBox(height: 16),
                 Text('INICIAR SESIÓN', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: isDark ? Colors.white : const Color(0xFF0F172A))),
                 const Text('LUDIPEK WMS', style: TextStyle(fontSize: 14, color: Colors.grey)),
@@ -5643,7 +5643,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             accountEmail: Text('Usuario: ${usuarioActivo?['usuario'] ?? '-'} | Rol: $rolUsuario'),
             currentAccountPicture: const CircleAvatar(
               backgroundColor: Color(0xFF1D4ED8),
-              child: Icon(Icons.person, color: Colors.white, size: 40),
+              child: Icon(Icons.pets_rounded, color: Colors.white, size: 38), // <-- Patita de gato
             ),
           ),
           ListTile(
@@ -5702,6 +5702,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               setState(() { _tabActual = 5; _mostrarMenuCentral = false; });
               Navigator.pop(context);
               _cargarOVsPendientes();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.track_changes_rounded, color: Color(0xFF6D28D9)),
+            title: const Text('Cíclico Dirigido por SKU', style: TextStyle(color: Color(0xFF6D28D9), fontWeight: FontWeight.bold)),
+            onTap: () {
+              setState(() { _tabActual = 7; _mostrarMenuCentral = false; });
+              Navigator.pop(context);
             },
           ),
           ListTile(
