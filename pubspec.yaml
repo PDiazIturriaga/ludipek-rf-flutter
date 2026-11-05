@@ -32,8 +32,6 @@ flutter_launcher_icons:
 flutter:
   uses-material-design: true
 
+ # Borra los nombres de archivos específicos y déjalo así:
   assets:
-    - assets/logo.png
-    - assets/gato.gif
-    - assets/icono_app.png
-    - assets/icono_app.png
+    - assets/
