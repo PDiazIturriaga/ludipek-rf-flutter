@@ -1,11 +1,11 @@
 {
-    "name": "ludipek_wms_rf",
-    "short_name": "ludipek_wms_rf",
+    "name": "Ludipek WMS RF",
+    "short_name": "Ludipek WMS",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#0F172A",
+    "theme_color": "#0F172A",
+    "description": "Sistema de Gestión de Bodega y Terminal RF - Ludipek",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
