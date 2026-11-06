@@ -2182,10 +2182,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                               );
 
                               if (ovMap['id'] != null) {
-                                await supabase.from('netsuite_ordenes_venta').update({
-                                  'estado': 'EMPACADO',
-                                }).eq('id', ovMap['id']);
+                              try {
+                                await supabase.from('netsuite_ordenes_venta').update({'estado_ns': 'EMPACADO'}).eq('id', ovMap['id']);
+                              } catch (_) {
+                                try {
+                                  await supabase.from('netsuite_ordenes_venta').update({'estado': 'EMPACADO'}).eq('id', ovMap['id']);
+                                } catch (_) {}
                               }
+                            }
 
                               // Guardar el Packing List en Supabase para que aparezca en la Torre de Control
                               final detalleParaTorre = _lineasOvFarmacia.map((l) {
@@ -3305,7 +3309,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   Future<void> _cargarAsnsActivos() async {
     try {
-      final res = await supabase.from('asn_cabecera').select().order('id', ascending: false).limit(25);
+      final res = await supabase.from('asn_cabecera').select().neq('estado', 'COMPLETADO').order('id', ascending: false).limit(25);
       setState(() {
         _asnsCabecera = List<Map<String, dynamic>>.from(res);
       });
@@ -3447,7 +3451,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
 
     final loteBase = _txtLote.text.trim().isEmpty ? 'S/L' : _txtLote.text.trim().toUpperCase();
-    final loteFinal = _estadoCalidad == 'LIBERADO' ? loteBase : '$loteBase-${_estadoCalidad.substring(0, 4)}';
+    final loteFinal = _estadoCalidad == 'LIBERADO' ? loteBase : '$loteBase|QA:$_estadoCalidad';
     final vencStr = normalizarFechaSql(_txtVencimiento.text);
     final descActiva = (_infoMedidasActiva['descripcion'] ?? 'INGRESO DIRECTO').toString().toUpperCase();
 
