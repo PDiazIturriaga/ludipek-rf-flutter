@@ -2849,8 +2849,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   void _onChangedBusquedaSkuCiclico(String valor) {
     _debounceSku?.cancel();
-    _debounceSku = Timer(const Duration(milliseconds: 200), () {
+    _debounceSku = Timer(const Duration(milliseconds: 250), () {
       _buscarSugerenciasSku(valor, esRecepcion: false);
+      _sincronizarSkuCiclicoConMaestra(fijarSkuEnCampo: false);
     });
   }
 
@@ -2965,50 +2966,65 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
-  Future<Map<String, dynamic>> _resolverSkuDesdeCodigoOGtin(String rawVal) async {
+  Future< Map<String, dynamic> > _resolverSkuDesdeCodigoOGtin(String rawVal) async {
     final limpio = rawVal.trim().toUpperCase();
     if (limpio.isEmpty) {
       return {'encontrado': false};
     }
 
+    // Generar variantes con y sin ceros a la izquierda (EAN-13 / GTIN-14)
     final candidatos = <String>{limpio};
     if (RegExp(r'^\d+$').hasMatch(limpio)) {
       final sinCeros = limpio.replaceFirst(RegExp(r'^0+'), '');
-      if (sinCeros.isNotEmpty) candidatos.add(sinCeros);
+      if (sinCeros.isNotEmpty) {
+        candidatos.add(sinCeros);
+        candidatos.add(sinCeros.padLeft(13, '0'));
+        candidatos.add(sinCeros.padLeft(14, '0'));
+      }
     }
 
+    // 1. Cruce exacto o flexible por código de barras en maestra_sku
     for (final cand in candidatos) {
       try {
-        final resCb = await supabase.from('maestra_sku').select().eq('codigo_barras', cand).limit(1);
+        final resCb = await supabase
+            .from('maestra_sku')
+            .select()
+            .ilike('codigo_barras', '%$cand%')
+            .limit(1);
         if (resCb.isNotEmpty) return _empaquetarFilaMaestra(resCb.first);
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('Error buscando codigo_barras en maestra_sku: $e');
+      }
     }
 
-    for (final cand in candidatos) {
+    // 2. Cruce por código de SKU directo o sin sufijo NetSuite
+    final skuBase = limpio.split('-').first.trim();
+    for (final cand in {limpio, skuBase}) {
+      if (cand.isEmpty) continue;
       try {
-        final resSku = await supabase.from('maestra_sku').select().ilike('sku', cand).order('multiplo', ascending: false).limit(1);
+        final resSku = await supabase
+            .from('maestra_sku')
+            .select()
+            .ilike('sku', '$cand%')
+            .order('multiplo', ascending: false)
+            .limit(1);
         if (resSku.isNotEmpty) return _empaquetarFilaMaestra(resSku.first);
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('Error buscando sku en maestra_sku: $e');
+      }
     }
 
     return {
-      'sku': limpio, 'codigo_barras': '', 'multiplo': 1, 'unidad_medida': 'UNIDAD', 'descripcion': 'NO REGISTRADO EN MAESTRA SKU',
-      'peso_kg': 0.0, 'alto_cm': 0.0, 'ancho_cm': 0.0, 'largo_cm': 0.0, 'encontrado': false,
-    };
-  }
-
-  Map<String, dynamic> _empaquetarFilaMaestra(Map<String, dynamic> fila) {
-    return {
-      'sku': (fila['sku'] ?? '').toString().toUpperCase(),
-      'codigo_barras': (fila['codigo_barras'] ?? '').toString().toUpperCase(),
-      'multiplo': ((fila['multiplo'] as num?)?.toInt() ?? 1).clamp(1, 999999),
-      'unidad_medida': (fila['unidad_medida'] ?? 'UNIDAD').toString().toUpperCase(),
-      'descripcion': (fila['descripcion'] ?? 'ARTÍCULO EN MAESTRA').toString().toUpperCase(),
-      'peso_kg': (fila['peso_kg'] as num?)?.toDouble() ?? 0.0,
-      'alto_cm': (fila['alto_cm'] as num?)?.toDouble() ?? 0.0,
-      'ancho_cm': (fila['ancho_cm'] as num?)?.toDouble() ?? 0.0,
-      'largo_cm': (fila['largo_cm'] as num?)?.toDouble() ?? 0.0,
-      'encontrado': true,
+      'sku': limpio,
+      'codigo_barras': '',
+      'multiplo': 1,
+      'unidad_medida': 'UNIDAD',
+      'descripcion': 'NO REGISTRADO EN MAESTRA SKU',
+      'peso_kg': 0.0,
+      'alto_cm': 0.0,
+      'ancho_cm': 0.0,
+      'largo_cm': 0.0,
+      'encontrado': false,
     };
   }
 
@@ -3063,8 +3079,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
 
     final info = await _resolverSkuDesdeCodigoOGtin(rawCodigo);
+    final esEanNumerico = RegExp(r'^\d{8,14}$').hasMatch(rawCodigo);
+
     if (info['encontrado'] == true) {
-      if (fijarSkuEnCampo || (info['codigo_barras'].toString().isNotEmpty && rawCodigo == info['codigo_barras'])) {
+      if (fijarSkuEnCampo || esEanNumerico || rawCodigo == info['codigo_barras']) {
         _cicloSkuCtrl.text = info['sku'];
         _sugerenciasSkuCiclico = [];
       }
@@ -3086,22 +3104,30 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
 
     final info = await _resolverSkuDesdeCodigoOGtin(rawCodigo);
+    final esEanNumerico = RegExp(r'^\d{8,14}$').hasMatch(rawCodigo);
+
     if (info['encontrado'] == true) {
-      if (fijarSkuEnCampo || (info['codigo_barras'].toString().isNotEmpty && rawCodigo == info['codigo_barras'])) {
+      if (fijarSkuEnCampo || esEanNumerico || rawCodigo == info['codigo_barras']) {
         _txtSkuDirecto.text = info['sku'];
         _sugerenciasSkuRecepcion = [];
       }
 
       _infoMedidasActiva = {
-        'peso_kg': info['peso_kg'], 'alto_cm': info['alto_cm'], 'ancho_cm': info['ancho_cm'],
-        'largo_cm': info['largo_cm'], 'unidad_medida': info['unidad_medida'], 'descripcion': info['descripcion'],
+        'peso_kg': info['peso_kg'],
+        'alto_cm': info['alto_cm'],
+        'ancho_cm': info['ancho_cm'],
+        'largo_cm': info['largo_cm'],
+        'unidad_medida': info['unidad_medida'],
+        'descripcion': info['descripcion'],
       };
 
       _txtMultiplo.text = info['multiplo'].toString();
       setState(() {
         _colorBordeSku = const Color(0xFF047857);
         _infoSkuTitulo = 'SKU ${info['sku']} (${info['unidad_medida']} x${info['multiplo']})';
-        _infoSkuSub = info['descripcion'].toString().length > 45 ? info['descripcion'].toString().substring(0, 45) : info['descripcion'].toString();
+        _infoSkuSub = info['descripcion'].toString().length > 45
+            ? info['descripcion'].toString().substring(0, 45)
+            : info['descripcion'].toString();
       });
 
       if (_asnActualId != null) {
@@ -3110,7 +3136,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _recalcularUnidadesEnVivo();
     } else {
       _infoMedidasActiva = {
-        'peso_kg': 0.0, 'alto_cm': 0.0, 'ancho_cm': 0.0, 'largo_cm': 0.0, 'unidad_medida': 'UNIDAD', 'descripcion': 'INGRESO DIRECTO',
+        'peso_kg': 0.0,
+        'alto_cm': 0.0,
+        'ancho_cm': 0.0,
+        'largo_cm': 0.0,
+        'unidad_medida': 'UNIDAD',
+        'descripcion': 'INGRESO DIRECTO',
       };
       setState(() {
         _colorBordeSku = const Color(0xFFD97706);
@@ -5198,7 +5229,29 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       ],
     );
   }
+  Future<void> _ejecutarBusquedaStockConCruceMaestra(String rawInput) async {
+    var q = _normalizarRackOCodigo(rawInput);
+    if (q.isEmpty) return;
 
+    // Si es un código de barras numérico (EAN/GTIN), cruzar primero con maestra_sku
+    if (RegExp(r'^\d{8,14}$').hasMatch(q)) {
+      final info = await _resolverSkuDesdeCodigoOGtin(q);
+      if (info['encontrado'] == true && info['sku'] != null) {
+        q = info['sku'].toString().toUpperCase();
+      }
+    }
+
+    setState(() => _txtScanConsulta.text = q);
+    try {
+      final res = await supabase
+          .from('bodega_inventario_ubicacion')
+          .select()
+          .or('codigo_ubicacion.ilike.%$q%,lpn.ilike.%$q%,sku.ilike.%$q%');
+      setState(() => _resultadosConsulta = List< Map<String, dynamic> >.from(res));
+    } catch (ex) {
+      _notificar('Error en consulta: $ex', color: const Color(0xFFDC2626));
+    }
+  }
   Widget _construirVistaConsulta() {
     return ListView(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 86),
@@ -5216,34 +5269,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                       controller: _txtScanConsulta,
                       textCapitalization: TextCapitalization.characters,
                       inputFormatters: [UpperCaseTextFormatter()],
-                      onSubmitted: (val) async {
-                        final q = _normalizarRackOCodigo(val);
-                        if (q.isEmpty) return;
-                        _txtScanConsulta.text = q;
-                        try {
-                          final res = await supabase.from('bodega_inventario_ubicacion').select().or('codigo_ubicacion.ilike.%$q%,lpn.ilike.%$q%,sku.ilike.%$q%');
-                          setState(() => _resultadosConsulta = List< Map<String, dynamic> >.from(res));
-                        } catch (ex) {
-                          _notificar('Error en consulta: $ex', color: const Color(0xFFDC2626));
-                        }
-                      },
+                      onSubmitted: (val) => _ejecutarBusquedaStockConCruceMaestra(val),
                       decoration: InputDecoration(
-                        labelText: 'LPN, SKU o Ubicación (Ej: A-01-02)',
+                        labelText: 'LPN, SKU, EAN o Ubicación (Ej: A-01-02)',
                         hintText: 'Ej: A-01-02',
                         prefixIcon: const Icon(Icons.search),
                         suffixIcon: IconButton(
                           icon: const Icon(Icons.qr_code_scanner, color: Color(0xFF1D4ED8)),
                           onPressed: () async {
-                            await _escanearParaCampo(_txtScanConsulta, 'Escanear Ubicación (A-01-02), LPN o SKU');
-                            final q = _normalizarRackOCodigo(_txtScanConsulta.text);
-                            if (q.isEmpty) return;
-                            setState(() => _txtScanConsulta.text = q);
-                            try {
-                              final res = await supabase.from('bodega_inventario_ubicacion').select().or('codigo_ubicacion.ilike.%$q%,lpn.ilike.%$q%,sku.ilike.%$q%');
-                              setState(() => _resultadosConsulta = List< Map<String, dynamic> >.from(res));
-                            } catch (ex) {
-                              _notificar('Error en consulta: $ex', color: const Color(0xFFDC2626));
-                            }
+                            await _escanearParaCampo(_txtScanConsulta, 'Escanear Ubicación (A-01-02), LPN, EAN o SKU');
+                            await _ejecutarBusquedaStockConCruceMaestra(_txtScanConsulta.text);
                           },
                         ),
                       ),
@@ -5252,17 +5287,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   const SizedBox(width: 6),
                   ElevatedButton(
                     style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), foregroundColor: Colors.white, minimumSize: const Size(0, 44)),
-                    onPressed: () async {
-                      final q = _normalizarRackOCodigo(_txtScanConsulta.text);
-                      if (q.isEmpty) return;
-                      setState(() => _txtScanConsulta.text = q);
-                      try {
-                        final res = await supabase.from('bodega_inventario_ubicacion').select().or('codigo_ubicacion.ilike.%$q%,lpn.ilike.%$q%,sku.ilike.%$q%');
-                        setState(() => _resultadosConsulta = List< Map<String, dynamic> >.from(res));
-                      } catch (ex) {
-                        _notificar('Error en consulta: $ex', color: const Color(0xFFDC2626));
-                      }
-                    },
+                    onPressed: () => _ejecutarBusquedaStockConCruceMaestra(_txtScanConsulta.text),
                     child: const Text('Buscar'),
                   ),
                 ],
@@ -6043,7 +6068,10 @@ class _DialogoEscanerVivo extends StatefulWidget {
 }
 
 class _DialogoEscanerVivoState extends State<_DialogoEscanerVivo> {
-  final MobileScannerController _controller = MobileScannerController(detectionSpeed: DetectionSpeed.noDuplicates, facing: CameraFacing.back);
+  final MobileScannerController _controller = MobileScannerController(
+    detectionSpeed: DetectionSpeed.normal, // <-- Cambiar a normal para Web
+    facing: CameraFacing.back,
+  );
   bool _detectado = false;
 
   @override

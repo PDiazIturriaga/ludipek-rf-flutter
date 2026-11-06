@@ -29,9 +29,13 @@
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>ludipek_wms_rf</title>
+  <title>LUDIPEK WMS</title>
   <link rel="manifest" href="manifest.json">
 </head>
+<!-- Motor ZXing obligatorio para que mobile_scanner lea códigos 1D/EAN/GS1 en Flutter Web -->
+  <script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js" type="application/javascript"></script>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
 <body>
   <!--
     You can customize the "flutter_bootstrap.js" script.
