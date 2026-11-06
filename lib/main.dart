@@ -2966,13 +2966,27 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
+  Map<String, dynamic> _empaquetarFilaMaestra(Map<String, dynamic> fila) {
+    return {
+      'sku': (fila['sku'] ?? '').toString().toUpperCase(),
+      'codigo_barras': (fila['codigo_barras'] ?? '').toString().toUpperCase(),
+      'multiplo': ((fila['multiplo'] as num?)?.toInt() ?? 1).clamp(1, 999999),
+      'unidad_medida': (fila['unidad_medida'] ?? 'UNIDAD').toString().toUpperCase(),
+      'descripcion': (fila['descripcion'] ?? 'ARTÍCULO EN MAESTRA').toString().toUpperCase(),
+      'peso_kg': (fila['peso_kg'] as num?)?.toDouble() ?? 0.0,
+      'alto_cm': (fila['alto_cm'] as num?)?.toDouble() ?? 0.0,
+      'ancho_cm': (fila['ancho_cm'] as num?)?.toDouble() ?? 0.0,
+      'largo_cm': (fila['largo_cm'] as num?)?.toDouble() ?? 0.0,
+      'encontrado': true,
+    };
+  }
+
   Future< Map<String, dynamic> > _resolverSkuDesdeCodigoOGtin(String rawVal) async {
     final limpio = rawVal.trim().toUpperCase();
     if (limpio.isEmpty) {
       return {'encontrado': false};
     }
 
-    // Generar variantes con y sin ceros a la izquierda (EAN-13 / GTIN-14)
     final candidatos = <String>{limpio};
     if (RegExp(r'^\d+$').hasMatch(limpio)) {
       final sinCeros = limpio.replaceFirst(RegExp(r'^0+'), '');
@@ -2983,7 +2997,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
     }
 
-    // 1. Cruce exacto o flexible por código de barras en maestra_sku
     for (final cand in candidatos) {
       try {
         final resCb = await supabase
@@ -2992,12 +3005,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             .ilike('codigo_barras', '%$cand%')
             .limit(1);
         if (resCb.isNotEmpty) return _empaquetarFilaMaestra(resCb.first);
-      } catch (e) {
-        debugPrint('Error buscando codigo_barras en maestra_sku: $e');
-      }
+      } catch (_) {}
     }
 
-    // 2. Cruce por código de SKU directo o sin sufijo NetSuite
     final skuBase = limpio.split('-').first.trim();
     for (final cand in {limpio, skuBase}) {
       if (cand.isEmpty) continue;
@@ -3009,9 +3019,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             .order('multiplo', ascending: false)
             .limit(1);
         if (resSku.isNotEmpty) return _empaquetarFilaMaestra(resSku.first);
-      } catch (e) {
-        debugPrint('Error buscando sku en maestra_sku: $e');
-      }
+      } catch (_) {}
     }
 
     return {
@@ -3082,7 +3090,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final esEanNumerico = RegExp(r'^\d{8,14}$').hasMatch(rawCodigo);
 
     if (info['encontrado'] == true) {
-      if (fijarSkuEnCampo || esEanNumerico || rawCodigo == info['codigo_barras']) {
+      if (fijarSkuEnCampo || esEanNumerico || (info['codigo_barras'].toString().isNotEmpty && rawCodigo == info['codigo_barras'])) {
         _cicloSkuCtrl.text = info['sku'];
         _sugerenciasSkuCiclico = [];
       }
@@ -3107,7 +3115,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final esEanNumerico = RegExp(r'^\d{8,14}$').hasMatch(rawCodigo);
 
     if (info['encontrado'] == true) {
-      if (fijarSkuEnCampo || esEanNumerico || rawCodigo == info['codigo_barras']) {
+      if (fijarSkuEnCampo || esEanNumerico || (info['codigo_barras'].toString().isNotEmpty && rawCodigo == info['codigo_barras'])) {
         _txtSkuDirecto.text = info['sku'];
         _sugerenciasSkuRecepcion = [];
       }
