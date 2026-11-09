@@ -805,7 +805,7 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
     setState(() => _isLoading = true);
 
     try {
-      final res = await supabase.from('wms_usuarios').select().eq('usuario', user).eq('password', pass).maybeSingle();
+      final res = await supabase.from('wms_usuarios').select().ilike('usuario', user).eq('password', pass).maybeSingle();
       
       if (res != null) {
         if (res['activo'] == true) {
