@@ -3951,15 +3951,47 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   DateTime _parsearFechaVencimientoFefo(String? fechaRaw) {
-    final norm = normalizarFechaSql(fechaRaw);
-    if (norm == null || norm.isEmpty || norm == 'S/F') {
+    if (fechaRaw == null || fechaRaw.trim().isEmpty || fechaRaw == 'S/F') {
       return DateTime(2099, 12, 31);
     }
-    try {
-      return DateFormat('dd/MM/yyyy').parseStrict(norm);
-    } catch (_) {
-      return DateTime(2099, 12, 31);
+    
+    // Intentar normalizar primero usando la función global
+    final norm = normalizarFechaSql(fechaRaw) ?? fechaRaw.trim();
+    
+    // Intentar formato DD/MM/YYYY o DD-MM-YYYY
+    final partes = norm.split(RegExp(r'[\/\-]'));
+    if (partes.length == 3) {
+      final p1 = int.tryParse(partes[0]) ?? 0;
+      final p2 = int.tryParse(partes[1]) ?? 0;
+      final p3 = int.tryParse(partes[2]) ?? 0;
+      
+      // Detectar si viene en formato YYYY-MM-DD o DD-MM-YYYY
+      if (partes[0].length == 4) {
+        final anio = p1;
+        final mes = p2;
+        final dia = p3;
+        if (anio > 2000 && mes >= 1 && mes <= 12 && dia >= 1 && dia <= 31) {
+          return DateTime(anio, mes, dia);
+        }
+      } else {
+        final dia = p1;
+        final mes = p2;
+        int anio = p3;
+        if (anio < 100) anio += 2000; // Por si viene en formato YY (ej: 28 -> 2028)
+        if (anio > 2000 && mes >= 1 && mes <= 12 && dia >= 1 && dia <= 31) {
+          return DateTime(anio, mes, dia);
+        }
+      }
     }
+
+    // Respaldo con DateFormat estricto
+    for (final fmt in [DateFormat('dd/MM/yyyy'), DateFormat('dd-MM-yyyy'), DateFormat('yyyy-MM-dd')]) {
+      try {
+        return fmt.parseStrict(norm);
+      } catch (_) {}
+    }
+
+    return DateTime(2099, 12, 31);
   }
 
   Future<void> _buscarUbicacionesFefoPorSku({String? skuForzado}) async {
@@ -3975,7 +4007,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     });
 
     try {
-      // Resolver si escaneó un EAN en vez del SKU directo
       final infoSku = await _resolverSkuDesdeCodigoOGtin(skuBuscar);
       if (infoSku['encontrado'] == true && infoSku['sku'] != null) {
         skuBuscar = infoSku['sku'].toString().toUpperCase();
@@ -3987,8 +4018,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .select()
           .eq('sku', skuBuscar);
 
-      // Filtrar ubicaciones válidas con stock positivo y que no sean MERMA ni ZONA-PICKING
-      final disponibles = List<Map<String, dynamic>>.from(res).where((r) {
+      final disponibles = List>.from(res).where((r) {
         final ubi = (r['codigo_ubicacion'] ?? '').toString().toUpperCase();
         final unid = (r['cantidad_unidades'] as num?)?.toInt() ?? 0;
         final cajas = (r['cajas'] as num?)?.toInt() ?? 0;
@@ -4005,11 +4035,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         return;
       }
 
-      // Ordenar estrictamente por FEFO (Fecha de vencimiento más próxima primero)
+      // ORDENAMIENTO FEFO ESTRICTO: Compara directamente los objetos DateTime (el menor, es decir, el más cercano a hoy, queda primero)
       disponibles.sort((a, b) {
         final dtA = _parsearFechaVencimientoFefo(a['fecha_vencimiento_cl']?.toString());
         final dtB = _parsearFechaVencimientoFefo(b['fecha_vencimiento_cl']?.toString());
-        final cmp = dtA.compareTo(dtB);
+        int cmp = dtA.compareTo(dtB);
         if (cmp != 0) return cmp;
         return (a['codigo_ubicacion'] ?? '').toString().compareTo((b['codigo_ubicacion'] ?? '').toString());
       });
