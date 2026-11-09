@@ -4018,7 +4018,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .select()
           .eq('sku', skuBuscar);
 
-      _ubicacionesFefoPicking = List>.from(disponibles);
+      final disponibles = (res as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .where((r) {
         final ubi = (r['codigo_ubicacion'] ?? '').toString().toUpperCase();
         final unid = (r['cantidad_unidades'] as num?)?.toInt() ?? 0;
         final cajas = (r['cajas'] as num?)?.toInt() ?? 0;
@@ -4035,7 +4037,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         return;
       }
 
-      // ORDENAMIENTO FEFO ESTRICTO: Compara directamente los objetos DateTime (el menor, es decir, el más cercano a hoy, queda primero)
       disponibles.sort((a, b) {
         final dtA = _parsearFechaVencimientoFefo(a['fecha_vencimiento_cl']?.toString());
         final dtB = _parsearFechaVencimientoFefo(b['fecha_vencimiento_cl']?.toString());
