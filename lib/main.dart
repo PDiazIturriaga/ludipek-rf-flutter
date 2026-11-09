@@ -4018,7 +4018,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .select()
           .eq('sku', skuBuscar);
 
-      final disponibles = List.from(res).where((r) {
+      _ubicacionesFefoPicking = List>.from(disponibles);
         final ubi = (r['codigo_ubicacion'] ?? '').toString().toUpperCase();
         final unid = (r['cantidad_unidades'] as num?)?.toInt() ?? 0;
         final cajas = (r['cajas'] as num?)?.toInt() ?? 0;
