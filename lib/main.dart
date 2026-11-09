@@ -2260,17 +2260,17 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       // Filtramos de forma flexible: cualquier orden cuyo canal o cliente indique Farmacia/FA/Boehringer
       final filtradasFa = todas.where((ov) {
-        final canal = (ov['canal_venta'] ?? '').toString().toUpperCase();
-        final cliente = (ov['cliente_nombre'] ?? '').toString().toUpperCase();
-        final estado = (ov['estado'] ?? '').toString().toUpperCase();
-        final esFa = canal.contains('FA') ||
-            canal.contains('FARM') ||
-            cliente.contains('FARM') ||
-            cliente.contains('FA') ||
-            cliente.contains('BOEHRINGER') ||
-            canal.isEmpty;
-        return esFa && estado != 'DESPACHADO' && estado != 'ANULADO';
-      }).toList();
+      final numOv = (ov['numero_ov'] ?? '').toString().toUpperCase();
+      final canal = (ov['canal_venta'] ?? '').toString().toUpperCase();
+      final cliente = (ov['cliente_nombre'] ?? '').toString().toUpperCase();
+      final estado = (ov['estado_ns'] ?? ov['estado'] ?? '').toString().toUpperCase();
+      final esFa = numOv.contains('-FA') ||
+          canal.contains('FA') ||
+          canal.contains('FARM') ||
+          cliente.contains('FARM') ||
+          cliente.contains('BOEHRINGER');
+      return esFa && estado != 'DESPACHADO' && estado != 'ANULADO' && estado != 'EMPACADO';
+    }).toList();
 
       if (mounted) {
         setState(() {
