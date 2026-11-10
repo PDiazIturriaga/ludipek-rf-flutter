@@ -79,18 +79,13 @@ Map<String, dynamic>? usuarioActivo;
 String bodegaActiva = 'Bodega Santiago';
 final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.light);
 
-bool perteneceABodegaActiva(Map<String, dynamic> fila) {
-  final rawBod = (fila['bodega'] ?? fila['sucursal'] ?? fila['centro'] ?? '').toString().trim().toUpperCase();
-  final buscandoCcp = bodegaActiva.toUpperCase().contains('CONCEPCION');
-  if (rawBod.isEmpty) {
-    // Si una fila antigua no tiene columna bodega, se asume de Santiago
-    return !buscandoCcp;
+Future<Session?> asegurarSesionSupabase() async {
+  var sesion = supabase.auth.currentSession;
+  if (sesion == null) {
+    final res = await supabase.auth.signInAnonymously();
+    sesion = res.session;
   }
-  if (buscandoCcp) {
-    return rawBod.contains('CONCEPCION') || rawBod.contains('CONCEPCIÓN') || rawBod == 'CCP';
-  } else {
-    return rawBod.contains('SANTIAGO') || rawBod == 'STGO' || rawBod == 'SCL';
-  }
+  return sesion;
 }
 
 // =====================================================================
@@ -1070,21 +1065,33 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _vaciasConHallazgoRojo.clear();
     });
     try {
-      final resMaestra = await supabase.from('bodega_ubicaciones').select();
-      final listaMaestra = List>.from(resMaestra);
-      final todas = listaMaestra
-          .where((e) => perteneceABodegaActiva(e))
-          .map((e) => (e['codigo_ubicacion'] ?? '').toString().toUpperCase().trim())
-          .where((u) => u.isNotEmpty)
-          .toSet();
+      // 1. Traer solo las ubicaciones de la bodega activa ('Bodega Santiago' o 'Bodega Concepcion')
+      final resMaestra = await supabase
+          .from('bodega_ubicaciones')
+          .select('codigo_ubicacion')
+          .eq('bodega', bodegaActiva);
 
-      final resOcupadas = await supabase.from('bodega_inventario_ubicacion').select('codigo_ubicacion, bodega');
-      final listaOcupadas = List>.from(resOcupadas);
-      final ocupadas = listaOcupadas
-          .where((e) => perteneceABodegaActiva(e) || todas.contains((e['codigo_ubicacion'] ?? '').toString().toUpperCase().trim()))
-          .map((e) => (e['codigo_ubicacion'] ?? '').toString().toUpperCase().trim())
-          .where((u) => u.isNotEmpty)
-          .toSet();
+      final Set<String> todas = {};
+      for (final fila in resMaestra) {
+        final cod = (fila['codigo_ubicacion'] ?? '').toString().toUpperCase().trim();
+        if (cod.isNotEmpty) {
+          todas.add(cod);
+        }
+      }
+
+      // 2. Traer las ubicaciones actualmente ocupadas y cruzarlas con las de esta bodega
+      final resOcupadas = await supabase
+          .from('bodega_inventario_ubicacion')
+          .select('codigo_ubicacion, bodega');
+
+      final Set<String> ocupadas = {};
+      for (final fila in resOcupadas) {
+        final cod = (fila['codigo_ubicacion'] ?? '').toString().toUpperCase().trim();
+        final bodFila = (fila['bodega'] ?? '').toString().trim();
+        if (cod.isNotEmpty && (bodFila.isEmpty || bodFila == bodegaActiva)) {
+          ocupadas.add(cod);
+        }
+      }
 
       final vacias = todas.difference(ocupadas).toList();
       vacias.sort();
@@ -2644,15 +2651,22 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // ===================================================================
   Future<void> _cargarMaestraUbicaciones() async {
     try {
-      final res = await supabase.from('bodega_ubicaciones').select();
-      final lista = List>.from(res);
+      final res = await supabase
+          .from('bodega_ubicaciones')
+          .select('codigo_ubicacion')
+          .eq('bodega', bodegaActiva);
+
+      final List<String> lista = [];
+      for (final fila in res) {
+        final cod = (fila['codigo_ubicacion'] ?? '').toString().toUpperCase().trim();
+        if (cod.isNotEmpty) {
+          lista.add(cod);
+        }
+      }
+
       if (mounted) {
         setState(() {
-          _maestraUbicaciones = lista
-              .where((e) => perteneceABodegaActiva(e))
-              .map((e) => (e['codigo_ubicacion'] ?? '').toString().toUpperCase().trim())
-              .where((u) => u.isNotEmpty)
-              .toList();
+          _maestraUbicaciones = lista;
         });
       }
     } catch (e) {
@@ -5758,7 +5772,21 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     return Drawer(
       child: ListView(
-        Padding(
+        padding: EdgeInsets.zero,
+        children: [
+          UserAccountsDrawerHeader(
+            decoration: const BoxDecoration(color: Color(0xFF0F172A)),
+            accountName: Text(
+              nombreUsuario,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+            ),
+            accountEmail: Text('Usuario: ${usuarioActivo?['usuario'] ?? '-'} | $bodegaActiva'),
+            currentAccountPicture: const CircleAvatar(
+              backgroundColor: Color(0xFF1D4ED8),
+              child: Icon(Icons.pets_rounded, color: Colors.white, size: 38),
+            ),
+          ),
+          Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             child: DropdownButtonFormField<String>(
               value: bodegaActiva,
@@ -5768,8 +5796,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 isDense: true,
               ),
               items: const [
-                DropdownMenuItem(value: 'Bodega Santiago', child: Text('Bodega Santiago', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
-                DropdownMenuItem(value: 'Bodega Concepcion', child: Text('Bodega Concepcion', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
+                DropdownMenuItem(
+                  value: 'Bodega Santiago',
+                  child: Text('Bodega Santiago', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                ),
+                DropdownMenuItem(
+                  value: 'Bodega Concepcion',
+                  child: Text('Bodega Concepcion', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                ),
               ],
               onChanged: (nuevaBod) {
                 if (nuevaBod != null && nuevaBod != bodegaActiva) {
@@ -5782,6 +5816,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 }
               },
             ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.grid_view_rounded, color: Color(0xFF1D4ED8)),
+            title: const Text('Menú Principal', style: TextStyle(fontWeight: FontWeight.bold)),
+            onTap: () {
+              setState(() => _mostrarMenuCentral = true);
+              Navigator.pop(context);
+            },
           ),
           const Divider(),
           ListTile(
