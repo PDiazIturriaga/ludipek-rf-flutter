@@ -2302,50 +2302,40 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   // Carga TODAS las Órdenes de Venta de Farmacia sin quedarse pegado
-  Future<void> _cargarOVsPendientes() async {
+  Future _cargarOVsPendientes() async {
     setState(() {
       _cargandoOv = true;
       _ovSeleccionadaKey = 'SIN_OV';
       _lineasOvFarmacia = [];
     });
     try {
-      // Traemos las últimas 150 órdenes para no truncar pedidos activos
       final res = await supabase
           .from('netsuite_ordenes_venta')
           .select()
           .order('id', ascending: false)
           .limit(150);
 
-      final todas = List< Map<String, dynamic> >.from(res);
+      final List todas = res as List;
 
-      // Filtramos de forma flexible: cualquier orden cuyo canal o cliente indique Farmacia/FA/Boehringer
-      final filtradasFa = todas.where((ov) {
-        final numOv = (ov['numero_ov'] ?? '').toString().toUpperCase();
-        final canal = (ov['canal_venta'] ?? '').toString().toUpperCase();
-        final cliente = (ov['cliente_nombre'] ?? '').toString().toUpperCase();
+      // Mostrar todas las OVs Estándar, OTs a Concepción y OVs Farmacia que no estén despachadas ni anuladas
+      final List activas = todas.where((rawOv) {
+        final ov = Map.from(rawOv as Map);
         final estado = (ov['estado_ns'] ?? ov['estado'] ?? '').toString().toUpperCase();
-        final esValida = canal.contains('FA') ||
-            canal.contains('FARM') ||
-            canal.contains('TRASLADO') ||
-            numOv.startsWith('OT') ||
-            cliente.contains('CONCEPCION') ||
-            cliente.contains('FARM') ||
-            cliente.contains('BOEHRINGER') ||
-            canal.isEmpty;
-        return esValida && estado != 'DESPACHADO' && estado != 'ANULADO';
-      }).toList();
+        return estado != 'DESPACHADO' && estado != 'ANULADO' && estado != 'CERRADO';
+      }).map((rawOv) => Map<String, dynamic>.from(rawOv as Map)).toList();
 
       if (mounted) {
         setState(() {
-          _ovsCabecera = filtradasFa.isNotEmpty ? filtradasFa : todas;
+          _ovsCabecera = activas.cast>();
         });
       }
     } catch (e) {
-      _notificar('Error cargando OVs de NetSuite: $e', color: Colors.red);
+      _notificar('Error cargando OVs/OTs: $e', color: Colors.red);
     } finally {
       if (mounted) setState(() => _cargandoOv = false);
     }
   }
+    
 
   // Carga TODAS las líneas de la OV seleccionada sin descartar SKUs si no tienen marca 'FA' en maestra
   Future<void> _seleccionarOvFarmacia(String? key) async {
@@ -2478,18 +2468,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         final Map<String, int> agrupado = {};
 
         // A) Buscar en stock ubicado (bodega_inventario_ubicacion) incluyendo ubicación y orden FEFO
+        // A) Buscar en stock ubicado mostrando Rack + Lote + Vencimiento
         final resInv = await supabase
             .from('bodega_inventario_ubicacion')
             .select('codigo_ubicacion, lote, fecha_vencimiento_cl, cantidad_unidades')
             .ilike('sku', '%$skuRaiz%');
-        for (var r in resInv) {
-          final ubi = (r['codigo_ubicacion'] ?? '').toString().trim().toUpperCase();
+        for (var r in (resInv as List)) {
+          final ubi = (r['codigo_ubicacion'] ?? 'RACK').toString().trim().toUpperCase();
           if (ubi == 'ZONA-MERMA') continue;
           final l = (r['lote'] ?? 'S/L').toString().split('|QA:').first.trim().toUpperCase();
-          final v = normalizarFechaSql(r['fecha_vencimiento_cl']?.toString()) ?? 'S/F';
+          final v = (r['fecha_vencimiento_cl'] ?? '').toString().trim();
           final c = (r['cantidad_unidades'] as num?)?.toInt() ?? 0;
           if (c > 0) {
-            final key = '$l | Venc: $v | Ubi: $ubi';
+            final loteVenc = v.isNotEmpty ? '$l / $v' : l;
+            final key = '$loteVenc [Rack: $ubi]';
             agrupado[key] = (agrupado[key] ?? 0) + c;
           }
         }
