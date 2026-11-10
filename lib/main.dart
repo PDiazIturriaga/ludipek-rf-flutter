@@ -2320,17 +2320,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       // Filtramos de forma flexible: cualquier orden cuyo canal o cliente indique Farmacia/FA/Boehringer
       final filtradasFa = todas.where((ov) {
-      final numOv = (ov['numero_ov'] ?? '').toString().toUpperCase();
-      final canal = (ov['canal_venta'] ?? '').toString().toUpperCase();
-      final cliente = (ov['cliente_nombre'] ?? '').toString().toUpperCase();
-      final estado = (ov['estado_ns'] ?? ov['estado'] ?? '').toString().toUpperCase();
-      final esFa = numOv.contains('-FA') ||
-          canal.contains('FA') ||
-          canal.contains('FARM') ||
-          cliente.contains('FARM') ||
-          cliente.contains('BOEHRINGER');
-      return esFa && estado != 'DESPACHADO' && estado != 'ANULADO' && estado != 'EMPACADO';
-    }).toList();
+        final numOv = (ov['numero_ov'] ?? '').toString().toUpperCase();
+        final canal = (ov['canal_venta'] ?? '').toString().toUpperCase();
+        final cliente = (ov['cliente_nombre'] ?? '').toString().toUpperCase();
+        final estado = (ov['estado_ns'] ?? ov['estado'] ?? '').toString().toUpperCase();
+        final esValida = canal.contains('FA') ||
+            canal.contains('FARM') ||
+            canal.contains('TRASLADO') ||
+            numOv.startsWith('OT') ||
+            cliente.contains('CONCEPCION') ||
+            cliente.contains('FARM') ||
+            cliente.contains('BOEHRINGER') ||
+            canal.isEmpty;
+        return esValida && estado != 'DESPACHADO' && estado != 'ANULADO';
+      }).toList();
 
       if (mounted) {
         setState(() {
@@ -2474,17 +2477,19 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         final skuRaiz = linea['sku'].toString().split('-').first.trim();
         final Map<String, int> agrupado = {};
 
-        // A) Buscar en stock ubicado (bodega_inventario_ubicacion)
+        // A) Buscar en stock ubicado (bodega_inventario_ubicacion) incluyendo ubicación y orden FEFO
         final resInv = await supabase
             .from('bodega_inventario_ubicacion')
-            .select('lote, fecha_vencimiento_cl, cantidad_unidades')
+            .select('codigo_ubicacion, lote, fecha_vencimiento_cl, cantidad_unidades')
             .ilike('sku', '%$skuRaiz%');
         for (var r in resInv) {
+          final ubi = (r['codigo_ubicacion'] ?? '').toString().trim().toUpperCase();
+          if (ubi == 'ZONA-MERMA') continue;
           final l = (r['lote'] ?? 'S/L').toString().split('|QA:').first.trim().toUpperCase();
-          final v = (r['fecha_vencimiento_cl'] ?? '').toString().trim();
+          final v = normalizarFechaSql(r['fecha_vencimiento_cl']?.toString()) ?? 'S/F';
           final c = (r['cantidad_unidades'] as num?)?.toInt() ?? 0;
-          if (l.isNotEmpty && l != 'S/L') {
-            final key = v.isNotEmpty ? '$l / $v' : l;
+          if (c > 0) {
+            final key = '$l | Venc: $v | Ubi: $ubi';
             agrupado[key] = (agrupado[key] ?? 0) + c;
           }
         }
@@ -2645,6 +2650,786 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
     }
   }
+  // ===================================================================
+  // MÓDULO 8: AUDITORÍA DE PACKING Y CONSOLIDACIÓN EN LPN (EN PISO RF)
+  // ===================================================================
+  String _ovPackingAuditKey = 'SIN_OV';
+  List<dynamic> _lineasAuditoriaPacking = [];
+  final Map<String, Map<String, dynamic>> _lpnConsolidadoMapa = {};
+  final TextEditingController _txtLpnConsolidadoPack = TextEditingController();
+  final TextEditingController _txtScanAuditoriaPack = TextEditingController();
+  bool _cargandoAuditoriaPack = false;
+  bool _guardandoPackingLpn = false;
+
+  void _generarLpnConsolidadoAuto() {
+    final sufijo = DateFormat('yyMMdd-HHmmss').format(DateTime.now());
+    setState(() {
+      _txtLpnConsolidadoPack.text = 'LPN-PK-$sufijo';
+    });
+    _notificar('LPN Maestro generado: ${_txtLpnConsolidadoPack.text}', color: const Color(0xFF0F766E));
+  }
+
+  Future<void> _cargarOrdenParaAuditoriaPacking(String? key) async {
+    if (key == null) return;
+    setState(() {
+      _ovPackingAuditKey = key;
+      _lineasAuditoriaPacking = [];
+      _lpnConsolidadoMapa.clear();
+      _cargandoAuditoriaPack = true;
+    });
+
+    if (key == 'SIN_OV') {
+      setState(() => _cargandoAuditoriaPack = false);
+      return;
+    }
+
+    if (_txtLpnConsolidadoPack.text.trim().isEmpty) {
+      _generarLpnConsolidadoAuto();
+    }
+
+    try {
+      final idNum = int.tryParse(key) ?? 0;
+      final resDet = await supabase
+          .from('netsuite_detalle_ov')
+          .select()
+          .eq('orden_id', idNum);
+
+      final resMaestra = await supabase
+          .from('maestra_sku')
+          .select('sku, descripcion, multiplo, codigo_barras');
+
+      final List<dynamic> listaTemp = [];
+
+      for (final det in (resDet as List)) {
+        final skuOv = (det['sku'] ?? '').toString().trim().toUpperCase();
+        final skuLimpio = skuOv.split('-').first.trim();
+
+        final matchesM = (resMaestra as List).where((m) {
+          final sM = (m['sku'] ?? '').toString().trim().toUpperCase();
+          return sM == skuLimpio || skuLimpio.contains(sM);
+        }).toList();
+
+        String descProd = (det['descripcion'] ?? 'ARTÍCULO ($skuOv)').toString().toUpperCase();
+        int multEmpaque = 1;
+        final List<dynamic> barcodes = [];
+
+        if (matchesM.isNotEmpty) {
+          final m0 = matchesM.first;
+          if ((m0['descripcion'] ?? '').toString().trim().isNotEmpty) {
+            descProd = m0['descripcion'].toString().toUpperCase();
+          }
+          multEmpaque = (m0['multiplo'] as num?)?.toInt() ?? 1;
+          for (final m in matchesM) {
+            barcodes.add((m['codigo_barras'] ?? '').toString().toUpperCase());
+          }
+        }
+
+        final int solicitado = (det['cantidad_pedida'] as num?)?.toInt() ?? 0;
+        final int pickeadoPrevio = (det['cantidad_pickeada'] as num?)?.toInt() ?? 0;
+        final String rawLotes = (det['lotes_pickeados'] ?? '').toString().trim();
+
+        // Extraer lote y vencimiento si venían del picking
+        String loteInicial = 'S/L';
+        String vencInicial = '';
+        if (rawLotes.isNotEmpty) {
+          final primerBloque = rawLotes.split('|').first.split('(').first.trim();
+          if (primerBloque.contains('/')) {
+            final partes = primerBloque.split('/');
+            loteInicial = partes.first.trim().toUpperCase();
+            vencInicial = normalizarFechaSql(partes.last.trim()) ?? partes.last.trim();
+          } else {
+            loteInicial = primerBloque.toUpperCase();
+          }
+        }
+
+        final itemMap = <String, dynamic>{
+          'id_detalle': det['id'],
+          'sku': skuLimpio,
+          'descripcion': descProd,
+          'multiplo': multEmpaque < 1 ? 1 : multEmpaque,
+          'barcodes': barcodes,
+          'solicitado': solicitado,
+          'pickeado_rf': pickeadoPrevio,
+          'auditado_unid': pickeadoPrevio > 0 ? pickeadoPrevio : solicitado,
+          'lote_auditado': loteInicial,
+          'venc_auditado': vencInicial,
+          'consolidado_en_lpn': false,
+        };
+
+        listaTemp.add(itemMap);
+      }
+
+      if (mounted) {
+        setState(() {
+          _lineasAuditoriaPacking = listaTemp;
+        });
+      }
+    } catch (e) {
+      _notificar('Error cargando orden para Packing: $e', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _cargandoAuditoriaPack = false);
+    }
+  }
+
+  Future<void> _abrirModalAuditarLineaPacking(Map<String, dynamic> linea) async {
+    if (_txtLpnConsolidadoPack.text.trim().isEmpty) {
+      _generarLpnConsolidadoAuto();
+    }
+
+    final sku = linea['sku'].toString();
+    final int solicitado = linea['solicitado'] as int;
+    final int mult = (linea['multiplo'] as int?) ?? 1;
+
+    // Buscar lotes y vencimientos reales en inventario para ayudar al auditor
+    final List<String> sugerenciasLoteVenc = [];
+    try {
+      final resInv = await supabase
+          .from('bodega_inventario_ubicacion')
+          .select('lote, fecha_vencimiento_cl')
+          .ilike('sku', '%$sku%')
+          .limit(15);
+      for (final r in (resInv as List)) {
+        final l = (r['lote'] ?? 'S/L').toString().split('|QA:').first.trim().toUpperCase();
+        final v = normalizarFechaSql(r['fecha_vencimiento_cl']?.toString()) ?? 'S/F';
+        final comb = '$l | $v';
+        if (l != 'S/L' && !sugerenciasLoteVenc.contains(comb)) {
+          sugerenciasLoteVenc.add(comb);
+        }
+      }
+    } catch (_) {}
+
+    final txtUnid = TextEditingController(text: (linea['auditado_unid'] ?? solicitado).toString());
+    final txtLote = TextEditingController(text: (linea['lote_auditado'] ?? 'S/L').toString());
+    final txtVenc = TextEditingController(text: (linea['venc_auditado'] ?? '').toString());
+
+    if (!mounted) return;
+    final conf = await showDialog>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setStateModal) {
+          return AlertDialog(
+            title: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('AUDITAR Y CONSOLIDAR EN ${_txtLpnConsolidadoPack.text}', style: const TextStyle(fontSize: 11, color: Color(0xFF0F766E), fontWeight: FontWeight.bold)),
+                Text('$sku - ${linea['descripcion']}', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w900)),
+              ],
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(color: const Color(0xFFF0FDFA), borderRadius: BorderRadius.circular(6), border: Border.all(color: const Color(0xFF5EEAD4))),
+                    child: Text(
+                      'Solicitado OT/OV: $solicitado UN  |  Pickeado RF: ${linea['pickeado_rf']} UN',
+                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF115E59)),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: txtUnid,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: '1. Unidades Físicas Auditadas',
+                      prefixIcon: Icon(Icons.fact_check_outlined, color: Color(0xFF0F766E)),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  if (sugerenciasLoteVenc.isNotEmpty) ...[
+                    DropdownButtonFormField<String>(
+                      isExpanded: true,
+                      decoration: const InputDecoration(labelText: 'Sugerencia Lote / Venc. en Stock'),
+                      items: sugerenciasLoteVenc
+                          .map((s) => DropdownMenuItem(value: s, child: Text(s, style: const TextStyle(fontSize: 12))))
+                          .toList(),
+                      onChanged: (val) {
+                        if (val != null && val.contains('|')) {
+                          final p = val.split('|');
+                          setStateModal(() {
+                            txtLote.text = p.first.trim();
+                            txtVenc.text = p.last.trim() == 'S/F' ? '' : p.last.trim();
+                          });
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 10),
+                  ],
+                  TextField(
+                    controller: txtLote,
+                    textCapitalization: TextCapitalization.characters,
+                    inputFormatters: [UpperCaseTextFormatter()],
+                    decoration: const InputDecoration(
+                      labelText: '2. Lote Físico Auditado',
+                      prefixIcon: Icon(Icons.qr_code_2_rounded),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: txtVenc,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [FechaInputFormatter()],
+                    decoration: const InputDecoration(
+                      labelText: '3. Fecha Vencimiento (DD/MM/YYYY)',
+                      hintText: 'DD/MM/YYYY',
+                      prefixIcon: Icon(Icons.calendar_month_rounded),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, null),
+                child: const Text('Cancelar', style: TextStyle(color: Colors.red)),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
+                icon: const Icon(Icons.add_box_rounded),
+                label: const Text('METER AL LPN CONSOLIDADO'),
+                onPressed: () {
+                  final u = int.tryParse(txtUnid.text.trim()) ?? 0;
+                  final l = txtLote.text.trim().isEmpty ? 'S/L' : txtLote.text.trim().toUpperCase();
+                  final v = normalizarFechaSql(txtVenc.text.trim()) ?? 'S/F';
+                  if (u <= 0) return;
+                  Navigator.pop(ctx, {'unid': u, 'lote': l, 'venc': v});
+                },
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    if (conf == null) return;
+
+    final int unidAudit = conf['unid'] as int;
+    final String loteAudit = conf['lote'] as String;
+    final String vencAudit = conf['venc'] as String;
+    final int cajasEst = (unidAudit / (mult < 1 ? 1 : mult)).ceil();
+
+    setState(() {
+      linea['auditado_unid'] = unidAudit;
+      linea['lote_auditado'] = loteAudit;
+      linea['venc_auditado'] = vencAudit;
+      linea['consolidado_en_lpn'] = true;
+
+      _lpnConsolidadoMapa[sku] = {
+        'id_detalle': linea['id_detalle'],
+        'sku': sku,
+        'descripcion': linea['descripcion'],
+        'descripcion_pdf': linea['descripcion'],
+        'solicitado': solicitado,
+        'pickeado': unidAudit,
+        'unidades_totales': unidAudit,
+        'cajas': cajasEst < 1 ? 1 : cajasEst,
+        'multiplo_aplicado': mult,
+        'lote': loteAudit,
+        'fecha_vencimiento_cl': vencAudit == 'S/F' ? null : vencAudit,
+        'lotes_pickeados': <String, int>{'$loteAudit / $vencAudit': unidAudit},
+        'barcodes': (linea['barcodes'] as List).map((b) => {'codigo_barras': b}).toList(),
+      };
+    });
+
+    _notificar('$sku ($unidAudit UN | Lote: $loteAudit) consolidado dentro de ${_txtLpnConsolidadoPack.text}', color: const Color(0xFF047857));
+  }
+
+  Future<void> _procesarEscaneoAuditoriaPacking() async {
+    final scan = _txtScanAuditoriaPack.text.trim().toUpperCase();
+    if (scan.isEmpty) return;
+    _txtScanAuditoriaPack.clear();
+
+    if (_lineasAuditoriaPacking.isEmpty) {
+      _notificar('Seleccione primero una Orden (OT / OV) para auditar.', color: Colors.orange);
+      return;
+    }
+
+    int idx = _lineasAuditoriaPacking.indexWhere((el) {
+      final m = el as Map<String, dynamic>;
+      if (m['sku'] == scan) return true;
+      final List bList = m['barcodes'] ?? [];
+      return bList.contains(scan);
+    });
+
+    if (idx == -1) {
+      final info = await _resolverSkuDesdeCodigoOGtin(scan);
+      if (info['encontrado'] == true) {
+        final skuRes = info['sku'].toString().toUpperCase().split('-').first.trim();
+        idx = _lineasAuditoriaPacking.indexWhere((el) => (el as Map)['sku'] == skuRes);
+      }
+    }
+
+    if (idx != -1) {
+      final item = Map<String, dynamic>.from(_lineasAuditoriaPacking[idx] as Map);
+      await _abrirModalAuditarLineaPacking(_lineasAuditoriaPacking[idx] as Map<String, dynamic>);
+    } else {
+      _notificar('El código $scan no pertenece a esta Orden de Traslado / OV.', color: Colors.red);
+    }
+  }
+
+  Future<void> _cerrarPackingYConsolidarLpn({required bool soloEtiquetaLpn}) async {
+    if (_lpnConsolidadoMapa.isEmpty) {
+      _notificar('Aún no ha consolidado ningún artículo dentro del LPN.', color: Colors.orange);
+      return;
+    }
+
+    var lpnMaster = _txtLpnConsolidadoPack.text.trim().toUpperCase();
+    if (lpnMaster.isEmpty) {
+      _generarLpnConsolidadoAuto();
+      lpnMaster = _txtLpnConsolidadoPack.text.trim().toUpperCase();
+    }
+
+    final listaConsolidada = _lpnConsolidadoMapa.values.map((e) => Map<String, dynamic>.from(e)).toList();
+
+    if (soloEtiquetaLpn) {
+      await generarPdfRecepcion15x10(lpnMaster, listaConsolidada);
+      return;
+    }
+
+    setState(() => _guardandoPackingLpn = true);
+
+    try {
+      final ovMap = _ovsCabecera.firstWhere(
+        (ov) => ov['id'].toString() == _ovPackingAuditKey,
+        orElse: () => <String, dynamic>{
+          'id': int.tryParse(_ovPackingAuditKey),
+          'numero_ov': _ovPackingAuditKey,
+          'cliente_nombre': 'BODEGA CONCEPCION',
+        },
+      );
+      final String numOvStr = (ovMap['numero_ov'] ?? 'OT-CONCEPCION').toString().toUpperCase();
+      final String clienteStr = (ovMap['cliente_nombre'] ?? 'BODEGA CONCEPCION').toString().toUpperCase();
+      final String fechaIso = DateTime.now().toIso8601String();
+      final String auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'PACKING_RF').toString().toUpperCase();
+
+      // 1. Actualizar netsuite_detalle_ov con las unidades, lotes, vencimientos y el LPN consolidado
+      for (final item in listaConsolidada) {
+        final idDet = item['id_detalle'];
+        final int cantAudit = item['unidades_totales'] as int;
+        final String loteStr = item['lote'].toString();
+        final String vencStr = (item['fecha_vencimiento_cl'] ?? 'S/F').toString();
+        final String trazabilidadCompleta = '[$lpnMaster] $loteStr / $vencStr ($cantAudit UN)';
+
+        if (idDet != null) {
+          try {
+            await supabase.from('netsuite_detalle_ov').update({
+              'cantidad_pickeada': cantAudit,
+              'lotes_pickeados': trazabilidadCompleta,
+              'estado_linea': 'CONSOLIDADO_LPN',
+            }).eq('id', idDet);
+          } catch (_) {}
+        }
+      }
+
+      // 2. Actualizar estado de la Orden a EMPACADO
+      if (ovMap['id'] != null) {
+        try {
+          await supabase.from('netsuite_ordenes_venta').update({'estado_ns': 'EMPACADO'}).eq('id', ovMap['id']);
+        } catch (_) {}
+      }
+
+      // 3. Registrar el Packing List Consolidado en wms_packing_lists_fa
+      final detalleJsonTorre = listaConsolidada.map((item) => {
+        'lpn_consolidado': lpnMaster,
+        'sku': item['sku'],
+        'descripcion': item['descripcion'],
+        'solicitado': item['solicitado'],
+        'pickeado': item['unidades_totales'],
+        'lotes': '[$lpnMaster] ${item['lote']} / ${item['fecha_vencimiento_cl'] ?? 'S/F'} (${item['unidades_totales']} UN)',
+      }).toList();
+
+      try {
+        await supabase.from('wms_packing_lists_fa').insert({
+          'orden_id': ovMap['id'],
+          'numero_ov': '$numOvStr ($lpnMaster)',
+          'cliente_nombre': '$clienteStr | LPN: $lpnMaster',
+          'usuario_picking': auditorStr,
+          'detalle_json': detalleJsonTorre,
+          'fecha_emision': fechaIso,
+        });
+      } catch (_) {}
+
+      // 4. Registrar el LPN Consolidado en registro_recepcion para que Concepción pueda consultar o recepcionar el LPN completo
+      final filasRecepcionLpn = listaConsolidada.map((item) => {
+        'lpn': lpnMaster,
+        'sku': item['sku'],
+        'codigo_barras_escaneado': item['sku'],
+        'lote': item['lote'],
+        'fecha_vencimiento_cl': item['fecha_vencimiento_cl'],
+        'multiplo_aplicado': item['multiplo_aplicado'],
+        'cajas': item['cajas'],
+        'unidades_sueltas': 0,
+        'unidades_totales': item['unidades_totales'],
+        'contenedor': numOvStr,
+        'fecha_recepcion': fechaIso,
+      }).toList();
+
+      try {
+        await supabase.from('registro_recepcion').insert(filasRecepcionLpn);
+      } catch (_) {}
+
+      // 5. Emitir Etiqueta 15x10 del LPN Consolidado y Packing List PDF
+      await generarPdfRecepcion15x10(lpnMaster, listaConsolidada);
+      await generarPdfPackingListFA(
+        {
+          ...ovMap,
+          'numero_ov': '$numOvStr | LPN: $lpnMaster',
+          'cliente_nombre': clienteStr,
+        },
+        listaConsolidada,
+      );
+
+      _notificar('Packing auditado y consolidado en $lpnMaster exitosamente.', color: const Color(0xFF047857));
+    } catch (e) {
+      _notificar('Error cerrando consolidación de LPN: $e', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _guardandoPackingLpn = false);
+    }
+  }
+
+  Widget _construirVistaAuditoriaPackingLpn() {
+    final idsDisp = {'SIN_OV', ..._ovsCabecera.map((r) => r['id'].toString())};
+    final valSeguro = idsDisp.contains(_ovPackingAuditKey) ? _ovPackingAuditKey : 'SIN_OV';
+
+    final int totalSkusOrden = _lineasAuditoriaPacking.length;
+    final int totalSkusEnLpn = _lpnConsolidadoMapa.length;
+    final int totalUnidEnLpn = _lpnConsolidadoMapa.values.fold<int>(
+      0,
+      (s, e) => s + ((e['unidades_totales'] as int?) ?? 0),
+    );
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 86),
+      children: [
+        // PASO 1: ORDEN Y LPN DE CONSOLIDACIÓN
+        _TarjetaMovil(
+          borderColor: const Color(0xFF0D9488),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Expanded(
+                    child: Text(
+                      '1. AUDITORÍA DE PACKING Y CONSOLIDACIÓN LPN',
+                      style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: Color(0xFF0F766E)),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.sync, color: Color(0xFF0F766E)),
+                    onPressed: _cargarOVsPendientes,
+                  ),
+                ],
+              ),
+              const Text(
+                'Seleccione la Orden de Traslado (OT) u OV, asigne un LPN Maestro y audite Unidades, Lote y Vencimiento de cada artículo que entra al pallet/caja.',
+                style: TextStyle(fontSize: 11, color: Color(0xFF475569)),
+              ),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
+                value: valSeguro,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'Orden de Traslado (OT) / OV a Auditar',
+                  prefixIcon: Icon(Icons.local_shipping_outlined),
+                ),
+                items: [
+                  const DropdownMenuItem(value: 'SIN_OV', child: Text('SELECCIONE ORDEN (OT / OV)')),
+                  ..._ovsCabecera.map((r) => DropdownMenuItem(
+                        value: r['id'].toString(),
+                        child: Text(
+                          '${r['numero_ov']} | ${r['cliente_nombre'] ?? 'CONCEPCION'} (${r['estado_ns'] ?? r['estado'] ?? 'ACTIVA'})',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      )),
+                ],
+                onChanged: _cargarOrdenParaAuditoriaPacking,
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _txtLpnConsolidadoPack,
+                      textCapitalization: TextCapitalization.characters,
+                      inputFormatters: [UpperCaseTextFormatter()],
+                      decoration: InputDecoration(
+                        labelText: 'LPN Maestro Consolidado',
+                        prefixIcon: const Icon(Icons.qr_code_2_rounded, color: Color(0xFF0F766E)),
+                        suffixIcon: IconButton(
+                          tooltip: 'Escanear Etiqueta LPN',
+                          icon: const Icon(Icons.qr_code_scanner, color: Color(0xFF0F766E)),
+                          onPressed: () => _escanearParaCampo(_txtLpnConsolidadoPack, 'Escanear LPN de Consolidación'),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF0F172A),
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(0, 46),
+                    ),
+                    onPressed: _generarLpnConsolidadoAuto,
+                    icon: const Icon(Icons.autorenew_rounded, size: 18),
+                    label: const Text('AUTO LPN', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+
+        if (_cargandoAuditoriaPack)
+          const Padding(padding: EdgeInsets.all(24), child: Center(child: CircularProgressIndicator())),
+
+        if (!_cargandoAuditoriaPack && _lineasAuditoriaPacking.isNotEmpty) ...[
+          const SizedBox(height: 10),
+
+          // PASO 2: ESCANEO RÁPIDO Y VERIFICACIÓN DE LÍNEAS DE LA ORDEN
+          _TarjetaMovil(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('2. ESCANEAR O TOCAR ARTÍCULO PARA AUDITAR E INGRESAR AL LPN', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _txtScanAuditoriaPack,
+                        textCapitalization: TextCapitalization.characters,
+                        inputFormatters: [UpperCaseTextFormatter()],
+                        onSubmitted: (_) => _procesarEscaneoAuditoriaPacking(),
+                        decoration: const InputDecoration(
+                          labelText: 'Escanear SKU o EAN para Auditar',
+                          prefixIcon: Icon(Icons.barcode_reader, color: Color(0xFF0F766E)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF0F766E),
+                        foregroundColor: Colors.white,
+                        minimumSize: const Size(0, 46),
+                      ),
+                      onPressed: () async {
+                        await _escanearParaCampo(_txtScanAuditoriaPack, 'Escanear Artículo en Mesa de Packing');
+                        if (_txtScanAuditoriaPack.text.isNotEmpty) {
+                          await _procesarEscaneoAuditoriaPacking();
+                        }
+                      },
+                      child: const Icon(Icons.qr_code_scanner_rounded),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                ..._lineasAuditoriaPacking.map((rawLin) {
+                  final l = rawLin as Map<String, dynamic>;
+                  final bool yaEnLpn = l['consolidado_en_lpn'] == true;
+                  final int sol = l['solicitado'] as int;
+                  final int aud = l['auditado_unid'] as int;
+
+                  return InkWell(
+                    onTap: () => _abrirModalAuditarLineaPacking(l),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: yaEnLpn ? const Color(0xFFECFDF5) : const Color(0xFFF8FAFC),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: yaEnLpn ? const Color(0xFF10B981) : const Color(0xFFCBD5E1),
+                          width: yaEnLpn ? 1.8 : 1.0,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            yaEnLpn ? Icons.check_circle_rounded : Icons.pending_actions_rounded,
+                            color: yaEnLpn ? const Color(0xFF047857) : const Color(0xFF64748B),
+                            size: 24,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '${l['sku']} - ${l['descripcion']}',
+                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  'Lote: ${l['lote_auditado']}  |  Venc: ${l['venc_auditado'].toString().isEmpty ? 'S/F' : l['venc_auditado']}',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: yaEnLpn ? const Color(0xFF065F46) : const Color(0xFF475569),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: yaEnLpn ? const Color(0xFF047857) : const Color(0xFF1E3A8A),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Text(
+                              yaEnLpn ? '$aud / $sol UN ✓' : 'AUDITAR ($sol UN)',
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 10),
+
+          // PASO 3: CONSOLIDACIÓN DENTRO DEL LPN ("LO QUE VA ADENTRO DEL LPN")
+          _TarjetaMovil(
+            borderColor: const Color(0xFF10B981),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F172A),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '3. CONSOLIDACIÓN DENTRO DEL LPN: ${_txtLpnConsolidadoPack.text}',
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 13),
+                            ),
+                            Text(
+                              'SKUs en LPN: $totalSkusEnLpn de $totalSkusOrden  |  Total Consolidado: $totalUnidEnLpn UN',
+                              style: const TextStyle(color: Color(0xFF34D399), fontWeight: FontWeight.bold, fontSize: 11),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Icon(Icons.inventory_rounded, color: Color(0xFF34D399), size: 26),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+                if (_lpnConsolidadoMapa.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(12),
+                    child: Text(
+                      'Toque o escanee los artículos de arriba para auditarlos e incluirlos dentro de este LPN.',
+                      style: TextStyle(fontSize: 12, color: Colors.grey),
+                    ),
+                  )
+                else ...[
+                  const Text('DETALLE DE ARTÍCULOS QUE VAN DENTRO DE ESTE LPN:', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF065F46))),
+                  const SizedBox(height: 6),
+                  ..._lpnConsolidadoMapa.values.map((item) => Container(
+                        margin: const EdgeInsets.only(bottom: 6),
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFF0FDFA),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: const Color(0xFF99F6E4)),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    '• ${item['sku']} | ${item['unidades_totales']} UN (${item['cajas']} Cj)',
+                                    style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: Color(0xFF0F172A)),
+                                  ),
+                                  Text(
+                                    'Lote: ${item['lote']} | Venc: ${item['fecha_vencimiento_cl'] ?? 'S/F'}',
+                                    style: const TextStyle(fontSize: 11, color: Color(0xFF0F766E), fontWeight: FontWeight.w600),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: 'Quitar del LPN',
+                              icon: const Icon(Icons.remove_circle_outline, color: Colors.red, size: 20),
+                              onPressed: () {
+                                setState(() {
+                                  final sBorrar = item['sku'].toString();
+                                  _lpnConsolidadoMapa.remove(sBorrar);
+                                  for (final rawL in _lineasAuditoriaPacking) {
+                                    final m = rawL as Map<String, dynamic>;
+                                    if (m['sku'] == sBorrar) m['consolidado_en_lpn'] = false;
+                                  }
+                                });
+                              },
+                            ),
+                          ],
+                        ),
+                      )),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: const Color(0xFF0F172A),
+                            side: const BorderSide(color: Color(0xFF0F172A), width: 1.5),
+                            minimumSize: const Size(0, 46),
+                          ),
+                          onPressed: () => _cerrarPackingYConsolidarLpn(soloEtiquetaLpn: true),
+                          icon: const Icon(Icons.qr_code_2_rounded, size: 18),
+                          label: const Text('ETIQUETA LPN 15x10', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF047857),
+                            foregroundColor: Colors.white,
+                            minimumSize: const Size(0, 46),
+                          ),
+                          onPressed: _guardandoPackingLpn ? null : () => _cerrarPackingYConsolidarLpn(soloEtiquetaLpn: false),
+                          icon: const Icon(Icons.verified_rounded, size: 18),
+                          label: const Text('CERRAR LPN + PACKING PDF', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
 
   // ===================================================================
   // CARGA Y VALIDACIÓN VISUAL DE UBICACIONES EN MAESTRA
@@ -4317,7 +5102,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       {'indice': 3, 'titulo': 'STOCK Y CONTEO CÍCLICO', 'subtitulo': 'Consulta Rayos-X y toma de inventario en piso', 'icono': Icons.fact_check_rounded, 'color': const Color(0xFF4338CA), 'fondo': const Color(0xFFEEF2FF)},
       {'indice': 4, 'titulo': 'MAESTRA DE PRODUCTOS', 'subtitulo': 'Enrolamiento de SKU, EAN y múltiplos de caja', 'icono': Icons.list_alt_rounded, 'color': const Color(0xFFB45309), 'fondo': const Color(0xFFFFFBEB)},
       {'indice': 5, 'titulo': 'PICKING FARMACIA (FA)', 'subtitulo': 'Preparación sin rack (Escaneo de código y suma)', 'icono': Icons.medical_services_rounded, 'color': const Color(0xFFE11D48), 'fondo': const Color(0xFFFFE4E6)},
-      
+      {'indice': 8, 'titulo': 'AUDITORÍA PACKING Y LPN', 'subtitulo': 'Revisar Unidades/Lote/Venc y consolidar dentro de un LPN', 'icono': Icons.inventory_rounded, 'color': const Color(0xFF0F766E), 'fondo': const Color(0xFFF0FDFA)},
       {'indice': 7, 'titulo': 'CÍCLICO DIRIGIDO POR SKU', 'subtitulo': 'Auditar todas las ubicaciones de un SKU (1 click OK / 2 click Incidencia)', 'icono': Icons.track_changes_rounded, 'color': const Color(0xFF6D28D9), 'fondo': const Color(0xFFF5F3FF)},
       {'indice': 6, 'titulo': 'UBICACIONES VACÍAS', 'subtitulo': 'Auditoría de espacios libres y registro de hallazgos', 'icono': Icons.check_box_outline_blank_rounded, 'color': const Color(0xFF64748B), 'fondo': const Color(0xFFF1F5F9)},
     ];
@@ -5876,6 +6661,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             },
           ),
           ListTile(
+            leading: const Icon(Icons.inventory_rounded, color: Color(0xFF0F766E)),
+            title: const Text('Auditoría Packing y LPN', style: TextStyle(color: Color(0xFF0F766E), fontWeight: FontWeight.bold)),
+            onTap: () {
+              setState(() { _tabActual = 8; _mostrarMenuCentral = false; });
+              Navigator.pop(context);
+              _cargarOVsPendientes();
+            },
+          ),
+          ListTile(
             leading: const Icon(Icons.track_changes_rounded, color: Color(0xFF6D28D9)),
             title: const Text('Cíclico Dirigido por SKU', style: TextStyle(color: Color(0xFF6D28D9), fontWeight: FontWeight.bold)),
             onTap: () {
@@ -5930,6 +6724,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _construirVistaPickingFarmacia(),
       _construirVistaVacias(),
       _construirVistaCiclicoPorSku(),
+      _construirVistaAuditoriaPackingLpn(), // <-- Índice 8: Auditoría Packing y Consolidación LPN
     ];
 
     return WillPopScope(
