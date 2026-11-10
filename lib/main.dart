@@ -2654,8 +2654,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // MÓDULO 8: AUDITORÍA DE PACKING Y CONSOLIDACIÓN EN LPN (EN PISO RF)
   // ===================================================================
   String _ovPackingAuditKey = 'SIN_OV';
-  List<dynamic> _lineasAuditoriaPacking = [];
-  final Map<String, Map<String, dynamic>> _lpnConsolidadoMapa = {};
+  List _lineasAuditoriaPacking = [];
+  final Map _lpnConsolidadoMapa = {};
   final TextEditingController _txtLpnConsolidadoPack = TextEditingController();
   final TextEditingController _txtScanAuditoriaPack = TextEditingController();
   bool _cargandoAuditoriaPack = false;
@@ -2669,7 +2669,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     _notificar('LPN Maestro generado: ${_txtLpnConsolidadoPack.text}', color: const Color(0xFF0F766E));
   }
 
-  Future<void> _cargarOrdenParaAuditoriaPacking(String? key) async {
+  Future _cargarOrdenParaAuditoriaPacking(String? key) async {
     if (key == null) return;
     setState(() {
       _ovPackingAuditKey = key;
@@ -2698,7 +2698,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .from('maestra_sku')
           .select('sku, descripcion, multiplo, codigo_barras');
 
-      final List<dynamic> listaTemp = [];
+      final List listaTemp = [];
 
       for (final det in (resDet as List)) {
         final skuOv = (det['sku'] ?? '').toString().trim().toUpperCase();
@@ -2711,7 +2711,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
         String descProd = (det['descripcion'] ?? 'ARTÍCULO ($skuOv)').toString().toUpperCase();
         int multEmpaque = 1;
-        final List<dynamic> barcodes = [];
+        final List barcodes = [];
 
         if (matchesM.isNotEmpty) {
           final m0 = matchesM.first;
@@ -2728,7 +2728,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         final int pickeadoPrevio = (det['cantidad_pickeada'] as num?)?.toInt() ?? 0;
         final String rawLotes = (det['lotes_pickeados'] ?? '').toString().trim();
 
-        // Extraer lote y vencimiento si venían del picking
         String loteInicial = 'S/L';
         String vencInicial = '';
         if (rawLotes.isNotEmpty) {
@@ -2742,7 +2741,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           }
         }
 
-        final itemMap = <String, dynamic>{
+        listaTemp.add({
           'id_detalle': det['id'],
           'sku': skuLimpio,
           'descripcion': descProd,
@@ -2754,9 +2753,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           'lote_auditado': loteInicial,
           'venc_auditado': vencInicial,
           'consolidado_en_lpn': false,
-        };
-
-        listaTemp.add(itemMap);
+        });
       }
 
       if (mounted) {
@@ -2771,7 +2768,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
-  Future<void> _abrirModalAuditarLineaPacking(Map<String, dynamic> linea) async {
+  Future _abrirModalAuditarLineaPacking(Map linea) async {
     if (_txtLpnConsolidadoPack.text.trim().isEmpty) {
       _generarLpnConsolidadoAuto();
     }
@@ -2780,8 +2777,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final int solicitado = linea['solicitado'] as int;
     final int mult = (linea['multiplo'] as int?) ?? 1;
 
-    // Buscar lotes y vencimientos reales en inventario para ayudar al auditor
-    final List<String> sugerenciasLoteVenc = [];
+    final List sugerenciasLoteVenc = [];
     try {
       final resInv = await supabase
           .from('bodega_inventario_ubicacion')
@@ -2803,7 +2799,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final txtVenc = TextEditingController(text: (linea['venc_auditado'] ?? '').toString());
 
     if (!mounted) return;
-    final conf = await showDialog>(
+    final conf = await showDialog(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => StatefulBuilder(
@@ -2841,15 +2837,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   ),
                   const SizedBox(height: 10),
                   if (sugerenciasLoteVenc.isNotEmpty) ...[
-                    DropdownButtonFormField<String>(
+                    DropdownButtonFormField(
                       isExpanded: true,
                       decoration: const InputDecoration(labelText: 'Sugerencia Lote / Venc. en Stock'),
                       items: sugerenciasLoteVenc
-                          .map((s) => DropdownMenuItem(value: s, child: Text(s, style: const TextStyle(fontSize: 12))))
+                          .map((s) => DropdownMenuItem(value: s.toString(), child: Text(s.toString(), style: const TextStyle(fontSize: 12))))
                           .toList(),
                       onChanged: (val) {
-                        if (val != null && val.contains('|')) {
-                          final p = val.split('|');
+                        if (val != null && val.toString().contains('|')) {
+                          final p = val.toString().split('|');
                           setStateModal(() {
                             txtLote.text = p.first.trim();
                             txtVenc.text = p.last.trim() == 'S/F' ? '' : p.last.trim();
@@ -2912,6 +2908,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final String vencAudit = conf['venc'] as String;
     final int cajasEst = (unidAudit / (mult < 1 ? 1 : mult)).ceil();
 
+    final Map lotesPickMap = {'$loteAudit / $vencAudit': unidAudit};
+
     setState(() {
       linea['auditado_unid'] = unidAudit;
       linea['lote_auditado'] = loteAudit;
@@ -2930,7 +2928,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'multiplo_aplicado': mult,
         'lote': loteAudit,
         'fecha_vencimiento_cl': vencAudit == 'S/F' ? null : vencAudit,
-        'lotes_pickeados': <String, int>{'$loteAudit / $vencAudit': unidAudit},
+        'lotes_pickeados': Map<String, int>.from(lotesPickMap),
         'barcodes': (linea['barcodes'] as List).map((b) => {'codigo_barras': b}).toList(),
       };
     });
