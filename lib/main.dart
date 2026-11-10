@@ -74,17 +74,23 @@ Future<void> main() async {
 
 late final supabase = Supabase.instance.client;
 
-// VARIABLES GLOBALES DE SESIÓN Y TEMA
+// VARIABLES GLOBALES DE SESIÓN, BODEGA ACTIVA Y TEMA
 Map<String, dynamic>? usuarioActivo;
+String bodegaActiva = 'Bodega Santiago';
 final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.light);
 
-Future<Session?> asegurarSesionSupabase() async {
-  var sesion = supabase.auth.currentSession;
-  if (sesion == null) {
-    final res = await supabase.auth.signInAnonymously();
-    sesion = res.session;
+bool perteneceABodegaActiva(Map<String, dynamic> fila) {
+  final rawBod = (fila['bodega'] ?? fila['sucursal'] ?? fila['centro'] ?? '').toString().trim().toUpperCase();
+  final buscandoCcp = bodegaActiva.toUpperCase().contains('CONCEPCION');
+  if (rawBod.isEmpty) {
+    // Si una fila antigua no tiene columna bodega, se asume de Santiago
+    return !buscandoCcp;
   }
-  return sesion;
+  if (buscandoCcp) {
+    return rawBod.contains('CONCEPCION') || rawBod.contains('CONCEPCIÓN') || rawBod == 'CCP';
+  } else {
+    return rawBod.contains('SANTIAGO') || rawBod == 'STGO' || rawBod == 'SCL';
+  }
 }
 
 // =====================================================================
@@ -779,7 +785,7 @@ class _SplashScreenLudipekState extends State<SplashScreenLudipek> {
 }
 
 // =====================================================================
-// PANTALLA DE LOGIN DE USUARIOS
+// PANTALLA DE LOGIN DE USUARIOS CON SELECCIÓN DE BODEGA
 // =====================================================================
 class LoginScreenLudipek extends StatefulWidget {
   const LoginScreenLudipek({super.key});
@@ -791,6 +797,7 @@ class LoginScreenLudipek extends StatefulWidget {
 class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
   final TextEditingController _userCtrl = TextEditingController();
   final TextEditingController _passCtrl = TextEditingController();
+  String _bodegaSeleccionada = bodegaActiva;
   bool _isLoading = false;
 
   Future<void> _iniciarSesion() async {
@@ -798,31 +805,47 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
     final pass = _passCtrl.text.trim();
 
     if (user.isEmpty || pass.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Ingrese usuario y contraseña.'), backgroundColor: Colors.orange));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Ingrese usuario y contraseña.'), backgroundColor: Colors.orange),
+      );
       return;
     }
 
     setState(() => _isLoading = true);
 
     try {
-      final res = await supabase.from('wms_usuarios').select().ilike('usuario', user).eq('password', pass).maybeSingle();
-      
+      final res = await supabase
+          .from('wms_usuarios')
+          .select()
+          .ilike('usuario', user)
+          .eq('password', pass)
+          .maybeSingle();
+
       if (res != null) {
         if (res['activo'] == true) {
           usuarioActivo = res;
+          bodegaActiva = _bodegaSeleccionada;
           if (!mounted) return;
-          Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const TerminalRfScreen()));
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => const TerminalRfScreen()),
+          );
         } else {
           if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Usuario inactivo. Contacte a Gerencia.'), backgroundColor: Colors.red));
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Usuario inactivo. Contacte a Gerencia.'), backgroundColor: Colors.red),
+          );
         }
       } else {
         if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Credenciales incorrectas.'), backgroundColor: Colors.red));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Credenciales incorrectas.'), backgroundColor: Colors.red),
+        );
       }
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error de red: $e'), backgroundColor: Colors.red));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error de red: $e'), backgroundColor: Colors.red),
+      );
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
@@ -831,7 +854,7 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    
+
     return Scaffold(
       body: SafeArea(
         child: Center(
@@ -842,28 +865,48 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
               children: [
                 Icon(Icons.pets_rounded, size: 80, color: isDark ? Colors.white : const Color(0xFF1D4ED8)),
                 const SizedBox(height: 16),
-                Text('INICIAR SESIÓN', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: isDark ? Colors.white : const Color(0xFF0F172A))),
+                Text(
+                  'INICIAR SESIÓN',
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: isDark ? Colors.white : const Color(0xFF0F172A)),
+                ),
                 const Text('LUDIPEK WMS', style: TextStyle(fontSize: 14, color: Colors.grey)),
-                const SizedBox(height: 36),
+                const SizedBox(height: 32),
                 TextField(
                   controller: _userCtrl,
                   decoration: const InputDecoration(labelText: 'Usuario / RUT', prefixIcon: Icon(Icons.person)),
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 14),
                 TextField(
                   controller: _passCtrl,
                   obscureText: true,
                   decoration: const InputDecoration(labelText: 'Contraseña', prefixIcon: Icon(Icons.lock)),
                 ),
-                const SizedBox(height: 32),
+                const SizedBox(height: 14),
+                DropdownButtonFormField<String>(
+                  value: _bodegaSeleccionada,
+                  decoration: const InputDecoration(
+                    labelText: 'Seleccionar Bodega a Operar',
+                    prefixIcon: Icon(Icons.warehouse_rounded, color: Color(0xFF1D4ED8)),
+                  ),
+                  items: const [
+                    DropdownMenuItem(value: 'Bodega Santiago', child: Text('BODEGA SANTIAGO (CD CENTRAL)')),
+                    DropdownMenuItem(value: 'Bodega Concepcion', child: Text('BODEGA CONCEPCIÓN (CCP)')),
+                  ],
+                  onChanged: (val) {
+                    if (val != null) setState(() => _bodegaSeleccionada = val);
+                  },
+                ),
+                const SizedBox(height: 28),
                 SizedBox(
                   width: double.infinity,
                   height: 48,
                   child: ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), foregroundColor: Colors.white),
                     onPressed: _isLoading ? null : _iniciarSesion,
-                    icon: _isLoading ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Icon(Icons.login),
-                    label: Text(_isLoading ? 'VERIFICANDO...' : 'INGRESAR', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    icon: _isLoading
+                        ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                        : const Icon(Icons.login),
+                    label: Text(_isLoading ? 'VERIFICANDO...' : 'INGRESAR A ${_bodegaSeleccionada.toUpperCase()}', style: const TextStyle(fontWeight: FontWeight.bold)),
                   ),
                 ),
               ],
@@ -1027,11 +1070,21 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _vaciasConHallazgoRojo.clear();
     });
     try {
-      final resMaestra = await supabase.from('bodega_ubicaciones').select('codigo_ubicacion');
-      final todas = resMaestra.map((e) => e['codigo_ubicacion'].toString().toUpperCase().trim()).toSet();
+      final resMaestra = await supabase.from('bodega_ubicaciones').select();
+      final listaMaestra = List>.from(resMaestra);
+      final todas = listaMaestra
+          .where((e) => perteneceABodegaActiva(e))
+          .map((e) => (e['codigo_ubicacion'] ?? '').toString().toUpperCase().trim())
+          .where((u) => u.isNotEmpty)
+          .toSet();
 
-      final resOcupadas = await supabase.from('bodega_inventario_ubicacion').select('codigo_ubicacion');
-      final ocupadas = resOcupadas.map((e) => e['codigo_ubicacion'].toString().toUpperCase().trim()).toSet();
+      final resOcupadas = await supabase.from('bodega_inventario_ubicacion').select('codigo_ubicacion, bodega');
+      final listaOcupadas = List>.from(resOcupadas);
+      final ocupadas = listaOcupadas
+          .where((e) => perteneceABodegaActiva(e) || todas.contains((e['codigo_ubicacion'] ?? '').toString().toUpperCase().trim()))
+          .map((e) => (e['codigo_ubicacion'] ?? '').toString().toUpperCase().trim())
+          .where((u) => u.isNotEmpty)
+          .toSet();
 
       final vacias = todas.difference(ocupadas).toList();
       vacias.sort();
@@ -1043,7 +1096,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         });
       }
     } catch (e) {
-      _notificar('Error al cargar vacías: $e', color: Colors.red);
+      _notificar('Error al cargar vacías ($bodegaActiva): $e', color: Colors.red);
     } finally {
       if (mounted) setState(() => _cargandoVacias = false);
     }
@@ -2591,10 +2644,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // ===================================================================
   Future<void> _cargarMaestraUbicaciones() async {
     try {
-      final res = await supabase.from('bodega_ubicaciones').select('codigo_ubicacion');
+      final res = await supabase.from('bodega_ubicaciones').select();
+      final lista = List>.from(res);
       if (mounted) {
         setState(() {
-          _maestraUbicaciones = res.map((e) => e['codigo_ubicacion'].toString().toUpperCase().trim()).toList();
+          _maestraUbicaciones = lista
+              .where((e) => perteneceABodegaActiva(e))
+              .map((e) => (e['codigo_ubicacion'] ?? '').toString().toUpperCase().trim())
+              .where((u) => u.isNotEmpty)
+              .toList();
         });
       }
     } catch (e) {
@@ -5700,27 +5758,30 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     return Drawer(
       child: ListView(
-        padding: EdgeInsets.zero,
-        children: [
-          UserAccountsDrawerHeader(
-            decoration: const BoxDecoration(color: Color(0xFF0F172A)),
-            accountName: Text(
-              nombreUsuario,
-              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+        Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            child: DropdownButtonFormField<String>(
+              value: bodegaActiva,
+              decoration: const InputDecoration(
+                labelText: 'Bodega Activa',
+                prefixIcon: Icon(Icons.warehouse_rounded, size: 18, color: Color(0xFF1D4ED8)),
+                isDense: true,
+              ),
+              items: const [
+                DropdownMenuItem(value: 'Bodega Santiago', child: Text('Bodega Santiago', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
+                DropdownMenuItem(value: 'Bodega Concepcion', child: Text('Bodega Concepcion', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
+              ],
+              onChanged: (nuevaBod) {
+                if (nuevaBod != null && nuevaBod != bodegaActiva) {
+                  setState(() => bodegaActiva = nuevaBod);
+                  _cargarMaestraUbicaciones();
+                  _cargarUbicacionesVacias();
+                  _cargarAsnsActivos();
+                  Navigator.pop(context);
+                  _notificar('Cambiado a $bodegaActiva', color: const Color(0xFF047857));
+                }
+              },
             ),
-            accountEmail: Text('Usuario: ${usuarioActivo?['usuario'] ?? '-'} | Rol: $rolUsuario'),
-            currentAccountPicture: const CircleAvatar(
-              backgroundColor: Color(0xFF1D4ED8),
-              child: Icon(Icons.pets_rounded, color: Colors.white, size: 38), // <-- Patita de gato
-            ),
-          ),
-          ListTile(
-            leading: const Icon(Icons.grid_view_rounded, color: Color(0xFF1D4ED8)),
-            title: const Text('Menú Principal', style: TextStyle(fontWeight: FontWeight.bold)),
-            onTap: () {
-              setState(() => _mostrarMenuCentral = true);
-              Navigator.pop(context);
-            },
           ),
           const Divider(),
           ListTile(
@@ -5877,7 +5938,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   children: [
                     const Text('LUDIPEK WMS RF', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
                     Text(
-                      'OPERADOR: ${(usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'EN LÍNEA').toString().toUpperCase()}',
+                      'OPERADOR: ${(usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'EN LÍNEA').toString().toUpperCase()} • ${bodegaActiva.toUpperCase()}',
                       style: const TextStyle(fontSize: 9, color: Color(0xFF93C5FD), fontWeight: FontWeight.bold),
                     ),
                   ],
