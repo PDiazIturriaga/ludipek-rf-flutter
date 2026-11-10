@@ -818,8 +818,31 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
 
       if (res != null) {
         if (res['activo'] == true) {
+          final rolUsr = (res['rol'] ?? 'OPERADOR').toString().trim().toUpperCase();
+          final bodegaAsignada = (res['bodega'] ?? 'Bodega Santiago').toString().trim();
+          final tieneAccesoGlobal = rolUsr.contains('ADMIN') ||
+              bodegaAsignada.toUpperCase().contains('AMBAS') ||
+              bodegaAsignada.toUpperCase().contains('TODAS');
+
+          // BLOQUEO ESTRICTO: Si es de Santiago y eligió Concepción (o viceversa), no lo deja entrar
+          if (!tieneAccesoGlobal && bodegaAsignada.toUpperCase() != _bodegaSeleccionada.toUpperCase()) {
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'ACCESO DENEGADO: Tu usuario pertenece exclusivamente a $bodegaAsignada.',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                backgroundColor: const Color(0xFFB91C1C),
+                duration: const Duration(seconds: 4),
+              ),
+            );
+            return;
+          }
+
           usuarioActivo = res;
-          bodegaActiva = _bodegaSeleccionada;
+          bodegaActiva = tieneAccesoGlobal ? _bodegaSeleccionada : bodegaAsignada;
+
           if (!mounted) return;
           Navigator.of(context).pushReplacement(
             MaterialPageRoute(builder: (_) => const TerminalRfScreen()),
@@ -2326,7 +2349,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       if (mounted) {
         setState(() {
-          _ovsCabecera = activas.cast>();
+          _ovsCabecera = activas.cast();
         });
       }
     } catch (e) {
@@ -6544,6 +6567,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         .toString()
         .toUpperCase();
     final rolUsuario = (usuarioActivo?['rol'] ?? 'OPERADOR').toString().toUpperCase();
+    final bodegaUsuarioDb = (usuarioActivo?['bodega'] ?? 'Bodega Santiago').toString().toUpperCase();
+    final bool puedeCambiarBodega = rolUsuario.contains('ADMIN') ||
+        bodegaUsuarioDb.contains('AMBAS') ||
+        bodegaUsuarioDb.contains('TODAS');
 
     return Drawer(
       child: ListView(
@@ -6555,43 +6582,68 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               nombreUsuario,
               style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
             ),
-            accountEmail: Text('Usuario: ${usuarioActivo?['usuario'] ?? '-'} | $bodegaActiva'),
+            accountEmail: Text('Rol: $rolUsuario | $bodegaActiva'),
             currentAccountPicture: const CircleAvatar(
               backgroundColor: Color(0xFF1D4ED8),
               child: Icon(Icons.pets_rounded, color: Colors.white, size: 38),
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-            child: DropdownButtonFormField<String>(
-              value: bodegaActiva,
-              decoration: const InputDecoration(
-                labelText: 'Bodega Activa',
-                prefixIcon: Icon(Icons.warehouse_rounded, size: 18, color: Color(0xFF1D4ED8)),
-                isDense: true,
+          if (puedeCambiarBodega)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+              child: DropdownButtonFormField<String>(
+                value: bodegaActiva,
+                decoration: const InputDecoration(
+                  labelText: 'Cambiar Bodega (Modo Admin)',
+                  prefixIcon: Icon(Icons.warehouse_rounded, size: 18, color: Color(0xFF1D4ED8)),
+                  isDense: true,
+                ),
+                items: const [
+                  DropdownMenuItem(
+                    value: 'Bodega Santiago',
+                    child: Text('Bodega Santiago', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                  ),
+                  DropdownMenuItem(
+                    value: 'Bodega Concepcion',
+                    child: Text('Bodega Concepcion', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                  ),
+                ],
+                onChanged: (nuevaBod) {
+                  if (nuevaBod != null && nuevaBod != bodegaActiva) {
+                    setState(() => bodegaActiva = nuevaBod);
+                    _cargarMaestraUbicaciones();
+                    _cargarUbicacionesVacias();
+                    _cargarAsnsActivos();
+                    Navigator.pop(context);
+                    _notificar('Cambiado a $bodegaActiva', color: const Color(0xFF047857));
+                  }
+                },
               ),
-              items: const [
-                DropdownMenuItem(
-                  value: 'Bodega Santiago',
-                  child: Text('Bodega Santiago', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF1F5F9),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0xFFCBD5E1)),
                 ),
-                DropdownMenuItem(
-                  value: 'Bodega Concepcion',
-                  child: Text('Bodega Concepcion', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                child: Row(
+                  children: [
+                    const Icon(Icons.lock_outline_rounded, size: 18, color: Color(0xFF475569)),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'BODEGA FIJA: ${bodegaActiva.toUpperCase()}',
+                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w900, color: Color(0xFF0F172A)),
+                      ),
+                    ),
+                  ],
                 ),
-              ],
-              onChanged: (nuevaBod) {
-                if (nuevaBod != null && nuevaBod != bodegaActiva) {
-                  setState(() => bodegaActiva = nuevaBod);
-                  _cargarMaestraUbicaciones();
-                  _cargarUbicacionesVacias();
-                  _cargarAsnsActivos();
-                  Navigator.pop(context);
-                  _notificar('Cambiado a $bodegaActiva', color: const Color(0xFF047857));
-                }
-              },
+              ),
             ),
-          ),
           ListTile(
             leading: const Icon(Icons.grid_view_rounded, color: Color(0xFF1D4ED8)),
             title: const Text('Menú Principal', style: TextStyle(fontWeight: FontWeight.bold)),
