@@ -258,11 +258,18 @@ Map<String, dynamic> parsearCodigoGs1128(String cadenaCruda) {
 // =====================================================================
 // 3. GENERADOR DE ETIQUETA TÉRMICA PDF 15x10 CM
 // =====================================================================
-Future<void> generarPdfRecepcion15x10(
-    String lpn, List<Map<String, dynamic>> lineasPallet) async {
+Future generarPdfRecepcion15x10(String lpn, List lineasPallet) async {
   final doc = pw.Document();
   const format15x10 =
       PdfPageFormat(150 * PdfPageFormat.mm, 100 * PdfPageFormat.mm);
+
+  int totalCajasPdf = 0;
+  int totalUnidPdf = 0;
+  for (final elem in lineasPallet) {
+    final m = elem as Map;
+    totalCajasPdf += (m['cajas'] as num?)?.toInt() ?? 0;
+    totalUnidPdf += (m['unidades_totales'] as num?)?.toInt() ?? 0;
+  }
 
   doc.addPage(
     pw.Page(
@@ -270,7 +277,7 @@ Future<void> generarPdfRecepcion15x10(
       margin: pw.EdgeInsets.zero,
       build: (pw.Context context) {
         final esMonolote = lineasPallet.length == 1;
-        final item = lineasPallet.first;
+        final Map item = lineasPallet.first as Map;
 
         return pw.Container(
           decoration: pw.BoxDecoration(border: pw.Border.all(width: 1)),
@@ -324,7 +331,7 @@ Future<void> generarPdfRecepcion15x10(
                                     style: const pw.TextStyle(fontSize: 10),
                                   ),
                                   pw.Text(
-                                    'LOTE: ${item['lote'] ?? 'S/L'}',
+                                    'LOTE: ${item['lote']?.toString().split('|').first ?? 'S/L'}',
                                     style: pw.TextStyle(
                                         fontSize: 15,
                                         fontWeight: pw.FontWeight.bold),
@@ -350,7 +357,7 @@ Future<void> generarPdfRecepcion15x10(
                                       pw.Text(
                                         'SKU: ${item['sku']} (MULTILOTE)',
                                         style: pw.TextStyle(
-                                            fontSize: 16,
+                                            fontSize: 15,
                                             fontWeight: pw.FontWeight.bold),
                                       ),
                                       pw.Text(
@@ -360,22 +367,34 @@ Future<void> generarPdfRecepcion15x10(
                                       ),
                                       pw.SizedBox(height: 4),
                                       ...lineasPallet.take(6).map(
-                                            (l) => pw.Container(
-                                              width: double.infinity,
-                                              margin: const pw.EdgeInsets.only(bottom: 3),
-                                              padding:
-                                                  const pw.EdgeInsets.symmetric(
-                                                      vertical: 3, horizontal: 5),
-                                              decoration: pw.BoxDecoration(
-                                                  border:
-                                                      pw.Border.all(width: 0.6)),
-                                              child: pw.Text(
-                                                'LOTE: ${l['lote']?.toString().split('|').first ?? 'S/L'}  |  VENC: ${l['fecha_vencimiento_cl'] ?? 'S/F'}  ->  ${l['cajas']} Cj (${l['unidades_totales']} UN)',
-                                                style: pw.TextStyle(
-                                                    fontSize: 8.5,
-                                                    fontWeight: pw.FontWeight.bold),
-                                              ),
-                                            ),
+                                            (rawL) {
+                                              final l = rawL as Map;
+                                              final loteTxt = (l['lote'] ?? 'S/L')
+                                                  .toString()
+                                                  .split('|')
+                                                  .first;
+                                              final vencTxt =
+                                                  l['fecha_vencimiento_cl'] ?? 'S/F';
+                                              return pw.Container(
+                                                width: double.infinity,
+                                                margin: const pw.EdgeInsets.only(
+                                                    bottom: 3),
+                                                padding:
+                                                    const pw.EdgeInsets.symmetric(
+                                                        vertical: 2,
+                                                        horizontal: 4),
+                                                decoration: pw.BoxDecoration(
+                                                    border: pw.Border.all(
+                                                        width: 0.6)),
+                                                child: pw.Text(
+                                                  'LOTE: $loteTxt | VENC: $vencTxt | ${l['cajas']} Cj (${l['unidades_totales']} UN)',
+                                                  style: pw.TextStyle(
+                                                      fontSize: 8,
+                                                      fontWeight:
+                                                          pw.FontWeight.bold),
+                                                ),
+                                              );
+                                            },
                                           ),
                                     ],
                                   ),
@@ -384,15 +403,38 @@ Future<void> generarPdfRecepcion15x10(
                                     padding: const pw.EdgeInsets.all(4),
                                     color: PdfColor.fromHex('#E2E8F0'),
                                     child: pw.Text(
-                                      'TOTAL PALLET: ${lineasPallet.fold<int>(0, (s, e) => s + ((e['cajas'] as int?) ?? 0))} Cajas  |  ${lineasPallet.fold<int>(0, (s, e) => s + ((e['unidades_totales'] as int?) ?? 0))} UN',
+                                      'TOTAL PALLET: $totalCajasPdf Cajas | $totalUnidPdf UN',
                                       style: pw.TextStyle(
-                                          fontSize: 10,
+                                          fontSize: 9.5,
                                           fontWeight: pw.FontWeight.bold),
                                       textAlign: pw.TextAlign.center,
                                     ),
                                   ),
                                 ],
                               ),
+                      ),
+                    ),
+                    pw.Container(width: 1, color: PdfColors.grey400),
+                    pw.Expanded(
+                      flex: 32,
+                      child: pw.Column(
+                        mainAxisAlignment: pw.MainAxisAlignment.center,
+                        children: [
+                          pw.BarcodeWidget(
+                            barcode: pw.Barcode.qrCode(),
+                            data: lpn,
+                            width: 38 * PdfPageFormat.mm,
+                            height: 38 * PdfPageFormat.mm,
+                          ),
+                          pw.SizedBox(height: 6),
+                          pw.Text(
+                            lpn,
+                            style: pw.TextStyle(
+                                fontSize: 10, fontWeight: pw.FontWeight.bold),
+                          ),
+                        ],
+                      ),
+                    ),
                   ],
                 ),
               ),
