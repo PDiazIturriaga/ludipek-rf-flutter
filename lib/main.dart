@@ -340,52 +340,59 @@ Future<void> generarPdfRecepcion15x10(
                             : pw.Column(
                                 crossAxisAlignment:
                                     pw.CrossAxisAlignment.start,
+                                mainAxisAlignment:
+                                    pw.MainAxisAlignment.spaceBetween,
                                 children: [
-                                  pw.Text('PALLET MULTILOTE / MULTISKU',
-                                      style: pw.TextStyle(
-                                          fontSize: 13,
-                                          fontWeight: pw.FontWeight.bold)),
-                                  pw.SizedBox(height: 6),
-                                  ...lineasPallet.take(8).map(
-                                        (l) => pw.Container(
-                                          padding:
-                                              const pw.EdgeInsets.symmetric(
-                                                  vertical: 2, horizontal: 4),
-                                          decoration: pw.BoxDecoration(
-                                              border:
-                                                  pw.Border.all(width: 0.5)),
-                                          child: pw.Text(
-                                            '${l['sku']} (${(l['descripcion_pdf'] ?? '').toString().length > 20 ? (l['descripcion_pdf'] ?? '').toString().substring(0, 20) : (l['descripcion_pdf'] ?? '').toString()}) | ${l['unidades_totales']} UN',
-                                            style:
-                                                const pw.TextStyle(fontSize: 7),
-                                          ),
-                                        ),
+                                  pw.Column(
+                                    crossAxisAlignment:
+                                        pw.CrossAxisAlignment.start,
+                                    children: [
+                                      pw.Text(
+                                        'SKU: ${item['sku']} (MULTILOTE)',
+                                        style: pw.TextStyle(
+                                            fontSize: 16,
+                                            fontWeight: pw.FontWeight.bold),
                                       ),
+                                      pw.Text(
+                                        '${item['descripcion_pdf'] ?? 'INGRESO DIRECTO'}',
+                                        style: const pw.TextStyle(fontSize: 8),
+                                        maxLines: 1,
+                                      ),
+                                      pw.SizedBox(height: 4),
+                                      ...lineasPallet.take(6).map(
+                                            (l) => pw.Container(
+                                              width: double.infinity,
+                                              margin: const pw.EdgeInsets.only(bottom: 3),
+                                              padding:
+                                                  const pw.EdgeInsets.symmetric(
+                                                      vertical: 3, horizontal: 5),
+                                              decoration: pw.BoxDecoration(
+                                                  border:
+                                                      pw.Border.all(width: 0.6)),
+                                              child: pw.Text(
+                                                'LOTE: ${l['lote']?.toString().split('|').first ?? 'S/L'}  |  VENC: ${l['fecha_vencimiento_cl'] ?? 'S/F'}  ->  ${l['cajas']} Cj (${l['unidades_totales']} UN)',
+                                                style: pw.TextStyle(
+                                                    fontSize: 8.5,
+                                                    fontWeight: pw.FontWeight.bold),
+                                              ),
+                                            ),
+                                          ),
+                                    ],
+                                  ),
+                                  pw.Container(
+                                    width: double.infinity,
+                                    padding: const pw.EdgeInsets.all(4),
+                                    color: PdfColor.fromHex('#E2E8F0'),
+                                    child: pw.Text(
+                                      'TOTAL PALLET: ${lineasPallet.fold<int>(0, (s, e) => s + ((e['cajas'] as int?) ?? 0))} Cajas  |  ${lineasPallet.fold<int>(0, (s, e) => s + ((e['unidades_totales'] as int?) ?? 0))} UN',
+                                      style: pw.TextStyle(
+                                          fontSize: 10,
+                                          fontWeight: pw.FontWeight.bold),
+                                      textAlign: pw.TextAlign.center,
+                                    ),
+                                  ),
                                 ],
                               ),
-                      ),
-                    ),
-                    pw.Container(width: 1, color: PdfColors.grey400),
-                    pw.Expanded(
-                      flex: 32,
-                      child: pw.Column(
-                        mainAxisAlignment: pw.MainAxisAlignment.center,
-                        children: [
-                          pw.BarcodeWidget(
-                            barcode: pw.Barcode.qrCode(),
-                            data: lpn,
-                            width: 38 * PdfPageFormat.mm,
-                            height: 38 * PdfPageFormat.mm,
-                          ),
-                          pw.SizedBox(height: 6),
-                          pw.Text(
-                            lpn,
-                            style: pw.TextStyle(
-                                fontSize: 10, fontWeight: pw.FontWeight.bold),
-                          ),
-                        ],
-                      ),
-                    ),
                   ],
                 ),
               ),
@@ -3920,15 +3927,34 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .maybeSingle();
 
       if (response != null && mounted) {
+        final regEsFecha = RegExp(r'^\d{1,4}[\-\/\.]\d{1,2}[\-\/\.]\d{1,4}$');
+
         setState(() {
           _opcionesLote.clear();
           _opcionesVencimiento.clear();
 
           if (response['lote_sugerido'] != null && response['lote_sugerido'].toString().isNotEmpty) {
-            final lotes = response['lote_sugerido'].toString().toUpperCase().split(RegExp(r'[,|]'));
-            _opcionesLote = lotes.map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
-            if (_opcionesLote.isNotEmpty) {
-              _txtLote.text = _opcionesLote.first;
+            final posiblesLotes = response['lote_sugerido']
+                .toString()
+                .toUpperCase()
+                .split(RegExp(r'[,|]'));
+
+            for (var item in posiblesLotes) {
+              final limpio = item.trim();
+              if (limpio.isEmpty || limpio == 'S/L' || limpio == 'NONE' || limpio == 'NULL') {
+                continue;
+              }
+              // Si el dato tiene formato de fecha, pasarlo a Vencimiento y NO a Lote
+              if (regEsFecha.hasMatch(limpio)) {
+                final fechaNorm = (normalizarFechaSql(limpio) ?? limpio).replaceAll('-', '/');
+                if (!_opcionesVencimiento.contains(fechaNorm)) {
+                  _opcionesVencimiento.add(fechaNorm);
+                }
+              } else {
+                if (!_opcionesLote.contains(limpio)) {
+                  _opcionesLote.add(limpio);
+                }
+              }
             }
           }
 
@@ -3936,15 +3962,22 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             final vencs = response['vencimiento_sugerido_cl'].toString().split(RegExp(r'[,|]'));
             for (var v in vencs) {
               v = v.trim();
-              if (v.isEmpty) continue;
-              String norm = normalizarFechaSql(v) ?? v;
+              if (v.isEmpty || v == 'S/F' || v == 'NONE' || v == 'NULL') continue;
+              final norm = (normalizarFechaSql(v) ?? v).replaceAll('-', '/');
               if (!_opcionesVencimiento.contains(norm)) {
                 _opcionesVencimiento.add(norm);
               }
             }
-            if (_opcionesVencimiento.isNotEmpty) {
-              _txtVencimiento.text = _opcionesVencimiento.first;
-            }
+          }
+
+          // El lote lo ingresa el operador manualmente (limpiamos 'S/L' para escribir directo)
+          if (_txtLote.text.trim() == 'S/L' || regEsFecha.hasMatch(_txtLote.text.trim())) {
+            _txtLote.clear();
+          }
+
+          // Pre-llenar fecha de vencimiento sugerida si está disponible
+          if (_opcionesVencimiento.isNotEmpty) {
+            _txtVencimiento.text = _opcionesVencimiento.first;
           }
         });
       }
@@ -4285,8 +4318,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
 
-    // BLOQUEO 1: No permitir mezclar SKUs distintos en el mismo LPN
-    final bool tieneOtroSku = _palletEnConstruccion.any((item) => item['sku'].toString().toUpperCase() != skuUsar);
+    // BLOQUEO 1: No permitir mezclar SKUs distintos en el mismo LPN (Pallet Mono-SKU)
+    final bool tieneOtroSku = _palletEnConstruccion.any(
+      (item) => item['sku'].toString().trim().toUpperCase() != skuUsar,
+    );
     if (tieneOtroSku) {
       final skuExistente = _palletEnConstruccion.first['sku'];
       _notificar(
@@ -4296,11 +4331,17 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
 
-    // BLOQUEO 2: No permitir duplicar línea del mismo SKU en el mismo LPN
-    final bool skuDuplicado = _palletEnConstruccion.any((item) => item['sku'].toString().toUpperCase() == skuUsar);
-    if (skuDuplicado) {
+    final loteBase = _txtLote.text.trim().isEmpty ? 'S/L' : _txtLote.text.trim().toUpperCase();
+
+    // BLOQUEO 2: Permitir varios lotes del mismo SKU, bloqueando solo si repite el MISMO Lote
+    final bool loteDuplicado = _palletEnConstruccion.any((item) {
+      final skuItem = item['sku'].toString().trim().toUpperCase();
+      final loteItemLimpio = item['lote'].toString().split('|').first.trim().toUpperCase();
+      return skuItem == skuUsar && loteItemLimpio == loteBase;
+    });
+    if (loteDuplicado) {
       _notificar(
-        'BLOQUEO: El SKU $skuUsar ya fue agregado a este LPN. Elimine la línea inferior si desea corregir la cantidad.',
+        'BLOQUEO: El Lote $loteBase del SKU $skuUsar ya fue agregado a este LPN. Ingrese el otro lote o elimine la línea inferior si desea corregir la cantidad.',
         color: const Color(0xFFDC2626),
       );
       return;
@@ -4320,7 +4361,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
 
-    final loteBase = _txtLote.text.trim().isEmpty ? 'S/L' : _txtLote.text.trim().toUpperCase();
     final loteFinal = _estadoCalidad == 'LIBERADO' ? loteBase : '$loteBase|QA:$_estadoCalidad';
     final vencStr = normalizarFechaSql(_txtVencimiento.text);
     final descActiva = (_infoMedidasActiva['descripcion'] ?? 'INGRESO DIRECTO').toString().toUpperCase();
@@ -4338,12 +4378,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'unidades_totales': unidTotales,
         'descripcion_pdf': descActiva,
       });
+      // Dejar el campo Lote limpio por si necesitas digitar un segundo lote del mismo SKU
+      _txtLote.clear();
     });
 
     _recalcularUnidadesEnVivo();
-    _notificar('Línea agregada ($skuUsar - $unidTotales UN). Cierre el pallet para emitir LPN.', color: const Color(0xFF047857));
+    _notificar(
+      'Lote $loteBase agregado ($skuUsar - $unidTotales UN). Puede agregar otro lote del mismo SKU o cerrar el pallet.',
+      color: const Color(0xFF047857),
+    );
   }
-
   Future<void> _confirmarYCerrarPallet() async {
     if (_palletEnConstruccion.isEmpty) return;
 
