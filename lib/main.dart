@@ -5005,7 +5005,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             .select('sku, codigo_barras, descripcion, multiplo')
             .or('sku.ilike.%$q%,codigo_barras.ilike.%$q%,descripcion.ilike.%$q%')
             .limit(10);
-        final lista = >[];
+        final List< Map<String, dynamic> > lista = [];
         for (final fila in resMaestra) {
           final skuM = (fila['sku'] ?? '').toString().toUpperCase();
           lista.add({
