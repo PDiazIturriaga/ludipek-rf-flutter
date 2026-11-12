@@ -463,7 +463,7 @@ Future generarPdfRecepcion15x10(String lpn, List lineasPallet) async {
 // =====================================================================
 // GENERADOR DE PACKING LIST FARMACIA (A4 LANDSCAPE + LOGO + LOTES)
 // =====================================================================
-Future<void> generarPdfPackingListFA(Map<String, dynamic> ovCabecera, List> lineas) async {
+Future<void> generarPdfPackingListFA(Map<String, dynamic> ovCabecera, List< Map<String, dynamic> > lineas) async {
     final pdf = pw.Document();
     
     // Intentar cargar logo (puede fallar si no existe en assets en web, se maneja el fallback)
@@ -1018,9 +1018,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // Variables Módulo 1: Recepción
   int? _asnActualId;
   String _asnSeleccionadoKey = 'SIN_ASN';
-  List> _asnsCabecera = [];
-  List> _lineasAsnActual = [];
-  final List> _palletEnConstruccion = [];
+  List< Map<String, dynamic> > _asnsCabecera = [];
+  List< Map<String, dynamic> > _lineasAsnActual = [];
+  final List< Map<String, dynamic> > _palletEnConstruccion = [];
   Map<String, int> _cajasRecibidasBdPorSku = {};
 
   final TextEditingController _txtLpnManual = TextEditingController();
@@ -1039,8 +1039,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   List<String> _opcionesLote = [];
   List<String> _opcionesVencimiento = [];
 
-  List> _sugerenciasSkuRecepcion = [];
-  List> _sugerenciasSkuCiclico = [];
+  List< Map<String, dynamic> > _sugerenciasSkuRecepcion = [];
+  List< Map<String, dynamic> > _sugerenciasSkuCiclico = [];
   Timer? _debounceSku;
 
   String _resumenAsn = 'Modo Recepción Libre activo.';
@@ -1059,7 +1059,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   // Variables Módulo 2: Almacenamiento (Paso a Paso)
   int _pasoAlmacenamiento = 1;
-  List> _lineasLpnAlmacenamiento = [];
+  List< Map<String, dynamic> > _lineasLpnAlmacenamiento = [];
   String _origenLpnAlmacenamiento = 'ANDEN_TRANSITO';
   bool _validandoLpnAlmacenamiento = false;
   final TextEditingController _txtPutLpn = TextEditingController();
@@ -1072,15 +1072,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   final TextEditingController _txtSkuPicking = TextEditingController();
   final TextEditingController _txtCajasMoverPicking = TextEditingController(text: '1');
   final TextEditingController _txtUbiDestinoPicking = TextEditingController(text: 'ZONA-PICKING');
-  List> _sugerenciasSkuPicking = [];
-  List> _ubicacionesFefoPicking = [];
+  List< Map<String, dynamic> > _sugerenciasSkuPicking = [];
+  List< Map<String, dynamic> > _ubicacionesFefoPicking = [];
   Map<String, dynamic>? _stockFefoSeleccionado;
   bool _buscandoFefo = false;
   String _mensajeEstadoFefo = 'Ingrese o escanee un SKU para buscar la ubicación con fecha más próxima a vencer (FEFO).';
 
   // Variables Módulo 3: Consulta y Conteo Cíclico
   final TextEditingController _txtScanConsulta = TextEditingController();
-  List> _resultadosConsulta = [];
+  List< Map<String, dynamic> > _resultadosConsulta = [];
 
   final TextEditingController _cicloUbicacionCtrl = TextEditingController();
   final TextEditingController _cicloLpnCtrl = TextEditingController();
@@ -2582,7 +2582,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       // 1. BUSCAR LOTES DISPONIBLES EN RECEPCIÓN Y EN BODEGA ACTIVA PARA ESTE SKU
       _notificar('Consultando lotes disponibles en $bodegaActiva...', color: const Color(0xFF1D4ED8));
-      List> lotesDisponibles = [];
+      List< Map<String, dynamic> > lotesDisponibles = [];
       try {
         final skuRaiz = linea['sku'].toString().split('-').first.trim();
         final Map<String, int> agrupado = {};
@@ -2630,7 +2630,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       // 2. MOSTRAR DIÁLOGO DE SELECCIÓN DE LOTE/VENCIMIENTO Y CANTIDAD MASIVA
       if (!mounted) return;
-      final resultado = await showDialog>(
+      final resultado = await showDialog< Map<String, dynamic> >(
         context: context,
         barrierDismissible: false,
         builder: (ctx) {
@@ -4329,7 +4329,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .neq('estado', 'COMPLETADO')
           .order('id', ascending: false)
           .limit(60);
-      final filtrados = List>.from(res)
+      final filtrados = List< Map<String, dynamic> >.from(res)
           .where((r) => _perteneceABodegaActiva(r))
           .take(25)
           .toList();
@@ -4386,7 +4386,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final resDet = await supabase.from('asn_detalle').select().eq('asn_id', id).order('sku');
       await _cargarCajasRecibidasDelAsn(id);
       setState(() {
-        _lineasAsnActual = List>.from(resDet);
+        _lineasAsnActual = List< Map<String, dynamic> >.from(resDet);
         _resumenAsn = 'Embarque activo: ${_lineasAsnActual.length} SKUs registrados.';
       });
     } catch (ex) {
@@ -4936,7 +4936,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }).toList();
 
         setState(() {
-          _lineasLpnAlmacenamiento = List>.from(lineasNorm);
+          _lineasLpnAlmacenamiento = List< Map<String, dynamic> >.from(lineasNorm);
           _origenLpnAlmacenamiento = ubiActual;
           _pasoAlmacenamiento = 2;
         });
@@ -4962,7 +4962,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }).toList();
 
       setState(() {
-        _lineasLpnAlmacenamiento = List>.from(lineasNorm);
+        _lineasLpnAlmacenamiento = List< Map<String, dynamic> >.from(lineasNorm);
         _origenLpnAlmacenamiento = 'ANDEN_TRANSITO';
         _pasoAlmacenamiento = 2;
       });
@@ -5275,7 +5275,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
-  Widget _construirListaSugerenciasSku(List> sugerencias, {required bool esRecepcion}) {
+  Widget _construirListaSugerenciasSku(List< Map<String, dynamic> > sugerencias, {required bool esRecepcion}) {
     if (sugerencias.isEmpty) return const SizedBox.shrink();
     return Container(
       margin: const EdgeInsets.only(top: 6),
@@ -7159,8 +7159,8 @@ class _ConsultaUniversalBottomSheet extends StatefulWidget {
 
 class _ConsultaUniversalBottomSheetState extends State<_ConsultaUniversalBottomSheet> {
   bool _cargando = true;
-  List> _resultadosInv = [];
-  List> _resultadosRec = [];
+  List< Map<String, dynamic> > _resultadosInv = [];
+  List< Map<String, dynamic> > _resultadosRec = [];
   Map<String, dynamic>? _infoMaestra;
 
   @override
@@ -7178,13 +7178,13 @@ class _ConsultaUniversalBottomSheetState extends State<_ConsultaUniversalBottomS
 
       // 2. Buscar en Inventario en Piso (Racks) filtrado por la bodega activa
       final resInv = await supabase.from('bodega_inventario_ubicacion').select().or('codigo_ubicacion.ilike.%$q%,lpn.eq.$q,sku.eq.$q');
-      _resultadosInv = List>.from(resInv)
+      _resultadosInv = List< Map<String, dynamic> >.from(resInv)
           .where((r) => _perteneceABodegaActiva(r))
           .toList();
 
       // 3. Buscar en Recepción Activa (Andén) filtrado por la bodega activa
       final resRec = await supabase.from('registro_recepcion').select().or('lpn.eq.$q,sku.eq.$q');
-      _resultadosRec = List>.from(resRec)
+      _resultadosRec = List< Map<String, dynamic> >.from(resRec)
           .where((r) => _perteneceABodegaActiva(r))
           .toList();
       
