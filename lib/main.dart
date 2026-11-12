@@ -2310,15 +2310,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // MÓDULOS DE PICKING (NORMAL VS FARMACIA) + AUDITORÍA PACKING POR BULTOS
   // ===================================================================
   String _ovSeleccionadaKey = 'SIN_OV';
-  Map<String, dynamic>? _ovCabeceraActiva;
-  List> _ovsCabecera = [];
-  List> _lineasOvFarmacia = [];
+  Map? _ovCabeceraActiva;
+  List _ovsCabecera = [];
+  List _lineasOvFarmacia = [];
   final TextEditingController _txtBuscarOvPicking = TextEditingController();
   final TextEditingController _txtScanFarmacia = TextEditingController();
   bool _cargandoOv = false;
 
   // Ordenador oficial por Marca (1. Churu -> 2. Ferall -> 3. Giwi -> 4. Arenas -> 5. Resto) y SKU de menor a mayor
-  int _obtenerPrioridadMarcaPicking(Map<String, dynamic> linea) {
+  int _obtenerPrioridadMarcaPicking(Map linea) {
     final sku = (linea['sku'] ?? '').toString().toUpperCase().trim();
     final marca = (linea['marca'] ?? '').toString().toUpperCase().trim();
     final desc = (linea['descripcion'] ?? '').toString().toUpperCase().trim();
@@ -2339,7 +2339,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     return 5; // 5° El resto
   }
 
-  String _etiquetaGrupoMarca(Map<String, dynamic> linea) {
+  String _etiquetaGrupoMarca(Map linea) {
     final p = _obtenerPrioridadMarcaPicking(linea);
     if (p == 1) return '1. CHURU / INABA';
     if (p == 2) return '2. FERALL';
@@ -2348,13 +2348,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     return '5. OTRAS MARCAS';
   }
 
-  void _ordenarLineasPorMarcaYSku(List> lista) {
+  void _ordenarLineasPorMarcaYSku(List lista) {
     lista.sort((a, b) {
-      final pA = _obtenerPrioridadMarcaPicking(a);
-      final pB = _obtenerPrioridadMarcaPicking(b);
+      final mA = a as Map;
+      final mB = b as Map;
+      final pA = _obtenerPrioridadMarcaPicking(mA);
+      final pB = _obtenerPrioridadMarcaPicking(mB);
       if (pA != pB) return pA.compareTo(pB);
-      final sA = (a['sku'] ?? '').toString().toUpperCase().trim();
-      final sB = (b['sku'] ?? '').toString().toUpperCase().trim();
+      final sA = (mA['sku'] ?? '').toString().toUpperCase().trim();
+      final sB = (mB['sku'] ?? '').toString().toUpperCase().trim();
       return sA.compareTo(sB);
     });
   }
@@ -2367,7 +2369,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .order('id', ascending: false)
           .limit(250);
       final List todas = res as List;
-      final List> activas = todas
+      final List activas = todas
           .where((rawOv) {
             final ov = Map.from(rawOv as Map);
             if (!_perteneceABodegaActiva(ov)) return false;
@@ -2378,7 +2380,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 estado != 'ANULADO' &&
                 estado != 'CERRADO';
           })
-          .map((rawOv) => Map<String, dynamic>.from(rawOv as Map))
+          .map((rawOv) => Map.from(rawOv as Map))
           .toList();
       if (mounted) {
         setState(() => _ovsCabecera = activas);
@@ -2386,7 +2388,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     } catch (_) {}
   }
 
-  Future<void> _buscarYCargarOvPorNumero({required bool modoFarmacia}) async {
+  Future _buscarYCargarOvPorNumero({required bool modoFarmacia}) async {
     final textoBuscado = _txtBuscarOvPicking.text.trim().toUpperCase().replaceAll('OV ', '').trim();
     if (textoBuscado.isEmpty) {
       _notificar('Escriba o escanee el número de la OV / OT.', color: Colors.orange);
@@ -2411,12 +2413,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .order('id', ascending: false)
           .limit(10);
 
-      final candidatas = List>.from(resCab as List)
+      final List candidatas = (resCab as List)
+          .map((e) => Map.from(e as Map))
           .where((r) => _perteneceABodegaActiva(r))
           .toList();
 
-      Map<String, dynamic>? elegida;
-      for (final c in candidatas) {
+      Map? elegida;
+      for (final rawC in candidatas) {
+        final c = rawC as Map;
         final numOv = (c['numero_ov'] ?? '').toString().toUpperCase();
         final canal = (c['canal_venta'] ?? '').toString().toUpperCase();
         final esFaOrden = numOv.endsWith('-FA') || canal.contains('FARM') || numOv.startsWith('OT-');
@@ -2430,7 +2434,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
 
       if (elegida == null && candidatas.isNotEmpty) {
-        final primera = candidatas.first;
+        final primera = candidatas.first as Map;
         final numOvP = (primera['numero_ov'] ?? '').toString().toUpperCase();
         final esFaP = numOvP.endsWith('-FA') || numOvP.startsWith('OT-');
         if (modoFarmacia && !esFaP) {
@@ -2466,7 +2470,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
-  Future<void> _seleccionarOvFarmacia(String? key) async {
+  Future _seleccionarOvFarmacia(String? key) async {
     if (key == null || key == 'SIN_OV') {
       setState(() => _cargandoOv = false);
       return;
@@ -2490,7 +2494,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             .select('sku, descripcion, multiplo, codigo_barras, marca')
             .range(0, 4999);
 
-        final List> lineasCargadas = [];
+        final List lineasCargadas = [];
 
         for (var det in resDetalle) {
           final skuOv = (det['sku'] ?? '').toString().trim().toUpperCase();
@@ -2501,7 +2505,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             return skuM == skuOvLimpio || skuOvLimpio.contains(skuM) || (skuM.isNotEmpty && skuM.contains(skuOvLimpio));
           }).toList();
 
-          List> barcodesInfo = [];
+          List barcodesInfo = [];
           String descProducto = (det['descripcion'] ?? 'ARTÍCULO ($skuOv)').toString().toUpperCase();
           String marcaProd = 'ESTANDAR';
 
@@ -2522,7 +2526,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           }
 
           final int cantYaPickeada = (det['cantidad_pickeada'] as num?)?.toInt() ?? 0;
-          final Map<String, int> lotesPrevios = {};
+          final Map lotesPrevios = {};
           final rawLotes = (det['lotes_pickeados'] ?? '').toString().trim();
           if (rawLotes.isNotEmpty) {
             lotesPrevios[rawLotes] = cantYaPickeada;
@@ -2541,7 +2545,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           });
         }
 
-        // Aplicar ordenamiento estricto: 1° Churu -> 2° Ferall -> 3° Giwi -> 4° Arenas -> 5° Resto (y de menor a mayor SKU)
+        // Ordenar: 1° Churu -> 2° Ferall -> 3° Giwi -> 4° Arenas -> 5° Resto (y SKU de menor a mayor)
         _ordenarLineasPorMarcaYSku(lineasCargadas);
 
         setState(() {
@@ -2562,8 +2566,13 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         ? '1. PICKING FARMACIA (-FA / OT)'
         : '1. PICKING ESTÁNDAR (OV NORMAL)';
 
-    int totalSolicitado = _lineasOvFarmacia.fold(0, (s, e) => s + (e['solicitado'] as int));
-    int totalPickeado = _lineasOvFarmacia.fold(0, (s, e) => s + (e['pickeado'] as int));
+    int totalSolicitado = 0;
+    int totalPickeado = 0;
+    for (final elem in _lineasOvFarmacia) {
+      final m = elem as Map;
+      totalSolicitado += (m['solicitado'] as num?)?.toInt() ?? 0;
+      totalPickeado += (m['pickeado'] as num?)?.toInt() ?? 0;
+    }
     double progreso = totalSolicitado > 0 ? (totalPickeado / totalSolicitado) : 0.0;
 
     return ListView(
@@ -2695,8 +2704,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               children: [
                 const Text('SECUENCIA DE PICKING ORDENADA POR MARCA Y SKU:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 const SizedBox(height: 8),
-                ..._lineasOvFarmacia.map((l) {
-                  bool completo = l['pickeado'] >= l['solicitado'];
+                ..._lineasOvFarmacia.map((rawLin) {
+                  final l = rawLin as Map;
+                  final int pickVal = (l['pickeado'] as num?)?.toInt() ?? 0;
+                  final int solVal = (l['solicitado'] as num?)?.toInt() ?? 0;
+                  final bool completo = pickVal >= solVal && solVal > 0;
                   final String grupoMarca = _etiquetaGrupoMarca(l);
                   return InkWell(
                     onTap: () {
@@ -2728,7 +2740,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                                 ),
                                 Builder(
                                   builder: (context) {
-                                    final lotesMap = l['lotes_pickeados'] as Map<String, int>? ?? {};
+                                    final Map lotesMap = (l['lotes_pickeados'] as Map?) ?? {};
                                     if (lotesMap.isEmpty) {
                                       return const Text('Toque o escanee para confirmar extracción', style: TextStyle(fontSize: 10, color: Color(0xFF475569)));
                                     }
@@ -2742,7 +2754,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                             decoration: BoxDecoration(color: completo ? const Color(0xFF047857) : colorTema, borderRadius: BorderRadius.circular(6)),
-                            child: Text('${l['pickeado']} / ${l['solicitado']}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
+                            child: Text('$pickVal / $solVal', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
                           ),
                         ],
                       ),
@@ -2759,10 +2771,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                         ? null
                         : () async {
                             try {
-                              for (var l in _lineasOvFarmacia) {
-                                final int idLinea = l['id_detalle'];
-                                final int cantPick = l['pickeado'];
-                                final Map<String, int> lotesMap = l['lotes_pickeados'] ?? {};
+                              for (var rawL in _lineasOvFarmacia) {
+                                final l = rawL as Map;
+                                final int idLinea = (l['id_detalle'] as num).toInt();
+                                final int cantPick = (l['pickeado'] as num?)?.toInt() ?? 0;
+                                final Map lotesMap = (l['lotes_pickeados'] as Map?) ?? {};
                                 String lotesStr = lotesMap.entries.map((e) => '${e.key} (${e.value} UN)').join(' | ');
 
                                 await supabase.from('netsuite_detalle_ov').update({
@@ -2771,14 +2784,13 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                                 }).eq('id', idLinea);
                               }
 
-                              final ovMap = _ovCabeceraActiva ??
+                              final Map ovMap = _ovCabeceraActiva ??
                                   {
                                     'id': int.tryParse(_ovSeleccionadaKey),
                                     'numero_ov': _txtBuscarOvPicking.text.trim().toUpperCase(),
                                     'cliente_nombre': 'CLIENTE',
                                   };
 
-                              // Al terminar el Picking, la orden pasa automáticamente a PENDIENTE_PACKING
                               if (ovMap['id'] != null) {
                                 try {
                                   await supabase.from('netsuite_ordenes_venta').update({'estado_ns': 'PENDIENTE_PACKING'}).eq('id', ovMap['id']);
@@ -2820,7 +2832,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     return _construirPantallaPickingUnificada(esModoFarmacia: true);
   }
 
-  Future<void> _procesarEscaneoFarmacia() async {
+  Future _procesarEscaneoFarmacia() async {
     final rawScan = _txtScanFarmacia.text.trim().toUpperCase();
     if (rawScan.isEmpty) return;
     _txtScanFarmacia.clear();
@@ -2830,24 +2842,28 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
 
-    int indexMatch = _lineasOvFarmacia.indexWhere((l) {
+    int indexMatch = _lineasOvFarmacia.indexWhere((rawL) {
+      final l = rawL as Map;
       if (l['sku'] == rawScan) return true;
       final List barcodes = l['barcodes'] ?? [];
-      return barcodes.any((b) => b['codigo_barras'] == rawScan);
+      return barcodes.any((b) => (b as Map)['codigo_barras'] == rawScan);
     });
 
     if (indexMatch != -1) {
-      final linea = _lineasOvFarmacia[indexMatch];
-      final cantSolicitada = linea['solicitado'] as int;
-      final cantPickeada = linea['pickeado'] as int;
+      final Map linea = _lineasOvFarmacia[indexMatch] as Map;
+      final int cantSolicitada = (linea['solicitado'] as num?)?.toInt() ?? 0;
+      final int cantPickeada = (linea['pickeado'] as num?)?.toInt() ?? 0;
 
       int multiplo = 1;
       if (linea['sku'] == rawScan) {
         multiplo = 1;
       } else {
         final List barcodes = linea['barcodes'] ?? [];
-        final bMatch = barcodes.firstWhere((b) => b['codigo_barras'] == rawScan, orElse: () => {'multiplo': 1});
-        multiplo = bMatch['multiplo'] as int;
+        final bMatch = barcodes.firstWhere(
+          (b) => (b as Map)['codigo_barras'] == rawScan,
+          orElse: () => {'multiplo': 1},
+        ) as Map;
+        multiplo = (bMatch['multiplo'] as num?)?.toInt() ?? 1;
       }
 
       if (cantPickeada >= cantSolicitada) {
@@ -2855,10 +2871,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         return;
       }
 
-      List> lotesDisponibles = [];
+      List lotesDisponibles = [];
       try {
         final skuRaiz = linea['sku'].toString().split('-').first.trim();
-        final Map<String, int> agrupado = {};
+        final Map agrupado = {};
 
         final resInv = await supabase
             .from('bodega_inventario_ubicacion')
@@ -2870,11 +2886,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           if (ubi == 'ZONA-MERMA') continue;
           final l = (r['lote'] ?? 'S/L').toString().split('|QA:').first.trim().toUpperCase();
           final v = (r['fecha_vencimiento_cl'] ?? '').toString().trim();
-          final c = (r['cantidad_unidades'] as num?)?.toInt() ?? 0;
+          final int c = (r['cantidad_unidades'] as num?)?.toInt() ?? 0;
           if (c > 0) {
             final loteVenc = v.isNotEmpty ? '$l / $v' : l;
             final key = '$loteVenc [Rack: $ubi]';
-            agrupado[key] = (agrupado[key] ?? 0) + c;
+            agrupado[key] = ((agrupado[key] as int?) ?? 0) + c;
           }
         }
 
@@ -2882,27 +2898,29 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             .from('registro_recepcion')
             .select('lote, fecha_vencimiento_cl, unidades_totales, bodega')
             .ilike('sku', '%$skuRaiz%');
-        for (var r in resRec) {
-          if (!_perteneceABodegaActiva(r)) continue;
+        for (var r in (resRec as List)) {
+          if (!_perteneceABodegaActiva(r as Map)) continue;
           final l = (r['lote'] ?? 'S/L').toString().split('|QA:').first.trim().toUpperCase();
           final v = (r['fecha_vencimiento_cl'] ?? '').toString().trim();
-          final c = (r['unidades_totales'] as num?)?.toInt() ?? 0;
+          final int c = (r['unidades_totales'] as num?)?.toInt() ?? 0;
           if (l.isNotEmpty && l != 'S/L') {
             final key = v.isNotEmpty ? '$l / $v' : l;
             if (!agrupado.containsKey(key)) agrupado[key] = c;
           }
         }
 
-        lotesDisponibles = agrupado.entries.map((e) => {'lote_venc': e.key, 'stock': e.value}).toList();
-        lotesDisponibles.sort((a, b) => (b['stock'] as int).compareTo(a['stock'] as int));
+        lotesDisponibles = agrupado.entries.map((e) => {'lote_venc': e.key.toString(), 'stock': e.value as int}).toList();
+        lotesDisponibles.sort((a, b) => ((b as Map)['stock'] as int).compareTo((a as Map)['stock'] as int));
       } catch (_) {}
 
       if (!mounted) return;
-      final resultado = await showDialog>(
+      final resultado = await showDialog(
         context: context,
         barrierDismissible: false,
         builder: (ctx) {
-          String loteSeleccionado = lotesDisponibles.isNotEmpty ? lotesDisponibles.first['lote_venc'] : 'NUEVO_MANUAL';
+          String loteSeleccionado = lotesDisponibles.isNotEmpty
+              ? (lotesDisponibles.first as Map)['lote_venc'].toString()
+              : 'NUEVO_MANUAL';
           final txtLoteManual = TextEditingController(text: 'S/L');
           final txtVencManual = TextEditingController();
 
@@ -2932,21 +2950,24 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                         child: Text('Faltan $faltante UN para completar.', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A), fontSize: 13)),
                       ),
                       if (lotesDisponibles.isNotEmpty)
-                        DropdownButtonFormField<String>(
+                        DropdownButtonFormField(
                           value: loteSeleccionado,
                           isExpanded: true,
                           decoration: const InputDecoration(labelText: 'Lote / Vencimiento en Stock', border: OutlineInputBorder()),
                           items: [
-                            ...lotesDisponibles.map((e) => DropdownMenuItem(
-                                  value: e['lote_venc'],
-                                  child: Text('${e['lote_venc']} (Disp: ${e['stock']} UN)', style: const TextStyle(fontSize: 12)),
-                                )),
+                            ...lotesDisponibles.map((rawE) {
+                              final e = rawE as Map;
+                              return DropdownMenuItem(
+                                value: e['lote_venc'].toString(),
+                                child: Text('${e['lote_venc']} (Disp: ${e['stock']} UN)', style: const TextStyle(fontSize: 12)),
+                              );
+                            }),
                             const DropdownMenuItem(
                               value: 'NUEVO_MANUAL',
                               child: Text('OTRO / SIN LOTE', style: TextStyle(color: Color(0xFF1D4ED8), fontWeight: FontWeight.bold, fontSize: 12)),
                             ),
                           ],
-                          onChanged: (v) => setStateSB(() => loteSeleccionado = v!),
+                          onChanged: (v) => setStateSB(() => loteSeleccionado = (v ?? 'NUEVO_MANUAL').toString()),
                         ),
                       if (lotesDisponibles.isEmpty || loteSeleccionado == 'NUEVO_MANUAL') ...[
                         const SizedBox(height: 12),
@@ -3002,17 +3023,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       if (resultado == null) return;
 
-      final loteEscaneado = resultado['lote_venc'] as String;
-      int cantidadASumar = resultado['cantidad'] as int;
+      final Map resMap = resultado as Map;
+      final String loteEscaneado = resMap['lote_venc'].toString();
+      int cantidadASumar = (resMap['cantidad'] as num).toInt();
 
       setState(() {
         if ((cantPickeada + cantidadASumar) > cantSolicitada) {
           cantidadASumar = cantSolicitada - cantPickeada;
         }
-        _lineasOvFarmacia[indexMatch]['pickeado'] = cantPickeada + cantidadASumar;
-        final Map<String, int> lotesAsignados = _lineasOvFarmacia[indexMatch]['lotes_pickeados'] ?? <String, int>{};
-        lotesAsignados[loteEscaneado] = (lotesAsignados[loteEscaneado] ?? 0) + cantidadASumar;
-        _lineasOvFarmacia[indexMatch]['lotes_pickeados'] = lotesAsignados;
+        linea['pickeado'] = cantPickeada + cantidadASumar;
+        final Map lotesAsignados = (linea['lotes_pickeados'] as Map?) ?? {};
+        lotesAsignados[loteEscaneado] = ((lotesAsignados[loteEscaneado] as int?) ?? 0) + cantidadASumar;
+        linea['lotes_pickeados'] = lotesAsignados;
       });
       _notificar('Extraído: $cantidadASumar UN', color: const Color(0xFF047857));
     } else {
@@ -3024,7 +3046,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // MÓDULO 8: PACKING POR BULTOS / PALLET -> PASA A FACTURACIÓN
   // ===================================================================
   String _ovPackingAuditKey = 'SIN_OV';
-  Map<String, dynamic>? _ovPackingCabeceraActiva;
+  Map? _ovPackingCabeceraActiva;
   List _lineasAuditoriaPacking = [];
   final Map _lpnConsolidadoMapa = {};
   final TextEditingController _txtBuscarOvPacking = TextEditingController();
@@ -3062,7 +3084,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .or('numero_ov.ilike.%$sinFa%,numero_ov.eq.$q')
           .order('id', ascending: false)
           .limit(5);
-      final lista = List>.from(res as List)
+      final List lista = (res as List)
+          .map((e) => Map.from(e as Map))
           .where((r) => _perteneceABodegaActiva(r))
           .toList();
       if (lista.isEmpty) {
@@ -3070,7 +3093,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         setState(() => _cargandoAuditoriaPack = false);
         return;
       }
-      _ovPackingCabeceraActiva = lista.first;
+      _ovPackingCabeceraActiva = lista.first as Map;
       final cli = (_ovPackingCabeceraActiva!['cliente_nombre'] ?? '').toString().toUpperCase();
       _txtComunaDespachoPack.text = cli.contains('CONCEPCION') ? 'CONCEPCIÓN' : 'SANTIAGO';
       await _cargarOrdenParaAuditoriaPacking(_ovPackingCabeceraActiva!['id'].toString());
@@ -3101,7 +3124,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final resDet = await supabase.from('netsuite_detalle_ov').select().eq('orden_id', idNum);
       final resMaestra = await supabase.from('maestra_sku').select('sku, descripcion, multiplo, codigo_barras, marca').range(0, 4999);
 
-      final List> listaTemp = [];
+      final List listaTemp = [];
 
       for (final det in (resDet as List)) {
         final skuOv = (det['sku'] ?? '').toString().trim().toUpperCase();
@@ -3180,8 +3203,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
 
     final sku = linea['sku'].toString();
-    final int solicitado = linea['solicitado'] as int;
-    final int mult = (linea['multiplo'] as int?) ?? 1;
+    final int solicitado = (linea['solicitado'] as num?)?.toInt() ?? 0;
+    final int mult = (linea['multiplo'] as num?)?.toInt() ?? 1;
 
     final txtUnid = TextEditingController(text: (linea['auditado_unid'] ?? solicitado).toString());
     final txtLote = TextEditingController(text: (linea['lote_auditado'] ?? 'S/L').toString());
@@ -3239,9 +3262,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     if (conf == null) return;
 
-    final int unidAudit = conf['unid'] as int;
-    final String loteAudit = conf['lote'] as String;
-    final String vencAudit = conf['venc'] as String;
+    final Map confMap = conf as Map;
+    final int unidAudit = (confMap['unid'] as num).toInt();
+    final String loteAudit = confMap['lote'].toString();
+    final String vencAudit = confMap['venc'].toString();
     final int cajasEst = (unidAudit / (mult < 1 ? 1 : mult)).ceil();
 
     setState(() {
@@ -3265,7 +3289,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     });
   }
 
-  Future<void> _procesarEscaneoAuditoriaPacking() async {
+  Future _procesarEscaneoAuditoriaPacking() async {
     final scan = _txtScanAuditoriaPack.text.trim().toUpperCase();
     if (scan.isEmpty) return;
     _txtScanAuditoriaPack.clear();
@@ -3276,20 +3300,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
 
     int idx = _lineasAuditoriaPacking.indexWhere((el) {
-      final m = el as Map<String, dynamic>;
+      final m = el as Map;
       if (m['sku'] == scan) return true;
       final List bList = m['barcodes'] ?? [];
       return bList.contains(scan);
     });
 
     if (idx != -1) {
-      await _abrirModalAuditarLineaPacking(_lineasAuditoriaPacking[idx] as Map<String, dynamic>);
+      await _abrirModalAuditarLineaPacking(_lineasAuditoriaPacking[idx] as Map);
     } else {
       _notificar('El código $scan no pertenece a esta orden.', color: Colors.red);
     }
   }
 
-  Future<void> _cerrarPackingYConsolidarLpn({required bool soloEtiquetaLpn}) async {
+  Future _cerrarPackingYConsolidarLpn({required bool soloEtiquetaLpn}) async {
     if (_lpnConsolidadoMapa.isEmpty) {
       _notificar('Aún no ha auditado ningún artículo en Packing.', color: Colors.orange);
       return;
@@ -3301,7 +3325,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       lpnMaster = _txtLpnConsolidadoPack.text.trim().toUpperCase();
     }
 
-    final ovMap = _ovPackingCabeceraActiva ??
+    final Map ovMap = _ovPackingCabeceraActiva ??
         {
           'id': int.tryParse(_ovPackingAuditKey),
           'numero_ov': _txtBuscarOvPacking.text.trim().toUpperCase(),
@@ -3329,13 +3353,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     setState(() => _guardandoPackingLpn = true);
 
     try {
-      final listaConsolidada = _lpnConsolidadoMapa.values.map((e) => Map<String, dynamic>.from(e)).toList();
+      final List listaConsolidada = _lpnConsolidadoMapa.values.map((e) => Map.from(e as Map)).toList();
       final String fechaIso = DateTime.now().toIso8601String();
       final String auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'PACKING_RF').toString().toUpperCase();
 
-      for (final item in listaConsolidada) {
+      for (final rawItem in listaConsolidada) {
+        final item = rawItem as Map;
         final idDet = item['id_detalle'];
-        final int cantAudit = item['unidades_totales'] as int;
+        final int cantAudit = (item['unidades_totales'] as num?)?.toInt() ?? 0;
         final String loteStr = item['lote'].toString();
         final String vencStr = (item['fecha_vencimiento_cl'] ?? 'S/F').toString();
         final String trazabilidadCompleta = '[$lpnMaster] $loteStr / $vencStr ($cantAudit UN)';
@@ -3351,23 +3376,25 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
       }
 
-      // Al terminar el Packing, pasa a PENDIENTE_FACTURACION y desaparece de Picking/Packing
       if (ovMap['id'] != null) {
         try {
           await supabase.from('netsuite_ordenes_venta').update({'estado_ns': 'PENDIENTE_FACTURACION'}).eq('id', ovMap['id']);
         } catch (_) {}
       }
 
-      final detalleJsonTorre = listaConsolidada.map((item) => {
-        'lpn_consolidado': lpnMaster,
-        'comuna': comunaStr,
-        'tipo_empaque': _tipoEmpaquePack,
-        'bultos': cantBultos,
-        'sku': item['sku'],
-        'descripcion': item['descripcion'],
-        'solicitado': item['solicitado'],
-        'pickeado': item['unidades_totales'],
-        'lotes': '${item['lote']} / ${item['fecha_vencimiento_cl'] ?? 'S/F'} (${item['unidades_totales']} UN)',
+      final detalleJsonTorre = listaConsolidada.map((rawItem) {
+        final item = rawItem as Map;
+        return {
+          'lpn_consolidado': lpnMaster,
+          'comuna': comunaStr,
+          'tipo_empaque': _tipoEmpaquePack,
+          'bultos': cantBultos,
+          'sku': item['sku'],
+          'descripcion': item['descripcion'],
+          'solicitado': item['solicitado'],
+          'pickeado': item['unidades_totales'],
+          'lotes': '${item['lote']} / ${item['fecha_vencimiento_cl'] ?? 'S/F'} (${item['unidades_totales']} UN)',
+        };
       }).toList();
 
       try {
@@ -3408,10 +3435,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   Widget _construirVistaAuditoriaPackingLpn() {
     final int totalSkusOrden = _lineasAuditoriaPacking.length;
     final int totalSkusEnLpn = _lpnConsolidadoMapa.length;
-    final int totalUnidEnLpn = _lpnConsolidadoMapa.values.fold<int>(
-      0,
-      (s, e) => s + ((e['unidades_totales'] as int?) ?? 0),
-    );
+    int totalUnidEnLpn = 0;
+    for (final val in _lpnConsolidadoMapa.values) {
+      final m = val as Map;
+      totalUnidEnLpn += (m['unidades_totales'] as num?)?.toInt() ?? 0;
+    }
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 86),
@@ -3473,14 +3501,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: DropdownButtonFormField<String>(
+                    child: DropdownButtonFormField(
                       value: _tipoEmpaquePack,
                       decoration: const InputDecoration(labelText: 'Empaque'),
                       items: const [
                         DropdownMenuItem(value: 'BULTO', child: Text('POR BULTO')),
                         DropdownMenuItem(value: 'PALLET', child: Text('POR PALLET')),
                       ],
-                      onChanged: (v) => setState(() => _tipoEmpaquePack = v ?? 'BULTO'),
+                      onChanged: (v) => setState(() => _tipoEmpaquePack = (v ?? 'BULTO').toString()),
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -3514,10 +3542,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                       onPressed: () {
                         setState(() {
                           for (final rawL in _lineasAuditoriaPacking) {
-                            final l = rawL as Map<String, dynamic>;
+                            final l = rawL as Map;
                             l['consolidado_en_lpn'] = true;
                             final s = l['sku'].toString();
-                            final u = (l['auditado_unid'] as int?) ?? (l['solicitado'] as int);
+                            final int u = (l['auditado_unid'] as num?)?.toInt() ?? ((l['solicitado'] as num?)?.toInt() ?? 0);
                             _lpnConsolidadoMapa[s] = {
                               'id_detalle': l['id_detalle'],
                               'sku': s,
@@ -3539,10 +3567,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   ],
                 ),
                 ..._lineasAuditoriaPacking.map((rawLin) {
-                  final l = rawLin as Map<String, dynamic>;
+                  final l = rawLin as Map;
                   final bool yaEnLpn = l['consolidado_en_lpn'] == true;
-                  final int sol = l['solicitado'] as int;
-                  final int aud = l['auditado_unid'] as int;
+                  final int sol = (l['solicitado'] as num?)?.toInt() ?? 0;
+                  final int aud = (l['auditado_unid'] as num?)?.toInt() ?? 0;
                   return InkWell(
                     onTap: () => _abrirModalAuditarLineaPacking(l),
                     child: Container(
@@ -3601,7 +3629,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         ],
       ],
     );
-  }  
+  }
 
 
   // ===================================================================
