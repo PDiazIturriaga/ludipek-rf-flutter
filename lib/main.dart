@@ -79,6 +79,15 @@ Map<String, dynamic>? usuarioActivo;
 String bodegaActiva = 'Bodega Santiago';
 final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.light);
 
+// Validador Multi-Bodega con respaldo seguro para registros antiguos sin columna bodega
+bool _perteneceABodegaActiva(Map<dynamic, dynamic> fila) {
+  final rawBod = (fila['bodega'] ?? '').toString().trim();
+  if (rawBod.isEmpty || rawBod.toUpperCase() == 'NULL' || rawBod.toUpperCase() == 'NONE') {
+    return bodegaActiva.toUpperCase() == 'BODEGA SANTIAGO';
+  }
+  return rawBod.toUpperCase() == bodegaActiva.toUpperCase();
+}
+
 Future<Session?> asegurarSesionSupabase() async {
   var sesion = supabase.auth.currentSession;
   if (sesion == null) {
@@ -454,7 +463,7 @@ Future generarPdfRecepcion15x10(String lpn, List lineasPallet) async {
 // =====================================================================
 // GENERADOR DE PACKING LIST FARMACIA (A4 LANDSCAPE + LOGO + LOTES)
 // =====================================================================
-Future<void> generarPdfPackingListFA(Map<String, dynamic> ovCabecera, List<Map<String, dynamic>> lineas) async {
+Future<void> generarPdfPackingListFA(Map<String, dynamic> ovCabecera, List> lineas) async {
     final pdf = pw.Document();
     
     // Intentar cargar logo (puede fallar si no existe en assets en web, se maneja el fallback)
@@ -1009,9 +1018,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // Variables Módulo 1: Recepción
   int? _asnActualId;
   String _asnSeleccionadoKey = 'SIN_ASN';
-  List<Map<String, dynamic>> _asnsCabecera = [];
-  List<Map<String, dynamic>> _lineasAsnActual = [];
-  final List<Map<String, dynamic>> _palletEnConstruccion = [];
+  List> _asnsCabecera = [];
+  List> _lineasAsnActual = [];
+  final List> _palletEnConstruccion = [];
   Map<String, int> _cajasRecibidasBdPorSku = {};
 
   final TextEditingController _txtLpnManual = TextEditingController();
@@ -1030,8 +1039,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   List<String> _opcionesLote = [];
   List<String> _opcionesVencimiento = [];
 
-  List<Map<String, dynamic>> _sugerenciasSkuRecepcion = [];
-  List<Map<String, dynamic>> _sugerenciasSkuCiclico = [];
+  List> _sugerenciasSkuRecepcion = [];
+  List> _sugerenciasSkuCiclico = [];
   Timer? _debounceSku;
 
   String _resumenAsn = 'Modo Recepción Libre activo.';
@@ -1050,7 +1059,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   // Variables Módulo 2: Almacenamiento (Paso a Paso)
   int _pasoAlmacenamiento = 1;
-  List<Map<String, dynamic>> _lineasLpnAlmacenamiento = [];
+  List> _lineasLpnAlmacenamiento = [];
   String _origenLpnAlmacenamiento = 'ANDEN_TRANSITO';
   bool _validandoLpnAlmacenamiento = false;
   final TextEditingController _txtPutLpn = TextEditingController();
@@ -1063,15 +1072,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   final TextEditingController _txtSkuPicking = TextEditingController();
   final TextEditingController _txtCajasMoverPicking = TextEditingController(text: '1');
   final TextEditingController _txtUbiDestinoPicking = TextEditingController(text: 'ZONA-PICKING');
-  List<Map<String, dynamic>> _sugerenciasSkuPicking = [];
-  List<Map<String, dynamic>> _ubicacionesFefoPicking = [];
+  List> _sugerenciasSkuPicking = [];
+  List> _ubicacionesFefoPicking = [];
   Map<String, dynamic>? _stockFefoSeleccionado;
   bool _buscandoFefo = false;
   String _mensajeEstadoFefo = 'Ingrese o escanee un SKU para buscar la ubicación con fecha más próxima a vencer (FEFO).';
 
   // Variables Módulo 3: Consulta y Conteo Cíclico
   final TextEditingController _txtScanConsulta = TextEditingController();
-  List<Map<String, dynamic>> _resultadosConsulta = [];
+  List> _resultadosConsulta = [];
 
   final TextEditingController _cicloUbicacionCtrl = TextEditingController();
   final TextEditingController _cicloLpnCtrl = TextEditingController();
@@ -1151,7 +1160,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
       }
 
-      // 2. Traer las ubicaciones actualmente ocupadas y cruzarlas con las de esta bodega
+      // 2. Traer las ubicaciones actualmente ocupadas y cruzarlas estrictamente con las de esta bodega
       final resOcupadas = await supabase
           .from('bodega_inventario_ubicacion')
           .select('codigo_ubicacion, bodega');
@@ -1159,8 +1168,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final Set<String> ocupadas = {};
       for (final fila in resOcupadas) {
         final cod = (fila['codigo_ubicacion'] ?? '').toString().toUpperCase().trim();
-        final bodFila = (fila['bodega'] ?? '').toString().trim();
-        if (cod.isNotEmpty && (bodFila.isEmpty || bodFila == bodegaActiva)) {
+        if (cod.isNotEmpty && _perteneceABodegaActiva(fila as Map)) {
           ocupadas.add(cod);
         }
       }
@@ -1196,21 +1204,28 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'ALERTA ROJA en $ubicacion: Posición ocupada sin registro. Bloqueada para evitar duplicar LPN.',
         color: const Color(0xFFDC2626),
       );
-      // Dejar traza en el historial para que Inventario regularice el movimiento
+      // Dejar traza en el historial con la bodega activa para que Inventario regularice el movimiento
+      final payloadHist = {
+        'bodega': bodegaActiva,
+        'usuario': usuarioActivo?['usuario']?.toString() ?? 'APP_RF',
+        'tipo_movimiento': 'ALERTA_VACIA_OCUPADA',
+        'lpn': 'SIN-REGISTRO',
+        'sku': 'REVISION-FISICA',
+        'lote': 'S/L',
+        'ubicacion_origen': 'DESCONOCIDO',
+        'ubicacion_destino': ubicacion,
+        'cajas_afectadas': 0,
+        'unidades_afectadas': 0,
+        'fecha': DateTime.now().toIso8601String(),
+      };
       try {
-        await supabase.from('historial_movimientos').insert({
-          'usuario': usuarioActivo?['usuario']?.toString() ?? 'APP_RF',
-          'tipo_movimiento': 'ALERTA_VACIA_OCUPADA',
-          'lpn': 'SIN-REGISTRO',
-          'sku': 'REVISION-FISICA',
-          'lote': 'S/L',
-          'ubicacion_origen': 'DESCONOCIDO',
-          'ubicacion_destino': ubicacion,
-          'cajas_afectadas': 0,
-          'unidades_afectadas': 0,
-          'fecha': DateTime.now().toIso8601String(),
-        });
-      } catch (_) {}
+        await supabase.from('historial_movimientos').insert(payloadHist);
+      } catch (_) {
+        try {
+          final copiaSinBod = Map<String, dynamic>.from(payloadHist)..remove('bodega');
+          await supabase.from('historial_movimientos').insert(copiaSinBod);
+        } catch (_) {}
+      }
     }
   }
 
@@ -1362,6 +1377,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
 
       payloadSupabase.add({
+        'bodega': bodegaActiva,
         'lote_auditoria': loteId,
         'pasillo': pasillo,
         'codigo_ubicacion': ubi,
@@ -1373,7 +1389,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
 
     try {
-      await supabase.from('auditoria_ubicaciones_vacias').insert(payloadSupabase);
+      try {
+        await supabase.from('auditoria_ubicaciones_vacias').insert(payloadSupabase);
+      } catch (_) {
+        final fallbackSinBod = payloadSupabase.map((e) {
+          final m = Map<String, dynamic>.from(e);
+          m.remove('bodega');
+          return m;
+        }).toList();
+        await supabase.from('auditoria_ubicaciones_vacias').insert(fallbackSinBod);
+      }
     } catch (e) {
       debugPrint('Aviso guardando en auditoria_ubicaciones_vacias: $e');
     } finally {
@@ -1673,7 +1698,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .eq('sku', skuBuscar)
           .order('codigo_ubicacion', ascending: true);
 
-      final nuevasFilas = List< Map<String, dynamic> >.from(res);
+      final nuevasFilas = List< Map<String, dynamic> >.from(res)
+          .where((fila) => _perteneceABodegaActiva(fila))
+          .toList();
+
       for (final fila in nuevasFilas) {
         final int idReg = (fila['id'] as num).toInt();
         _itemsAuditadosSkuMemoria[idReg] = fila;
@@ -1691,7 +1719,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       });
 
       if (nuevasFilas.isEmpty) {
-        _notificar('El SKU $skuBuscar no registra ubicaciones con stock en el sistema.', color: Colors.orange);
+        _notificar('El SKU $skuBuscar no registra ubicaciones con stock en $bodegaActiva.', color: Colors.orange);
       }
     } catch (e) {
       _notificar('Error buscando ubicaciones del SKU: $e', color: Colors.red);
@@ -1788,6 +1816,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final int idReg = (item['id'] as num).toInt();
       final String estado = _estadoAuditoriaPorId[idReg] ?? 'SIN_REVISAR';
       return {
+        'bodega': bodegaActiva,
         'lote_auditoria': loteId,
         'sku': (item['sku'] ?? _skuDirigidoActivo).toString().toUpperCase(),
         'codigo_ubicacion': (item['codigo_ubicacion'] ?? '').toString().toUpperCase(),
@@ -1803,7 +1832,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }).toList();
 
     try {
-      await supabase.from('auditoria_ciclico_sku').insert(payload);
+      try {
+        await supabase.from('auditoria_ciclico_sku').insert(payload);
+      } catch (_) {
+        final fallbackSinBod = payload.map((e) {
+          final m = Map<String, dynamic>.from(e);
+          m.remove('bodega');
+          return m;
+        }).toList();
+        await supabase.from('auditoria_ciclico_sku').insert(fallbackSinBod);
+      }
     } catch (e) {
       debugPrint('Aviso enviando auditoría de SKU: $e');
     } finally {
@@ -2323,7 +2361,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                               }
                             }
 
-                              // Guardar el Packing List en Supabase para que aparezca en la Torre de Control
+                              // Guardar el Packing List en Supabase con bodegaActiva para que aparezca en la Torre de Control
                               final detalleParaTorre = _lineasOvFarmacia.map((l) {
                                 final lotesMap = l['lotes_pickeados'] as Map<String, int>? ?? {};
                                 String eanBase = '';
@@ -2340,16 +2378,24 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                                 };
                               }).toList();
 
+                              final payloadPackingFa = {
+                                'bodega': bodegaActiva,
+                                'orden_id': ovMap['id'],
+                                'numero_ov': ovMap['numero_ov']?.toString() ?? 'S/N',
+                                'cliente_nombre': ovMap['cliente_nombre']?.toString() ?? 'SIN CLIENTE',
+                                'usuario_picking': usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'OPERADOR RF',
+                                'detalle_json': detalleParaTorre,
+                                'fecha_emision': DateTime.now().toIso8601String(),
+                              };
+
                               try {
-                                await supabase.from('wms_packing_lists_fa').insert({
-                                  'orden_id': ovMap['id'],
-                                  'numero_ov': ovMap['numero_ov']?.toString() ?? 'S/N',
-                                  'cliente_nombre': ovMap['cliente_nombre']?.toString() ?? 'SIN CLIENTE',
-                                  'usuario_picking': usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'OPERADOR RF',
-                                  'detalle_json': detalleParaTorre,
-                                  'fecha_emision': DateTime.now().toIso8601String(),
-                                });
-                              } catch (_) {}
+                                await supabase.from('wms_packing_lists_fa').insert(payloadPackingFa);
+                              } catch (_) {
+                                try {
+                                  final copiaSinBod = Map<String, dynamic>.from(payloadPackingFa)..remove('bodega');
+                                  await supabase.from('wms_packing_lists_fa').insert(copiaSinBod);
+                                } catch (_) {}
+                              }
 
                               // Emitir también el PDF en el dispositivo
                               final copiaLineas = List< Map<String, dynamic> >.from(_lineasOvFarmacia);
@@ -2373,7 +2419,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     );
   }
 
-  // Carga TODAS las Órdenes de Venta de Farmacia sin quedarse pegado
+  // Carga TODAS las Órdenes de Venta de la bodega activa sin quedarse pegado
   Future _cargarOVsPendientes() async {
     setState(() {
       _cargandoOv = true;
@@ -2385,13 +2431,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .from('netsuite_ordenes_venta')
           .select()
           .order('id', ascending: false)
-          .limit(150);
+          .limit(200);
 
       final List todas = res as List;
 
-      // Mostrar todas las OVs Estándar, OTs a Concepción y OVs Farmacia que no estén despachadas ni anuladas
+      // Mostrar todas las OVs Estándar, OTs a Concepción y OVs Farmacia de la bodega activa que no estén despachadas ni anuladas
       final List activas = todas.where((rawOv) {
         final ov = Map.from(rawOv as Map);
+        if (!_perteneceABodegaActiva(ov)) return false;
         final estado = (ov['estado_ns'] ?? ov['estado'] ?? '').toString().toUpperCase();
         return estado != 'DESPACHADO' && estado != 'ANULADO' && estado != 'CERRADO';
       }).map((rawOv) => Map<String, dynamic>.from(rawOv as Map)).toList();
@@ -2433,7 +2480,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       if (resDetalle.isNotEmpty) {
         final resMaestra = await supabase
             .from('maestra_sku')
-            .select('sku, descripcion, multiplo, codigo_barras, marca');
+            .select('sku, descripcion, multiplo, codigo_barras, marca')
+            .range(0, 4999);
 
         final List< Map<String, dynamic> > lineasCargadas = [];
 
@@ -2532,20 +2580,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         return;
       }
 
-      // 1. BUSCAR LOTES DISPONIBLES EN RECEPCIÓN Y EN BODEGA PARA ESTE SKU
-      _notificar('Consultando lotes disponibles...', color: const Color(0xFF1D4ED8));
-      List<Map<String, dynamic>> lotesDisponibles = [];
+      // 1. BUSCAR LOTES DISPONIBLES EN RECEPCIÓN Y EN BODEGA ACTIVA PARA ESTE SKU
+      _notificar('Consultando lotes disponibles en $bodegaActiva...', color: const Color(0xFF1D4ED8));
+      List> lotesDisponibles = [];
       try {
         final skuRaiz = linea['sku'].toString().split('-').first.trim();
         final Map<String, int> agrupado = {};
 
-        // A) Buscar en stock ubicado (bodega_inventario_ubicacion) incluyendo ubicación y orden FEFO
-        // A) Buscar en stock ubicado mostrando Rack + Lote + Vencimiento
+        // A) Buscar en stock ubicado (bodega_inventario_ubicacion) de la bodega activa mostrando Rack + Lote + Vencimiento
         final resInv = await supabase
             .from('bodega_inventario_ubicacion')
-            .select('codigo_ubicacion, lote, fecha_vencimiento_cl, cantidad_unidades')
+            .select('codigo_ubicacion, lote, fecha_vencimiento_cl, cantidad_unidades, bodega')
             .ilike('sku', '%$skuRaiz%');
         for (var r in (resInv as List)) {
+          if (!_perteneceABodegaActiva(r as Map)) continue;
           final ubi = (r['codigo_ubicacion'] ?? 'RACK').toString().trim().toUpperCase();
           if (ubi == 'ZONA-MERMA') continue;
           final l = (r['lote'] ?? 'S/L').toString().split('|QA:').first.trim().toUpperCase();
@@ -2558,12 +2606,13 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           }
         }
 
-        // B) Si no está en rack (o adicionalmente), buscar en Recepciones (registro_recepcion)
+        // B) Si no está en rack (o adicionalmente), buscar en Recepciones (registro_recepcion) de la bodega activa
         final resRec = await supabase
             .from('registro_recepcion')
-            .select('lote, fecha_vencimiento_cl, unidades_totales')
+            .select('lote, fecha_vencimiento_cl, unidades_totales, bodega')
             .ilike('sku', '%$skuRaiz%');
         for (var r in resRec) {
+          if (!_perteneceABodegaActiva(r)) continue;
           final l = (r['lote'] ?? 'S/L').toString().split('|QA:').first.trim().toUpperCase();
           final v = (r['fecha_vencimiento_cl'] ?? '').toString().trim();
           final c = (r['unidades_totales'] as num?)?.toInt() ?? 0;
@@ -2581,7 +2630,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       // 2. MOSTRAR DIÁLOGO DE SELECCIÓN DE LOTE/VENCIMIENTO Y CANTIDAD MASIVA
       if (!mounted) return;
-      final resultado = await showDialog<Map<String, dynamic>>(
+      final resultado = await showDialog>(
         context: context,
         barrierDismissible: false,
         builder: (ctx) {
@@ -2760,7 +2809,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       final resMaestra = await supabase
           .from('maestra_sku')
-          .select('sku, descripcion, multiplo, codigo_barras');
+          .select('sku, descripcion, multiplo, codigo_barras')
+          .range(0, 4999);
 
       final List listaTemp = [];
 
@@ -2845,10 +2895,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     try {
       final resInv = await supabase
           .from('bodega_inventario_ubicacion')
-          .select('lote, fecha_vencimiento_cl')
+          .select('lote, fecha_vencimiento_cl, bodega')
           .ilike('sku', '%$sku%')
-          .limit(15);
+          .limit(30);
       for (final r in (resInv as List)) {
+        if (!_perteneceABodegaActiva(r as Map)) continue;
         final l = (r['lote'] ?? 'S/L').toString().split('|QA:').first.trim().toUpperCase();
         final v = normalizarFechaSql(r['fecha_vencimiento_cl']?.toString()) ?? 'S/F';
         final comb = '$l | $v';
@@ -3094,7 +3145,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         } catch (_) {}
       }
 
-      // 3. Registrar el Packing List Consolidado en wms_packing_lists_fa
+      // 3. Registrar el Packing List Consolidado en wms_packing_lists_fa con bodegaActiva
       final detalleJsonTorre = listaConsolidada.map((item) => {
         'lpn_consolidado': lpnMaster,
         'sku': item['sku'],
@@ -3104,19 +3155,29 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'lotes': '[$lpnMaster] ${item['lote']} / ${item['fecha_vencimiento_cl'] ?? 'S/F'} (${item['unidades_totales']} UN)',
       }).toList();
 
-      try {
-        await supabase.from('wms_packing_lists_fa').insert({
-          'orden_id': ovMap['id'],
-          'numero_ov': '$numOvStr ($lpnMaster)',
-          'cliente_nombre': '$clienteStr | LPN: $lpnMaster',
-          'usuario_picking': auditorStr,
-          'detalle_json': detalleJsonTorre,
-          'fecha_emision': fechaIso,
-        });
-      } catch (_) {}
+      final payloadPlConsolidado = {
+        'bodega': bodegaActiva,
+        'orden_id': ovMap['id'],
+        'numero_ov': '$numOvStr ($lpnMaster)',
+        'cliente_nombre': '$clienteStr | LPN: $lpnMaster',
+        'usuario_picking': auditorStr,
+        'detalle_json': detalleJsonTorre,
+        'fecha_emision': fechaIso,
+      };
 
-      // 4. Registrar el LPN Consolidado en registro_recepcion para que Concepción pueda consultar o recepcionar el LPN completo
+      try {
+        await supabase.from('wms_packing_lists_fa').insert(payloadPlConsolidado);
+      } catch (_) {
+        try {
+          final copiaSinBod = Map<String, dynamic>.from(payloadPlConsolidado)..remove('bodega');
+          await supabase.from('wms_packing_lists_fa').insert(copiaSinBod);
+        } catch (_) {}
+      }
+
+      // 4. Registrar el LPN Consolidado en registro_recepcion (si es OT hacia Concepción queda disponible para Bodega Concepcion)
+      final String bodegaDestinoLpn = clienteStr.contains('CONCEPCION') ? 'Bodega Concepcion' : bodegaActiva;
       final filasRecepcionLpn = listaConsolidada.map((item) => {
+        'bodega': bodegaDestinoLpn,
         'lpn': lpnMaster,
         'sku': item['sku'],
         'codigo_barras_escaneado': item['sku'],
@@ -3132,7 +3193,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       try {
         await supabase.from('registro_recepcion').insert(filasRecepcionLpn);
-      } catch (_) {}
+      } catch (_) {
+        try {
+          final fallbackSinBod = filasRecepcionLpn.map((e) {
+            final m = Map<String, dynamic>.from(e);
+            m.remove('bodega');
+            return m;
+          }).toList();
+          await supabase.from('registro_recepcion').insert(fallbackSinBod);
+        } catch (_) {}
+      }
 
       // 5. Emitir Etiqueta 15x10 del LPN Consolidado y Packing List PDF
       await generarPdfRecepcion15x10(lpnMaster, listaConsolidada);
@@ -3152,7 +3222,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       if (mounted) setState(() => _guardandoPackingLpn = false);
     }
   }
-
   Widget _construirVistaAuditoriaPackingLpn() {
     final idsDisp = {'SIN_OV', ..._ovsCabecera.map((r) => r['id'].toString())};
     final valSeguro = idsDisp.contains(_ovPackingAuditKey) ? _ovPackingAuditKey : 'SIN_OV';
@@ -3579,7 +3648,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
- // Normaliza cualquier lectura de rack ("A0102", "A-1-2", "A 01 02", "RACK A-01-02") -> "A-01-02"
+  // Normaliza cualquier lectura de rack ("A0102", "A-1-2", "A 01 02", "RACK A-01-02") -> "A-01-02"
   // Si es un LPN o un SKU, lo conserva intacto.
   String _normalizarRackOCodigo(String raw) {
     String s = raw.trim().toUpperCase();
@@ -4254,9 +4323,26 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   Future<void> _cargarAsnsActivos() async {
     try {
-      final res = await supabase.from('asn_cabecera').select().neq('estado', 'COMPLETADO').order('id', ascending: false).limit(25);
+      final res = await supabase
+          .from('asn_cabecera')
+          .select()
+          .neq('estado', 'COMPLETADO')
+          .order('id', ascending: false)
+          .limit(60);
+      final filtrados = List>.from(res)
+          .where((r) => _perteneceABodegaActiva(r))
+          .take(25)
+          .toList();
+      final idsDisp = {'SIN_ASN', ...filtrados.map((r) => r['id'].toString())};
       setState(() {
-        _asnsCabecera = List<Map<String, dynamic>>.from(res);
+        _asnsCabecera = filtrados;
+        if (!idsDisp.contains(_asnSeleccionadoKey)) {
+          _asnSeleccionadoKey = 'SIN_ASN';
+          _asnActualId = null;
+          _lineasAsnActual = [];
+          _cajasRecibidasBdPorSku = {};
+          _resumenAsn = 'Modo Recepción Libre activo ($bodegaActiva).';
+        }
       });
     } catch (ex) {
       _notificar('Error cargando ASNs: $ex', color: const Color(0xFFDC2626));
@@ -4300,7 +4386,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final resDet = await supabase.from('asn_detalle').select().eq('asn_id', id).order('sku');
       await _cargarCajasRecibidasDelAsn(id);
       setState(() {
-        _lineasAsnActual = List<Map<String, dynamic>>.from(resDet);
+        _lineasAsnActual = List>.from(resDet);
         _resumenAsn = 'Embarque activo: ${_lineasAsnActual.length} SKUs registrados.';
       });
     } catch (ex) {
@@ -4455,6 +4541,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       item['lpn'] = nuevoLpn;
       final copia = Map<String, dynamic>.from(item);
       copia.remove('descripcion_pdf');
+      copia['bodega'] = bodegaActiva;
       copia['contenedor'] = contenedorStr;
       copia['fecha_recepcion'] = fechaIso;
       datosAInsertar.add(copia);
@@ -4467,6 +4554,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         // Fallback seguro si aún no se corre el ALTER TABLE en Supabase
         final datosFallback = datosAInsertar.map((e) {
           final m = Map<String, dynamic>.from(e);
+          m.remove('bodega');
           m.remove('contenedor');
           m.remove('fecha_recepcion');
           return m;
@@ -4475,6 +4563,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
 
       final logsRecepcion = datosAInsertar.map((item) => {
+        'bodega': bodegaActiva,
         'usuario': usuarioActivo?['usuario']?.toString() ?? 'APP_RF',
         'tipo_movimiento': 'RECEPCION ($contenedorStr)',
         'lpn': item['lpn'],
@@ -4486,7 +4575,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'unidades_afectadas': item['unidades_totales'],
         'fecha': fechaIso,
       }).toList();
-      try { await supabase.from('historial_movimientos').insert(logsRecepcion); } catch (_) {}
+      try {
+        await supabase.from('historial_movimientos').insert(logsRecepcion);
+      } catch (_) {
+        try {
+          final logsFallback = logsRecepcion.map((e) {
+            final m = Map<String, dynamic>.from(e);
+            m.remove('bodega');
+            return m;
+          }).toList();
+          await supabase.from('historial_movimientos').insert(logsFallback);
+        } catch (_) {}
+      }
 
       if (_asnActualId != null) {
         for (final item in _palletEnConstruccion) {
@@ -4586,7 +4686,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
 
     if (_maestraUbicaciones.isNotEmpty && !_maestraUbicaciones.contains(ubicacionLimpia)) {
-      _notificar('BLOQUEO: La ubicación $ubicacionLimpia no existe en la Maestra.', color: Colors.red);
+      _notificar('BLOQUEO: La ubicación $ubicacionLimpia no existe en la Maestra de $bodegaActiva.', color: Colors.red);
       return;
     }
 
@@ -4612,7 +4712,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         if (cajasContadas <= 0) {
           await supabase.from('bodega_inventario_ubicacion').delete().eq('id', _editandoConteoId!);
         } else {
-          await supabase.from('bodega_inventario_ubicacion').update({
+          final payloadEdit = {
+            'bodega': bodegaActiva,
             'cajas': cajasContadas,
             'cantidad_unidades': unidadesCalculadas,
             'codigo_ubicacion': ubicacionLimpia,
@@ -4621,7 +4722,13 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             'fecha_vencimiento_cl': vencimientoCl,
             'auditor': usuarioActivo?['usuario']?.toString() ?? 'APP_RF',
             'fecha': DateTime.now().toIso8601String(),
-          }).eq('id', _editandoConteoId!);
+          };
+          try {
+            await supabase.from('bodega_inventario_ubicacion').update(payloadEdit).eq('id', _editandoConteoId!);
+          } catch (_) {
+            final copiaSinBod = Map<String, dynamic>.from(payloadEdit)..remove('bodega');
+            await supabase.from('bodega_inventario_ubicacion').update(copiaSinBod).eq('id', _editandoConteoId!);
+          }
         }
 
         _notificar('Modificación exitosa en Supabase.', color: const Color(0xFF047857));
@@ -4640,20 +4747,23 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     // MODO ORIGINAL: CONTEO CÍCLICO DIRECTO EN PISO (SUMAR)
     // =======================================================
     try {
-      // 1. AHORA BUSCAMOS POR UBICACIÓN + SKU + LOTE
+      // 1. AHORA BUSCAMOS POR BODEGA ACTIVA + UBICACIÓN + SKU + LOTE
       final query = supabase
           .from('bodega_inventario_ubicacion')
-          .select('id, cajas, cantidad_unidades')
+          .select('id, cajas, cantidad_unidades, bodega')
           .eq('codigo_ubicacion', ubicacionLimpia)
           .eq('sku', sku)
           .eq('lote', loteFinal); // <-- NUEVO FILTRO PARA AISLAR LOTES
           
       // El LPN sigue siendo la llave que define si es un bulto distinto
       final response = lpn.isEmpty 
-          ? await query.isFilter('lpn', null).limit(1)
-          : await query.eq('lpn', lpn).limit(1);
+          ? await query.isFilter('lpn', null)
+          : await query.eq('lpn', lpn);
           
-      final existeRegistro = (response as List).isNotEmpty ? response.first : null;
+      final candidatosBodega = (response as List)
+          .where((r) => _perteneceABodegaActiva(r as Map))
+          .toList();
+      final existeRegistro = candidatosBodega.isNotEmpty ? candidatosBodega.first : null;
 
       int cajasAnteriores = 0;
       int unidadesAnteriores = 0;
@@ -4688,6 +4798,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           try {
             await supabase.from('bodega_inventario_ubicacion').update({
               ...payloadUpdate,
+              'bodega': bodegaActiva,
               'fecha': DateTime.now().toIso8601String(),
             }).eq('id', existeRegistro['id']);
           } catch (_) {
@@ -4710,6 +4821,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           try {
             await supabase.from('bodega_inventario_ubicacion').insert({
               ...payloadInsert,
+              'bodega': bodegaActiva,
               'fecha': DateTime.now().toIso8601String(),
             });
           } catch (_) {
@@ -4723,20 +4835,27 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       // -- LOG DE TRAZABILIDAD (CONTEO CÍCLICO) --
       if (tipoMov != 'AJUSTE_CICLICO_NEUTRO') {
+        final logCic = {
+          'bodega': bodegaActiva,
+          'usuario': usuarioActivo?['usuario']?.toString() ?? 'APP_RF',
+          'tipo_movimiento': tipoMov,
+          'lpn': lpn.isNotEmpty ? lpn : null,
+          'sku': sku,
+          'lote': loteFinal,
+          'ubicacion_origen': ubicacionLimpia,
+          'ubicacion_destino': ubicacionLimpia,
+          'cajas_afectadas': diffCajas,
+          'unidades_afectadas': diffUnidades,
+          'fecha': DateTime.now().toIso8601String(),
+        };
         try {
-          await supabase.from('historial_movimientos').insert({
-            'usuario': usuarioActivo?['usuario']?.toString() ?? 'APP_RF',
-            'tipo_movimiento': tipoMov,
-            'lpn': lpn.isNotEmpty ? lpn : null,
-            'sku': sku,
-            'lote': loteFinal,
-            'ubicacion_origen': ubicacionLimpia,
-            'ubicacion_destino': ubicacionLimpia,
-            'cajas_afectadas': diffCajas,
-            'unidades_afectadas': diffUnidades,
-            'fecha': DateTime.now().toIso8601String(),
-          });
-        } catch (_) {}
+          await supabase.from('historial_movimientos').insert(logCic);
+        } catch (_) {
+          try {
+            final copiaSinBod = Map<String, dynamic>.from(logCic)..remove('bodega');
+            await supabase.from('historial_movimientos').insert(copiaSinBod);
+          } catch (_) {}
+        }
       }
 
       setState(() {
@@ -4803,8 +4922,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     setState(() => _validandoLpnAlmacenamiento = true);
 
     try {
-      // 1. Verificar si ya está ubicado en algún rack de inventario (Reubicación)
-      final resInv = await supabase.from('bodega_inventario_ubicacion').select().eq('lpn', lpn);
+      // 1. Verificar si ya está ubicado en algún rack de inventario de la bodega activa (Reubicación)
+      final resInvRaw = await supabase.from('bodega_inventario_ubicacion').select().eq('lpn', lpn);
+      final resInv = (resInvRaw as List).where((r) => _perteneceABodegaActiva(r as Map)).toList();
       if (resInv.isNotEmpty) {
         final ubiActual = (resInv.first['codigo_ubicacion'] ?? 'ANDEN_TRANSITO').toString().toUpperCase();
         final lineasNorm = resInv.map((item) => {
@@ -4816,7 +4936,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }).toList();
 
         setState(() {
-          _lineasLpnAlmacenamiento = List<Map<String, dynamic>>.from(lineasNorm);
+          _lineasLpnAlmacenamiento = List>.from(lineasNorm);
           _origenLpnAlmacenamiento = ubiActual;
           _pasoAlmacenamiento = 2;
         });
@@ -4825,9 +4945,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
 
       // 2. Buscar en Registro de Recepción (Andén a Rack)
-      final resRec = await supabase.from('registro_recepcion').select().eq('lpn', lpn);
+      final resRecRaw = await supabase.from('registro_recepcion').select().eq('lpn', lpn);
+      final resRecBodega = (resRecRaw as List).where((r) => _perteneceABodegaActiva(r as Map)).toList();
+      final resRec = resRecBodega.isNotEmpty ? resRecBodega : (resRecRaw as List);
       if (resRec.isEmpty) {
-        _notificar('El LPN $lpn no existe en Recepción ni en Inventario.', color: const Color(0xFFDC2626));
+        _notificar('El LPN $lpn no existe en Recepción ni en Inventario de $bodegaActiva.', color: const Color(0xFFDC2626));
         return;
       }
 
@@ -4840,7 +4962,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }).toList();
 
       setState(() {
-        _lineasLpnAlmacenamiento = List<Map<String, dynamic>>.from(lineasNorm);
+        _lineasLpnAlmacenamiento = List>.from(lineasNorm);
         _origenLpnAlmacenamiento = 'ANDEN_TRANSITO';
         _pasoAlmacenamiento = 2;
       });
@@ -4883,7 +5005,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             .select('sku, codigo_barras, descripcion, multiplo')
             .or('sku.ilike.%$q%,codigo_barras.ilike.%$q%,descripcion.ilike.%$q%')
             .limit(10);
-        final lista = <Map<String, dynamic>>[];
+        final lista = >[];
         for (final fila in resMaestra) {
           final skuM = (fila['sku'] ?? '').toString().toUpperCase();
           lista.add({
@@ -4977,6 +5099,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final disponibles = (res as List)
           .map((e) => Map<String, dynamic>.from(e as Map))
           .where((r) {
+        if (!_perteneceABodegaActiva(r)) return false;
         final ubi = (r['codigo_ubicacion'] ?? '').toString().toUpperCase();
         final unid = (r['cantidad_unidades'] as num?)?.toInt() ?? 0;
         final cajas = (r['cajas'] as num?)?.toInt() ?? 0;
@@ -4987,9 +5110,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         setState(() {
           _ubicacionesFefoPicking = [];
           _stockFefoSeleccionado = null;
-          _mensajeEstadoFefo = 'No se encontró stock disponible en Racks para el SKU $skuBuscar.';
+          _mensajeEstadoFefo = 'No se encontró stock disponible en Racks ($bodegaActiva) para el SKU $skuBuscar.';
         });
-        _notificar('Sin stock en racks para SKU $skuBuscar.', color: const Color(0xFFDC2626));
+        _notificar('Sin stock en racks ($bodegaActiva) para SKU $skuBuscar.', color: const Color(0xFFDC2626));
         return;
       }
 
@@ -5008,7 +5131,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         _ubicacionesFefoPicking = disponibles;
         _stockFefoSeleccionado = sugerido;
         _txtCajasMoverPicking.text = cajasDisp > 0 ? cajasDisp.toString() : '1';
-        _mensajeEstadoFefo = 'FEFO calculado: ${disponibles.length} ubicación(es) encontrada(s) para $skuBuscar.';
+        _mensajeEstadoFefo = 'FEFO calculado ($bodegaActiva): ${disponibles.length} ubicación(es) encontrada(s) para $skuBuscar.';
       });
     } catch (ex) {
       _notificar('Error consultando FEFO: $ex', color: const Color(0xFFDC2626));
@@ -5076,8 +5199,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           await supabase.from('bodega_ubicaciones').upsert({
             'codigo_ubicacion': ubiDestino,
             'zona': ubiDestino.split('-').first,
+            'bodega': bodegaActiva,
           });
-        } catch (_) {}
+        } catch (_) {
+          try {
+            await supabase.from('bodega_ubicaciones').upsert({
+              'codigo_ubicacion': ubiDestino,
+              'zona': ubiDestino.split('-').first,
+            });
+          } catch (_) {}
+        }
       }
 
       // 2. Descontar o eliminar de la ubicación de origen
@@ -5092,9 +5223,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }).eq('id', origenItem['id']);
       }
 
-      // 3. Insertar o sumar en la ubicación destino de Picking
+      // 3. Insertar en la ubicación destino de Picking en la bodega activa
       final zonaDest = ubiDestino.split('-').first;
-      await supabase.from('bodega_inventario_ubicacion').insert({
+      final payloadDest = {
+        'bodega': bodegaActiva,
         'codigo_ubicacion': ubiDestino,
         'lpn': lpn,
         'sku': sku,
@@ -5105,23 +5237,36 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'zona': zonaDest,
         'auditor': usuarioStr,
         'fecha': DateTime.now().toIso8601String(),
-      });
+      };
+      try {
+        await supabase.from('bodega_inventario_ubicacion').insert(payloadDest);
+      } catch (_) {
+        final copiaSinBod = Map<String, dynamic>.from(payloadDest)..remove('bodega');
+        await supabase.from('bodega_inventario_ubicacion').insert(copiaSinBod);
+      }
 
       // 4. Registrar en Historial de Movimientos (Kardex)
+      final logMov = {
+        'bodega': bodegaActiva,
+        'usuario': usuarioStr,
+        'tipo_movimiento': 'MOVIMIENTO_PICKING',
+        'lpn': lpn,
+        'sku': sku,
+        'lote': lote,
+        'ubicacion_origen': ubiOrigen,
+        'ubicacion_destino': ubiDestino,
+        'cajas_afectadas': cajasMover,
+        'unidades_afectadas': unidadesMover,
+        'fecha': DateTime.now().toIso8601String(),
+      };
       try {
-        await supabase.from('historial_movimientos').insert({
-          'usuario': usuarioStr,
-          'tipo_movimiento': 'MOVIMIENTO_PICKING',
-          'lpn': lpn,
-          'sku': sku,
-          'lote': lote,
-          'ubicacion_origen': ubiOrigen,
-          'ubicacion_destino': ubiDestino,
-          'cajas_afectadas': cajasMover,
-          'unidades_afectadas': unidadesMover,
-          'fecha': DateTime.now().toIso8601String(),
-        });
-      } catch (_) {}
+        await supabase.from('historial_movimientos').insert(logMov);
+      } catch (_) {
+        try {
+          final copiaSinBod = Map<String, dynamic>.from(logMov)..remove('bodega');
+          await supabase.from('historial_movimientos').insert(copiaSinBod);
+        } catch (_) {}
+      }
 
       _notificar('Movimiento a Picking exitoso: $cajasMover Cj ($unidadesMover UN) de $ubiOrigen a $ubiDestino.', color: const Color(0xFF047857));
       await _buscarUbicacionesFefoPorSku(skuForzado: sku);
@@ -5130,7 +5275,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
-  Widget _construirListaSugerenciasSku(List<Map<String, dynamic>> sugerencias, {required bool esRecepcion}) {
+  Widget _construirListaSugerenciasSku(List> sugerencias, {required bool esRecepcion}) {
     if (sugerencias.isEmpty) return const SizedBox.shrink();
     return Container(
       margin: const EdgeInsets.only(top: 6),
@@ -5499,7 +5644,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       ],
     );
   }
-
   Widget _construirVistaPutaway() {
     final totalCajasLpn = _lineasLpnAlmacenamiento.fold<int>(0, (s, i) => s + ((i['cajas'] as int?) ?? 0));
     final totalUnidLpn = _lineasLpnAlmacenamiento.fold<int>(0, (s, i) => s + ((i['unidades_totales'] as int?) ?? 0));
@@ -5729,7 +5873,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                             }
 
                             if (_maestraUbicaciones.isNotEmpty && !_maestraUbicaciones.contains(ubi)) {
-                              _notificar('BLOQUEO: La ubicación $ubi no existe en la Maestra.', color: Colors.red);
+                              _notificar('BLOQUEO: La ubicación $ubi no existe en la Maestra de $bodegaActiva.', color: Colors.red);
                               return;
                             }
 
@@ -5743,6 +5887,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                               }
 
                               final nuevos = _lineasLpnAlmacenamiento.map((item) => {
+                                'bodega': bodegaActiva,
                                 'codigo_ubicacion': ubi,
                                 'lpn': lpnActual,
                                 'sku': item['sku'],
@@ -5755,9 +5900,19 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                                 'fecha': DateTime.now().toIso8601String(),
                               }).toList();
 
-                              await supabase.from('bodega_inventario_ubicacion').insert(nuevos);
+                              try {
+                                await supabase.from('bodega_inventario_ubicacion').insert(nuevos);
+                              } catch (_) {
+                                final nuevosSinBod = nuevos.map((e) {
+                                  final m = Map<String, dynamic>.from(e);
+                                  m.remove('bodega');
+                                  return m;
+                                }).toList();
+                                await supabase.from('bodega_inventario_ubicacion').insert(nuevosSinBod);
+                              }
 
                               final logsAlm = _lineasLpnAlmacenamiento.map((item) => {
+                                'bodega': bodegaActiva,
                                 'usuario': usuarioStr,
                                 'tipo_movimiento': 'ALMACENAMIENTO',
                                 'lpn': lpnActual,
@@ -5771,11 +5926,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                               }).toList();
                               try {
                                 await supabase.from('historial_movimientos').insert(logsAlm);
-                              } catch (_) {}
+                              } catch (_) {
+                                try {
+                                  final logsSinBod = logsAlm.map((e) {
+                                    final m = Map<String, dynamic>.from(e);
+                                    m.remove('bodega');
+                                    return m;
+                                  }).toList();
+                                  await supabase.from('historial_movimientos').insert(logsSinBod);
+                                } catch (_) {}
+                              }
 
                               final mantenerUbi = await _preguntarMantenerDatos(
                                 tituloMovimiento: 'Almacenamiento Confirmado',
-                                detalleMovimiento: 'LPN $lpnActual almacenado en $ubi',
+                                detalleMovimiento: 'LPN $lpnActual almacenado en $ubi ($bodegaActiva)',
                                 camposQueSeMantienen: 'Ubicación Destino ($ubi) pre-cargada para el siguiente LPN',
                               );
 
@@ -5802,13 +5966,25 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                           const ubiMerma = 'ZONA-MERMA';
                           try {
                             final usuarioStr = usuarioActivo?['usuario']?.toString() ?? 'APP_RF';
-                            await supabase.from('bodega_ubicaciones').upsert({'codigo_ubicacion': ubiMerma, 'zona': 'MERMA'});
+                            try {
+                              await supabase.from('bodega_ubicaciones').upsert({
+                                'codigo_ubicacion': ubiMerma,
+                                'zona': 'MERMA',
+                                'bodega': bodegaActiva,
+                              });
+                            } catch (_) {
+                              await supabase.from('bodega_ubicaciones').upsert({
+                                'codigo_ubicacion': ubiMerma,
+                                'zona': 'MERMA',
+                              });
+                            }
 
                             if (_origenLpnAlmacenamiento != 'ANDEN_TRANSITO') {
                               await supabase.from('bodega_inventario_ubicacion').delete().eq('lpn', lpnActual);
                             }
 
                             final nuevos = _lineasLpnAlmacenamiento.map((item) => {
+                              'bodega': bodegaActiva,
                               'codigo_ubicacion': ubiMerma,
                               'lpn': lpnActual,
                               'sku': item['sku'],
@@ -5821,9 +5997,19 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                               'fecha': DateTime.now().toIso8601String(),
                             }).toList();
 
-                            await supabase.from('bodega_inventario_ubicacion').insert(nuevos);
+                            try {
+                              await supabase.from('bodega_inventario_ubicacion').insert(nuevos);
+                            } catch (_) {
+                              final nuevosSinBod = nuevos.map((e) {
+                                final m = Map<String, dynamic>.from(e);
+                                m.remove('bodega');
+                                return m;
+                              }).toList();
+                              await supabase.from('bodega_inventario_ubicacion').insert(nuevosSinBod);
+                            }
 
                             final logsMerma = _lineasLpnAlmacenamiento.map((item) => {
+                              'bodega': bodegaActiva,
                               'usuario': usuarioStr,
                               'tipo_movimiento': 'ENVIO_MERMA',
                               'lpn': lpnActual,
@@ -5837,9 +6023,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                             }).toList();
                             try {
                               await supabase.from('historial_movimientos').insert(logsMerma);
-                            } catch (_) {}
+                            } catch (_) {
+                              try {
+                                final logsSinBod = logsMerma.map((e) {
+                                  final m = Map<String, dynamic>.from(e);
+                                  m.remove('bodega');
+                                  return m;
+                                }).toList();
+                                await supabase.from('historial_movimientos').insert(logsSinBod);
+                              } catch (_) {}
+                            }
 
-                            _notificar('LPN $lpnActual enviado a ZONA-MERMA.', color: const Color(0xFFDC2626));
+                            _notificar('LPN $lpnActual enviado a ZONA-MERMA ($bodegaActiva).', color: const Color(0xFFDC2626));
                             _reiniciarPasoAlmacenamiento(mantenerUbicacion: false);
                           } catch (ex) {
                             _notificar('Error moviendo a Merma: $ex', color: const Color(0xFFDC2626));
@@ -6246,7 +6441,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .from('bodega_inventario_ubicacion')
           .select()
           .or('codigo_ubicacion.ilike.%$q%,lpn.ilike.%$q%,sku.ilike.%$q%');
-      setState(() => _resultadosConsulta = List< Map<String, dynamic> >.from(res));
+      final filtrados = List< Map<String, dynamic> >.from(res)
+          .where((r) => _perteneceABodegaActiva(r))
+          .toList();
+      setState(() => _resultadosConsulta = filtrados);
     } catch (ex) {
       _notificar('Error en consulta: $ex', color: const Color(0xFFDC2626));
     }
@@ -6696,10 +6894,17 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 ],
                 onChanged: (nuevaBod) {
                   if (nuevaBod != null && nuevaBod != bodegaActiva) {
-                    setState(() => bodegaActiva = nuevaBod);
+                    setState(() {
+                      bodegaActiva = nuevaBod;
+                      _resultadosConsulta.clear();
+                      _ubicacionesFefoPicking.clear();
+                      _stockFefoSeleccionado = null;
+                      _ubicacionesSkuDirigido.clear();
+                    });
                     _cargarMaestraUbicaciones();
                     _cargarUbicacionesVacias();
                     _cargarAsnsActivos();
+                    _cargarOVsPendientes();
                     Navigator.pop(context);
                     _notificar('Cambiado a $bodegaActiva', color: const Color(0xFF047857));
                   }
@@ -6841,7 +7046,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     );
   }
 
- @override
+  @override
   Widget build(BuildContext context) {
     final vistas = [
       _construirVistaRecepcion(),
@@ -6938,7 +7143,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       ),
     );
   }
-} // <--- AGREGA ESTA LLAVE QUE CIERRA _TerminalRfScreenState
+}
 
 // =====================================================================
 // 6. WIDGET MODAL DE ESCÁNER EN VIVO
@@ -6954,8 +7159,8 @@ class _ConsultaUniversalBottomSheet extends StatefulWidget {
 
 class _ConsultaUniversalBottomSheetState extends State<_ConsultaUniversalBottomSheet> {
   bool _cargando = true;
-  List<Map<String, dynamic>> _resultadosInv = [];
-  List<Map<String, dynamic>> _resultadosRec = [];
+  List> _resultadosInv = [];
+  List> _resultadosRec = [];
   Map<String, dynamic>? _infoMaestra;
 
   @override
@@ -6971,13 +7176,17 @@ class _ConsultaUniversalBottomSheetState extends State<_ConsultaUniversalBottomS
       final resM = await supabase.from('maestra_sku').select().or('sku.eq.$q,codigo_barras.eq.$q').limit(1);
       if (resM.isNotEmpty) _infoMaestra = resM.first;
 
-      // 2. Buscar en Inventario en Piso (Racks)
+      // 2. Buscar en Inventario en Piso (Racks) filtrado por la bodega activa
       final resInv = await supabase.from('bodega_inventario_ubicacion').select().or('codigo_ubicacion.ilike.%$q%,lpn.eq.$q,sku.eq.$q');
-      _resultadosInv = List<Map<String, dynamic>>.from(resInv);
+      _resultadosInv = List>.from(resInv)
+          .where((r) => _perteneceABodegaActiva(r))
+          .toList();
 
-      // 3. Buscar en Recepción Activa (Andén)
+      // 3. Buscar en Recepción Activa (Andén) filtrado por la bodega activa
       final resRec = await supabase.from('registro_recepcion').select().or('lpn.eq.$q,sku.eq.$q');
-      _resultadosRec = List<Map<String, dynamic>>.from(resRec);
+      _resultadosRec = List>.from(resRec)
+          .where((r) => _perteneceABodegaActiva(r))
+          .toList();
       
     } catch (e) {
       debugPrint('Error en Consulta Universal: $e');
@@ -7010,7 +7219,7 @@ class _ConsultaUniversalBottomSheetState extends State<_ConsultaUniversalBottomS
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text('VISOR RAYOS-X', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 10, fontWeight: FontWeight.bold)),
+                      Text('VISOR RAYOS-X • ${bodegaActiva.toUpperCase()}', style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 10, fontWeight: FontWeight.bold)),
                       Text(widget.queryBusqueda, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w900)),
                     ],
                   ),
@@ -7118,7 +7327,7 @@ class _ConsultaUniversalBottomSheetState extends State<_ConsultaUniversalBottomS
                   ],
 
                   if (_infoMaestra == null && _resultadosInv.isEmpty && _resultadosRec.isEmpty)
-                    const Center(child: Padding(padding: EdgeInsets.all(30), child: Text('No se encontraron registros activos para esta consulta.', textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)))),
+                    Center(child: Padding(padding: const EdgeInsets.all(30), child: Text('No se encontraron registros activos en $bodegaActiva para esta consulta.', textAlign: TextAlign.center, style: const TextStyle(color: Colors.grey)))),
                 ],
               ),
             ),
