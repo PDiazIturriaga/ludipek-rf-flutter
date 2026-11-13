@@ -477,9 +477,12 @@ Future generarPdfEtiquetaPackingBultos15x10({
   final String ovTexto = (numeroOv.toUpperCase().startsWith('OV') || numeroOv.toUpperCase().startsWith('OT'))
       ? numeroOv.toUpperCase()
       : 'OV ${numeroOv.toUpperCase()}';
+  final String lpnBase = lpn.trim().toUpperCase();
 
   for (int b = 1; b <= cantBultos; b++) {
     final int bActual = b;
+    final String lpnBultoActual = cantBultos > 1 ? '$lpnBase-B$bActual' : lpnBase;
+
     doc.addPage(
       pw.Page(
         pageFormat: format15x10,
@@ -491,7 +494,7 @@ Future generarPdfEtiquetaPackingBultos15x10({
             child: pw.Column(
               mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
               children: [
-                // 1. CABECERA: LPN + FECHA | QR
+                // 1. CABECERA: LPN POR BULTO + FECHA | QR
                 pw.Container(
                   padding: const pw.EdgeInsets.only(bottom: 4),
                   decoration: const pw.BoxDecoration(
@@ -505,8 +508,8 @@ Future generarPdfEtiquetaPackingBultos15x10({
                           crossAxisAlignment: pw.CrossAxisAlignment.start,
                           children: [
                             pw.Text(
-                              lpn.toUpperCase(),
-                              style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold),
+                              lpnBultoActual,
+                              style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold),
                             ),
                             pw.SizedBox(height: 2),
                             pw.Text(
@@ -518,7 +521,7 @@ Future generarPdfEtiquetaPackingBultos15x10({
                       ),
                       pw.BarcodeWidget(
                         barcode: pw.Barcode.qrCode(),
-                        data: '$lpn|$ovTexto|$tipoEmpaque:$bActual/$cantBultos',
+                        data: '$lpnBultoActual|$ovTexto|$tipoEmpaque:$bActual/$cantBultos',
                         width: 20 * PdfPageFormat.mm,
                         height: 20 * PdfPageFormat.mm,
                       ),
@@ -526,7 +529,7 @@ Future generarPdfEtiquetaPackingBultos15x10({
                   ),
                 ),
 
-                // 2. OV / TO GIGANTE
+                // 2. OV / OT GIGANTE
                 pw.Container(
                   width: double.infinity,
                   padding: const pw.EdgeInsets.symmetric(vertical: 4),
@@ -574,7 +577,7 @@ Future generarPdfEtiquetaPackingBultos15x10({
                   ),
                 ),
 
-                // 5. BULTO / PALLET (1 DE 3, 2 DE 3...)
+                // 5. BULTO / PALLET (1 DE 2, 2 DE 2...)
                 pw.Container(
                   width: double.infinity,
                   padding: const pw.EdgeInsets.symmetric(vertical: 6),
@@ -599,10 +602,9 @@ Future generarPdfEtiquetaPackingBultos15x10({
 
   await Printing.layoutPdf(
     onLayout: (PdfPageFormat format) async => doc.save(),
-    name: 'Packing_${ovTexto.replaceAll(" ", "_")}_$lpn.pdf',
+    name: 'Packing_${ovTexto.replaceAll(" ", "_")}_$lpnBase.pdf',
   );
 }
-
 
 
 // =====================================================================
@@ -1276,54 +1278,98 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     );
   }
   // ===================================================================
-  // MÓDULO: UBICACIONES VACÍAS (1 TOQUE = VERDE | DOBLE TOQUE = ROJO BLOQUEO)
+  // MÓDULO: UBICACIONES VACÍAS (1 TOQUE = VERDE | DOBLE TOQUE = MENÚ OCUPADA CON DETALLE OPCIONAL)
   // ===================================================================
-  List<String> _ubicacionesVacias = [];
-  Set<String> _vaciasVerificadas = {}; // 1 Toque: Verde (Realmente vacía)
-  Set<String> _vaciasConHallazgoRojo = {}; // Doble Toque: Rojo (Pallet físico sin registro)
+  List _ubicacionesVacias = [];
+  Set _vaciasVerificadas = {}; // 1 Toque: Verde (Realmente vacía)
+  Set _vaciasConHallazgoRojo = {}; // Doble Toque: Reportada ocupada
+  Map _vaciasOcupadasDetalle = {}; // Ubicación -> Detalle opcional (se limpia sola al ingresar a inventario)
   bool _cargandoVacias = false;
   String _pasilloFiltro = 'TODOS';
 
-  Future<void> _cargarUbicacionesVacias() async {
+  Future _cargarUbicacionesVacias() async {
     setState(() {
       _cargandoVacias = true;
       _vaciasVerificadas.clear();
       _vaciasConHallazgoRojo.clear();
     });
     try {
-      // 1. Traer solo las ubicaciones de la bodega activa ('Bodega Santiago' o 'Bodega Concepcion')
+      // 1. Traer las ubicaciones maestras de la bodega activa
       final resMaestra = await supabase
           .from('bodega_ubicaciones')
           .select('codigo_ubicacion')
           .eq('bodega', bodegaActiva);
 
-      final Set<String> todas = {};
-      for (final fila in resMaestra) {
+      final Set todas = {};
+      for (final fila in (resMaestra as List)) {
         final cod = (fila['codigo_ubicacion'] ?? '').toString().toUpperCase().trim();
         if (cod.isNotEmpty) {
           todas.add(cod);
         }
       }
 
-      // 2. Traer las ubicaciones actualmente ocupadas y cruzarlas estrictamente con las de esta bodega
+      // 2. Traer las ubicaciones actualmente ocupadas en inventario oficial
       final resOcupadas = await supabase
           .from('bodega_inventario_ubicacion')
           .select('codigo_ubicacion, bodega');
 
-      final Set<String> ocupadas = {};
-      for (final fila in resOcupadas) {
+      final Set ocupadasEnInventario = {};
+      for (final fila in (resOcupadas as List)) {
         final cod = (fila['codigo_ubicacion'] ?? '').toString().toUpperCase().trim();
         if (cod.isNotEmpty && _perteneceABodegaActiva(fila as Map)) {
-          ocupadas.add(cod);
+          ocupadasEnInventario.add(cod);
         }
       }
 
-      final vacias = todas.difference(ocupadas).toList();
+      // 3. Revisar las ubicaciones marcadas como ocupadas sin inventario aún (ALERTA_VACIA_OCUPADA)
+      final Map ocupadasPendientesMap = {};
+      try {
+        final resAlertas = await supabase
+            .from('historial_movimientos')
+            .select('id, ubicacion_destino, sku, lote, bodega')
+            .eq('tipo_movimiento', 'ALERTA_VACIA_OCUPADA')
+            .order('id', ascending: false)
+            .limit(400);
+
+        for (final rawA in (resAlertas as List)) {
+          final a = rawA as Map;
+          if (!_perteneceABodegaActiva(a)) continue;
+          final ubiAlerta = (a['ubicacion_destino'] ?? '').toString().toUpperCase().trim();
+          if (ubiAlerta.isEmpty) continue;
+
+          // Si ya fue ingresada al inventario oficial, eliminamos la alerta temporal automáticamente
+          if (ocupadasEnInventario.contains(ubiAlerta)) {
+            if (a['id'] != null) {
+              try {
+                await supabase.from('historial_movimientos').delete().eq('id', a['id']);
+              } catch (_) {}
+            }
+            continue;
+          }
+
+          if (!ocupadasPendientesMap.containsKey(ubiAlerta)) {
+            final detSku = (a['sku'] ?? '').toString().trim();
+            final detLote = (a['lote'] ?? '').toString().trim();
+            String detalleMostrar = detLote.isNotEmpty && detLote != 'S/L'
+                ? detLote
+                : (detSku != 'REVISION-FISICA' ? detSku : 'Ocupada (Pendiente de inventariar)');
+            ocupadasPendientesMap[ubiAlerta] = detalleMostrar;
+          }
+        }
+      } catch (_) {}
+
+      final Set todasExcluidas = {
+        ...ocupadasEnInventario,
+        ...ocupadasPendientesMap.keys,
+      };
+
+      final List vacias = todas.difference(todasExcluidas).toList();
       vacias.sort();
 
       if (mounted) {
         setState(() {
           _ubicacionesVacias = vacias;
+          _vaciasOcupadasDetalle = ocupadasPendientesMap;
           _pasilloFiltro = 'TODOS';
         });
       }
@@ -1334,44 +1380,145 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
-  Future<void> _marcarHallazgoRojoSinDuplicar(String ubicacion) async {
+  Future _marcarHallazgoRojoSinDuplicar(String ubicacion) async {
+    final TextEditingController txtDetalleOpc = TextEditingController();
+
+    final confirmar = await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children: [
+            const Icon(Icons.warning_amber_rounded, color: Color(0xFFDC2626), size: 24),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Ubicación $ubicacion Ocupada',
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w900),
+              ),
+            ),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Esta posición se ocultará del listado de Vacías para que no vuelva a aparecer mientras ingresan el producto al inventario.',
+                style: TextStyle(fontSize: 12, color: Color(0xFF334155)),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: txtDetalleOpc,
+                autofocus: true,
+                textCapitalization: TextCapitalization.characters,
+                inputFormatters: [UpperCaseTextFormatter()],
+                decoration: const InputDecoration(
+                  labelText: 'Detalle opcional (SKU, producto o nota)',
+                  hintText: 'Ej: PALLET ARENA / SIN INGRESAR',
+                  prefixIcon: Icon(Icons.edit_note_rounded, color: Color(0xFFDC2626)),
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(null),
+            child: const Text('CANCELAR', style: TextStyle(color: Colors.grey)),
+          ),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFDC2626),
+              foregroundColor: Colors.white,
+            ),
+            icon: const Icon(Icons.visibility_off_rounded, size: 18),
+            label: const Text('GUARDAR Y OCULTAR DE VACÍAS'),
+            onPressed: () {
+              Navigator.of(ctx).pop(txtDetalleOpc.text.trim().toUpperCase());
+            },
+          ),
+        ],
+      ),
+    );
+
+    if (confirmar == null) return;
+
+    final String detalleIngresado = confirmar.toString().trim();
+    final String notaFinal = detalleIngresado.isEmpty
+        ? 'OCUPADA PENDIENTE DE INVENTARIO'
+        : detalleIngresado;
+
     setState(() {
       _vaciasVerificadas.remove(ubicacion);
-      if (_vaciasConHallazgoRojo.contains(ubicacion)) {
-        _vaciasConHallazgoRojo.remove(ubicacion);
-      } else {
-        _vaciasConHallazgoRojo.add(ubicacion);
-      }
+      _ubicacionesVacias.remove(ubicacion);
+      _vaciasConHallazgoRojo.add(ubicacion);
+      _vaciasOcupadasDetalle[ubicacion] = notaFinal;
     });
 
-    if (_vaciasConHallazgoRojo.contains(ubicacion)) {
-      _notificar(
-        'ALERTA ROJA en $ubicacion: Posición ocupada sin registro. Bloqueada para evitar duplicar LPN.',
-        color: const Color(0xFFDC2626),
-      );
-      // Dejar traza en el historial con la bodega activa para que Inventario regularice el movimiento
-      final payloadHist = {
-        'bodega': bodegaActiva,
-        'usuario': usuarioActivo?['usuario']?.toString() ?? 'APP_RF',
-        'tipo_movimiento': 'ALERTA_VACIA_OCUPADA',
-        'lpn': 'SIN-REGISTRO',
-        'sku': 'REVISION-FISICA',
-        'lote': 'S/L',
-        'ubicacion_origen': 'DESCONOCIDO',
-        'ubicacion_destino': ubicacion,
-        'cajas_afectadas': 0,
-        'unidades_afectadas': 0,
-        'fecha': DateTime.now().toIso8601String(),
-      };
+    final String fechaIso = DateTime.now().toIso8601String();
+    final String auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'APP_RF').toString().toUpperCase();
+    final String pasillo = ubicacion.contains('-') ? ubicacion.split('-').first : 'S/P';
+
+    final payloadHist = {
+      'bodega': bodegaActiva,
+      'usuario': auditorStr,
+      'tipo_movimiento': 'ALERTA_VACIA_OCUPADA',
+      'lpn': 'SIN-REGISTRO',
+      'sku': notaFinal.length > 40 ? notaFinal.substring(0, 40) : notaFinal,
+      'lote': notaFinal,
+      'ubicacion_origen': 'PENDIENTE_INVENTARIO',
+      'ubicacion_destino': ubicacion,
+      'cajas_afectadas': 0,
+      'unidades_afectadas': 0,
+      'fecha': fechaIso,
+    };
+    try {
+      await supabase.from('historial_movimientos').insert(payloadHist);
+    } catch (_) {
       try {
-        await supabase.from('historial_movimientos').insert(payloadHist);
-      } catch (_) {
-        try {
-          final copiaSinBod = Map<String, dynamic>.from(payloadHist)..remove('bodega');
-          await supabase.from('historial_movimientos').insert(copiaSinBod);
-        } catch (_) {}
-      }
+        final copiaSinBod = Map.from(payloadHist)..remove('bodega');
+        await supabase.from('historial_movimientos').insert(copiaSinBod);
+      } catch (_) {}
     }
+
+    final payloadAudit = {
+      'bodega': bodegaActiva,
+      'lote_auditoria': 'OCUP-${DateFormat('yyyyMMdd-HHmmss').format(DateTime.now())}',
+      'pasillo': pasillo,
+      'codigo_ubicacion': ubicacion,
+      'estado_sistema': 'VACIA',
+      'resultado_auditoria': 'OCUPADA_SIN_REGISTRO ($notaFinal)',
+      'auditor': auditorStr,
+      'fecha': fechaIso,
+    };
+    try {
+      await supabase.from('auditoria_ubicaciones_vacias').insert(payloadAudit);
+    } catch (_) {
+      try {
+        final copiaSinBod = Map.from(payloadAudit)..remove('bodega');
+        await supabase.from('auditoria_ubicaciones_vacias').insert(copiaSinBod);
+      } catch (_) {}
+    }
+
+    _notificar(
+      'Ubicación $ubicacion registrada como ocupada ($notaFinal). No volverá a aparecer en Vacías.',
+      color: const Color(0xFFDC2626),
+    );
+  }
+
+  Future _liberarUbicacionOcupadaManual(String ubicacion) async {
+    try {
+      await supabase
+          .from('historial_movimientos')
+          .delete()
+          .eq('tipo_movimiento', 'ALERTA_VACIA_OCUPADA')
+          .eq('ubicacion_destino', ubicacion);
+    } catch (_) {}
+    await _cargarUbicacionesVacias();
+    _notificar('Ubicación $ubicacion devuelta al listado de vacías.', color: const Color(0xFF047857));
   }
 
   // ===================================================================
@@ -1379,11 +1526,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // ===================================================================
   bool _enviandoReporteVacias = false;
 
-  Future<void> _generarYDescargarExcelNativo({
+  Future _generarYDescargarExcelNativo({
     required String nombreHoja,
     required String nombreArchivo,
-    required List<String> cabeceras,
-    required List<List<String>> filas,
+    required List cabeceras,
+    required List filas,
   }) async {
     var excel = excel_lib.Excel.createExcel();
     excel_lib.Sheet sheetObject = excel[nombreHoja];
@@ -1396,15 +1543,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       horizontalAlign: excel_lib.HorizontalAlign.Center,
     );
 
-    sheetObject.appendRow(cabeceras.map((h) => excel_lib.TextCellValue(h)).toList());
+    sheetObject.appendRow(cabeceras.map((h) => excel_lib.TextCellValue(h.toString())).toList());
     for (int i = 0; i < cabeceras.length; i++) {
       sheetObject
           .cell(excel_lib.CellIndex.indexByColumnRow(columnIndex: i, rowIndex: 0))
           .cellStyle = headerStyle;
     }
 
-    for (final fila in filas) {
-      sheetObject.appendRow(fila.map((val) => excel_lib.TextCellValue(val)).toList());
+    for (final rawFila in filas) {
+      final fila = rawFila as List;
+      sheetObject.appendRow(fila.map((val) => excel_lib.TextCellValue(val.toString())).toList());
     }
 
     final fileBytes = excel.save();
@@ -1416,18 +1564,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
-  Future<void> _generarPdfReporteVacias(
+  Future _generarPdfReporteVacias(
     String loteId,
     String pasilloAuditado,
     String auditorStr,
-    List< Map<String, dynamic> > registros,
+    List registros,
   ) async {
     final doc = pw.Document();
     final fechaEmision = DateFormat('dd-MM-yyyy HH:mm').format(DateTime.now());
 
-    final confirmadas = registros.where((r) => r['resultado_auditoria'] == 'CONFIRMADA_VACIA').length;
-    final ocupadasRojo = registros.where((r) => r['resultado_auditoria'] == 'OCUPADA_SIN_REGISTRO').length;
-    final sinRevisar = registros.where((r) => r['resultado_auditoria'] == 'SIN_REVISAR').length;
+    final confirmadas = registros.where((r) => (r as Map)['resultado_auditoria'] == 'CONFIRMADA_VACIA').length;
+    final ocupadasRojo = registros.where((r) => (r as Map)['resultado_auditoria'].toString().startsWith('OCUPADA')).length;
+    final sinRevisar = registros.where((r) => (r as Map)['resultado_auditoria'] == 'SIN_REVISAR').length;
 
     doc.addPage(
       pw.MultiPage(
@@ -1465,17 +1613,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             ),
             pw.SizedBox(height: 14),
             pw.TableHelper.fromTextArray(
-              headers: ['Pasillo', 'Ubicación', 'Estado Sistema', 'Resultado Auditoría', 'Auditor'],
+              headers: ['Pasillo', 'Ubicación', 'Estado Sistema', 'Resultado Auditoría / Detalle', 'Auditor'],
               headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white, fontSize: 9),
               headerDecoration: pw.BoxDecoration(color: PdfColor.fromHex('#1E3A8A')),
               cellStyle: const pw.TextStyle(fontSize: 9),
-              data: registros.map((r) => [
-                r['pasillo'].toString(),
-                r['codigo_ubicacion'].toString(),
-                r['estado_sistema'].toString(),
-                r['resultado_auditoria'].toString(),
-                r['auditor'].toString(),
-              ]).toList(),
+              data: registros.map((rawR) {
+                final r = rawR as Map;
+                return [
+                  r['pasillo'].toString(),
+                  r['codigo_ubicacion'].toString(),
+                  r['estado_sistema'].toString(),
+                  r['resultado_auditoria'].toString(),
+                  r['auditor'].toString(),
+                ];
+              }).toList(),
             ),
           ];
         },
@@ -1488,20 +1639,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     );
   }
 
-  Future<void> _exportarVaciasAExcel() async {
-    if (_ubicacionesVacias.isEmpty) {
+  Future _exportarVaciasAExcel() async {
+    if (_ubicacionesVacias.isEmpty && _vaciasOcupadasDetalle.isEmpty) {
       _notificar('No hay ubicaciones vacías para reportar.', color: Colors.orange);
       return;
     }
 
-    final listaAuditar = _pasilloFiltro == 'TODOS'
+    final List listaAuditar = _pasilloFiltro == 'TODOS'
         ? _ubicacionesVacias
-        : _ubicacionesVacias.where((u) => u.startsWith('$_pasilloFiltro-')).toList();
-
-    if (listaAuditar.isEmpty) {
-      _notificar('No hay ubicaciones en el filtro seleccionado.', color: Colors.orange);
-      return;
-    }
+        : _ubicacionesVacias.where((u) => u.toString().startsWith('$_pasilloFiltro-')).toList();
 
     setState(() => _enviandoReporteVacias = true);
 
@@ -1510,17 +1656,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final fechaIso = DateTime.now().toIso8601String();
     final auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'APP_RF').toString().toUpperCase();
 
-    final List< Map<String, dynamic> > payloadSupabase = [];
+    final List payloadSupabase = [];
 
-    for (final ubi in listaAuditar) {
+    for (final rawUbi in listaAuditar) {
+      final ubi = rawUbi.toString();
       final pasillo = ubi.contains('-') ? ubi.split('-').first : 'S/P';
       String resultado = 'SIN_REVISAR';
-      if (_vaciasConHallazgoRojo.contains(ubi)) {
-        resultado = 'OCUPADA_SIN_REGISTRO';
-      } else if (_vaciasVerificadas.contains(ubi)) {
+      if (_vaciasVerificadas.contains(ubi)) {
         resultado = 'CONFIRMADA_VACIA';
       }
-
       payloadSupabase.add({
         'bodega': bodegaActiva,
         'lote_auditoria': loteId,
@@ -1533,26 +1677,41 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       });
     }
 
+    for (final entry in _vaciasOcupadasDetalle.entries) {
+      final ubi = entry.key.toString();
+      if (_pasilloFiltro != 'TODOS' && !ubi.startsWith('$_pasilloFiltro-')) continue;
+      final pasillo = ubi.contains('-') ? ubi.split('-').first : 'S/P';
+      payloadSupabase.add({
+        'bodega': bodegaActiva,
+        'lote_auditoria': loteId,
+        'pasillo': pasillo,
+        'codigo_ubicacion': ubi,
+        'estado_sistema': 'VACIA',
+        'resultado_auditoria': 'OCUPADA_SIN_REGISTRO (${entry.value})',
+        'auditor': auditorStr,
+        'fecha': fechaIso,
+      });
+    }
+
     try {
       try {
         await supabase.from('auditoria_ubicaciones_vacias').insert(payloadSupabase);
       } catch (_) {
         final fallbackSinBod = payloadSupabase.map((e) {
-          final m = Map<String, dynamic>.from(e);
+          final m = Map.from(e as Map);
           m.remove('bodega');
           return m;
         }).toList();
         await supabase.from('auditoria_ubicaciones_vacias').insert(fallbackSinBod);
       }
-    } catch (e) {
-      debugPrint('Aviso guardando en auditoria_ubicaciones_vacias: $e');
+    } catch (_) {
     } finally {
       if (mounted) setState(() => _enviandoReporteVacias = false);
     }
 
-    final cantVerde = payloadSupabase.where((r) => r['resultado_auditoria'] == 'CONFIRMADA_VACIA').length;
-    final cantRojo = payloadSupabase.where((r) => r['resultado_auditoria'] == 'OCUPADA_SIN_REGISTRO').length;
-    final cantPend = payloadSupabase.where((r) => r['resultado_auditoria'] == 'SIN_REVISAR').length;
+    final cantVerde = payloadSupabase.where((r) => (r as Map)['resultado_auditoria'] == 'CONFIRMADA_VACIA').length;
+    final cantRojo = payloadSupabase.where((r) => (r as Map)['resultado_auditoria'].toString().startsWith('OCUPADA')).length;
+    final cantPend = payloadSupabase.where((r) => (r as Map)['resultado_auditoria'] == 'SIN_REVISAR').length;
 
     if (!mounted) return;
     showDialog(
@@ -1571,10 +1730,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           children: [
             Text('Lote: $loteId', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
             const Divider(height: 16),
-            Text('Sector: ${_pasilloFiltro == 'TODOS' ? 'TODA LA BODEGA' : 'PASILLO $_pasilloFiltro'} (${listaAuditar.length} pos.)'),
-            const SizedBox(height: 6),
             Text('• Confirmadas Vacías (Verde): $cantVerde', style: const TextStyle(color: Color(0xFF047857), fontWeight: FontWeight.bold)),
-            Text('• Ocupadas sin Registro (Rojo): $cantRojo', style: const TextStyle(color: Color(0xFFDC2626), fontWeight: FontWeight.bold)),
+            Text('• Ocupadas Pendientes de Inventario: $cantRojo', style: const TextStyle(color: Color(0xFFDC2626), fontWeight: FontWeight.bold)),
             Text('• Sin revisar: $cantPend', style: const TextStyle(color: Color(0xFF64748B))),
           ],
         ),
@@ -1588,15 +1745,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 nombreHoja: 'Ubicaciones Vacias',
                 nombreArchivo: 'Reporte_Vacias_$loteId.xlsx',
                 cabeceras: ['LOTE', 'PASILLO', 'UBICACION', 'ESTADO_SISTEMA', 'RESULTADO_AUDITORIA', 'AUDITOR', 'FECHA'],
-                filas: payloadSupabase.map((r) => [
-                  loteId,
-                  r['pasillo'].toString(),
-                  r['codigo_ubicacion'].toString(),
-                  r['estado_sistema'].toString(),
-                  r['resultado_auditoria'].toString(),
-                  r['auditor'].toString(),
-                  fechaReporte,
-                ]).toList(),
+                filas: payloadSupabase.map((rawR) {
+                  final r = rawR as Map;
+                  return [
+                    loteId,
+                    r['pasillo'].toString(),
+                    r['codigo_ubicacion'].toString(),
+                    r['estado_sistema'].toString(),
+                    r['resultado_auditoria'].toString(),
+                    r['auditor'].toString(),
+                    fechaReporte,
+                  ];
+                }).toList(),
               );
             },
             icon: const Icon(Icons.table_view_rounded, size: 18),
@@ -1617,20 +1777,21 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   Widget _construirVistaVacias() {
-    final pasillosUnicos = {'TODOS'};
-    for (var u in _ubicacionesVacias) {
+    final Set pasillosUnicos = {'TODOS'};
+    for (var rawU in _ubicacionesVacias) {
+      final u = rawU.toString();
       if (u.contains('-')) {
         pasillosUnicos.add(u.split('-').first);
       }
     }
-    final listaPasillos = pasillosUnicos.toList()..sort();
+    final List listaPasillos = pasillosUnicos.toList()..sort();
     if (!listaPasillos.contains(_pasilloFiltro)) {
       _pasilloFiltro = 'TODOS';
     }
 
-    final vaciasFiltradas = _pasilloFiltro == 'TODOS'
+    final List vaciasFiltradas = _pasilloFiltro == 'TODOS'
         ? _ubicacionesVacias
-        : _ubicacionesVacias.where((u) => u.startsWith('$_pasilloFiltro-')).toList();
+        : _ubicacionesVacias.where((u) => u.toString().startsWith('$_pasilloFiltro-')).toList();
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 86),
@@ -1649,7 +1810,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   IconButton(
                     tooltip: 'Exportar Excel / PDF',
                     icon: const Icon(Icons.table_view_outlined, size: 22, color: Color(0xFF047857)),
-                    onPressed: (_ubicacionesVacias.isEmpty || _enviandoReporteVacias) ? null : _exportarVaciasAExcel,
+                    onPressed: (_ubicacionesVacias.isEmpty && _vaciasOcupadasDetalle.isEmpty) || _enviandoReporteVacias
+                        ? null
+                        : _exportarVaciasAExcel,
                   ),
                   IconButton(
                     tooltip: 'Actualizar',
@@ -1661,15 +1824,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               const SizedBox(height: 4),
               const Text(
                 '• 1 TOQUE: Confirmar vacía (Queda en VERDE).\n'
-                '• DOBLE TOQUE: Alerta de pallet movido sin registro (Queda en ROJO, bloquea ingreso para evitar duplicidad).',
+                '• DOBLE TOQUE: Si está ocupada físicamente, abre menú para ingresar detalle opcional y la oculta hasta que sea ingresada al inventario.',
                 style: TextStyle(fontSize: 11, color: Color(0xFF475569)),
               ),
               const SizedBox(height: 12),
-              DropdownButtonFormField<String>(
+              DropdownButtonFormField(
                 value: _pasilloFiltro,
                 decoration: const InputDecoration(labelText: 'Llamar Pasillo / Rack', prefixIcon: Icon(Icons.shelves)),
-                items: listaPasillos.map((p) => DropdownMenuItem(value: p, child: Text(p == 'TODOS' ? 'MOSTRAR TODOS LOS RACKS' : 'PASILLO $p'))).toList(),
-                onChanged: (val) => setState(() => _pasilloFiltro = val ?? 'TODOS'),
+                items: listaPasillos
+                    .map((p) => DropdownMenuItem(
+                          value: p.toString(),
+                          child: Text(p == 'TODOS' ? 'MOSTRAR TODOS LOS RACKS' : 'PASILLO $p'),
+                        ))
+                    .toList(),
+                onChanged: (val) => setState(() => _pasilloFiltro = (val ?? 'TODOS').toString()),
               ),
             ],
           ),
@@ -1677,7 +1845,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         const SizedBox(height: 10),
         if (_cargandoVacias)
           const Padding(padding: EdgeInsets.all(20), child: Center(child: CircularProgressIndicator())),
-        if (!_cargandoVacias)
+        if (!_cargandoVacias) ...[
           _TarjetaMovil(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1689,9 +1857,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text('DISPONIBLES: ${vaciasFiltradas.length}', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF0F172A), fontSize: 11)),
+                      Text('VACÍAS: ${vaciasFiltradas.length}', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF0F172A), fontSize: 11)),
                       Text('VERIFICADAS: ${_vaciasVerificadas.length}', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF065F46), fontSize: 11)),
-                      Text('EN ROJO: ${_vaciasConHallazgoRojo.length}', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFFDC2626), fontSize: 11)),
+                      Text('OCUPADAS S/INV: ${_vaciasOcupadasDetalle.length}', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFFDC2626), fontSize: 11)),
                     ],
                   ),
                 ),
@@ -1699,7 +1867,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 if (vaciasFiltradas.isEmpty)
                   const Padding(
                     padding: EdgeInsets.all(16.0),
-                    child: Text('No hay ubicaciones vacías en este rack.', style: TextStyle(color: Colors.grey)),
+                    child: Text('No hay ubicaciones vacías disponibles en este rack.', style: TextStyle(color: Colors.grey)),
                   )
                 else ...[
                   GridView.builder(
@@ -1713,28 +1881,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                     ),
                     itemCount: vaciasFiltradas.length,
                     itemBuilder: (context, index) {
-                      final ubi = vaciasFiltradas[index];
+                      final ubi = vaciasFiltradas[index].toString();
                       final esVerde = _vaciasVerificadas.contains(ubi);
-                      final esRoja = _vaciasConHallazgoRojo.contains(ubi);
 
-                      Color bgColor = Colors.white;
-                      Color borderColor = const Color(0xFFCBD5E1);
-                      Color textColor = const Color(0xFF0F172A);
-
-                      if (esRoja) {
-                        bgColor = const Color(0xFFFEE2E2);
-                        borderColor = const Color(0xFFDC2626);
-                        textColor = const Color(0xFF991B1B);
-                      } else if (esVerde) {
-                        bgColor = const Color(0xFFD1FAE5);
-                        borderColor = const Color(0xFF10B981);
-                        textColor = const Color(0xFF065F46);
-                      }
+                      Color bgColor = esVerde ? const Color(0xFFD1FAE5) : Colors.white;
+                      Color borderColor = esVerde ? const Color(0xFF10B981) : const Color(0xFFCBD5E1);
+                      Color textColor = esVerde ? const Color(0xFF065F46) : const Color(0xFF0F172A);
 
                       return InkWell(
                         onTap: () {
                           setState(() {
-                            _vaciasConHallazgoRojo.remove(ubi);
                             if (esVerde) {
                               _vaciasVerificadas.remove(ubi);
                             } else {
@@ -1749,18 +1905,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                           alignment: Alignment.center,
                           decoration: BoxDecoration(
                             color: bgColor,
-                            border: Border.all(color: borderColor, width: (esVerde || esRoja) ? 2.2 : 1.0),
+                            border: Border.all(color: borderColor, width: esVerde ? 2.2 : 1.0),
                             borderRadius: BorderRadius.circular(6),
                             boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 2, offset: Offset(0, 1))],
                           ),
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Text(ubi, style: TextStyle(fontWeight: FontWeight.bold, color: textColor, fontSize: 12)),
-                              if (esRoja)
-                                const Text('⚠ OCUPADA', style: TextStyle(fontSize: 8, fontWeight: FontWeight.w900, color: Color(0xFFDC2626))),
-                            ],
-                          ),
+                          child: Text(ubi, style: TextStyle(fontWeight: FontWeight.bold, color: textColor, fontSize: 12)),
                         ),
                       );
                     },
@@ -1780,6 +1929,40 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               ],
             ),
           ),
+          if (_vaciasOcupadasDetalle.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            _TarjetaMovil(
+              borderColor: const Color(0xFFFCA5A5),
+              child: ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                leading: const Icon(Icons.inventory_2_outlined, color: Color(0xFFDC2626)),
+                title: Text(
+                  'OCUPADAS PENDIENTES DE INVENTARIO (${_vaciasOcupadasDetalle.length})',
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w900, color: Color(0xFF991B1B)),
+                ),
+                subtitle: const Text(
+                  'Ocultas del listado de vacías. Desaparecen solas al ingresarlas al inventario.',
+                  style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B)),
+                ),
+                children: _vaciasOcupadasDetalle.entries.map((e) {
+                  final ubiO = e.key.toString();
+                  final detO = e.value.toString();
+                  return ListTile(
+                    dense: true,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                    title: Text(ubiO, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: Color(0xFF991B1B))),
+                    subtitle: Text('Detalle: $detO', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
+                    trailing: IconButton(
+                      tooltip: 'Restaurar a Vacías si ya quedó libre',
+                      icon: const Icon(Icons.restore_rounded, color: Color(0xFF047857), size: 20),
+                      onPressed: () => _liberarUbicacionOcupadaManual(ubiO),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+          ],
+        ],
       ],
     );
   }
@@ -3338,7 +3521,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final String comunaStr = _txtComunaDespachoPack.text.trim().isEmpty
         ? 'SANTIAGO'
         : _txtComunaDespachoPack.text.trim().toUpperCase();
-    final int cantBultos = int.tryParse(_txtCantidadBultosPack.text.trim()) ?? 1;
+    final int cantBultos = (int.tryParse(_txtCantidadBultosPack.text.trim()) ?? 1).clamp(1, 200);
 
     if (soloEtiquetaLpn) {
       await generarPdfEtiquetaPackingBultos15x10(
@@ -3358,6 +3541,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final List listaConsolidada = _lpnConsolidadoMapa.values.map((e) => Map.from(e as Map)).toList();
       final String fechaIso = DateTime.now().toIso8601String();
       final String auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'PACKING_RF').toString().toUpperCase();
+      final String lpnRangoTexto = cantBultos > 1 ? '$lpnMaster-B1..B$cantBultos' : lpnMaster;
 
       for (final rawItem in listaConsolidada) {
         final item = rawItem as Map;
@@ -3365,7 +3549,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         final int cantAudit = (item['unidades_totales'] as num?)?.toInt() ?? 0;
         final String loteStr = item['lote'].toString();
         final String vencStr = (item['fecha_vencimiento_cl'] ?? 'S/F').toString();
-        final String trazabilidadCompleta = '[$lpnMaster] $loteStr / $vencStr ($cantAudit UN)';
+        final String trazabilidadCompleta =
+            '[$lpnMaster|BULTOS:$cantBultos|TIPO:$_tipoEmpaquePack|COMUNA:$comunaStr] $loteStr / $vencStr ($cantAudit UN)';
 
         if (idDet != null) {
           try {
@@ -3378,13 +3563,39 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
       }
 
-      // ACTUALIZA EL ESTATUS DESDE MAIN.DART A PENDIENTE_FACTURACION (ENCIENDE EN VERDE PACKING Y ENVIADO A FACTURACIÓN EN EL PC)
+      // Actualizar estado_ns y guardar Bultos + LPN + Comuna directamente en canal_venta de netsuite_ordenes_venta
       if (ovMap['id'] != null) {
+        final String canalPrevio = (ovMap['canal_venta'] ?? '').toString().trim();
+        final List partesBase = canalPrevio
+            .split('|')
+            .where((p) {
+              final u = p.trim().toUpperCase();
+              return u.isNotEmpty &&
+                  !u.startsWith('LPN:') &&
+                  !u.startsWith('BULTOS:') &&
+                  !u.startsWith('TIPO:') &&
+                  !u.startsWith('COMUNA:');
+            })
+            .toList();
+        if (partesBase.isEmpty) {
+          partesBase.add(numOvStr.endsWith('-FA') || numOvStr.startsWith('OT-') ? 'FARMACIA (-FA)' : 'ESTANDAR');
+        }
+        partesBase.addAll([
+          'LPN:$lpnMaster',
+          'BULTOS:$cantBultos',
+          'TIPO:$_tipoEmpaquePack',
+          'COMUNA:$comunaStr',
+        ]);
+        final String canalActualizado = partesBase.join('|');
+
         try {
-          await supabase.from('netsuite_ordenes_venta').update({'estado_ns': 'PENDIENTE_FACTURACION'}).eq('id', ovMap['id']);
+          await supabase.from('netsuite_ordenes_venta').update({
+            'estado_ns': 'PENDIENTE_FACTURACION',
+            'canal_venta': canalActualizado,
+          }).eq('id', ovMap['id']);
         } catch (_) {
           try {
-            await supabase.from('netsuite_ordenes_venta').update({'estado': 'PENDIENTE_FACTURACION'}).eq('id', ovMap['id']);
+            await supabase.from('netsuite_ordenes_venta').update({'estado_ns': 'PENDIENTE_FACTURACION'}).eq('id', ovMap['id']);
           } catch (_) {}
         }
       }
@@ -3393,6 +3604,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         final item = rawItem as Map;
         return {
           'lpn_consolidado': lpnMaster,
+          'lpn_rango': lpnRangoTexto,
           'comuna': comunaStr,
           'tipo_empaque': _tipoEmpaquePack,
           'bultos': cantBultos,
@@ -3404,17 +3616,23 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         };
       }).toList();
 
+      final payloadPl = {
+        'bodega': bodegaActiva,
+        'orden_id': ovMap['id'],
+        'numero_ov': numOvStr,
+        'cliente_nombre': clienteStr,
+        'usuario_picking': auditorStr,
+        'detalle_json': detalleJsonTorre,
+        'fecha_emision': fechaIso,
+      };
       try {
-        await supabase.from('wms_packing_lists_fa').insert({
-          'bodega': bodegaActiva,
-          'orden_id': ovMap['id'],
-          'numero_ov': numOvStr,
-          'cliente_nombre': clienteStr,
-          'usuario_picking': auditorStr,
-          'detalle_json': detalleJsonTorre,
-          'fecha_emision': fechaIso,
-        });
-      } catch (_) {}
+        await supabase.from('wms_packing_lists_fa').insert(payloadPl);
+      } catch (_) {
+        try {
+          final copiaSinBod = Map.from(payloadPl)..remove('bodega');
+          await supabase.from('wms_packing_lists_fa').insert(copiaSinBod);
+        } catch (_) {}
+      }
 
       await generarPdfEtiquetaPackingBultos15x10(
         lpn: lpnMaster,
@@ -3425,7 +3643,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         totalBultos: cantBultos,
       );
 
-      _notificar('¡Packing finalizado! OV $numOvStr enviada a FACTURACIÓN ($cantBultos $_tipoEmpaquePack).', color: const Color(0xFF047857));
+      _notificar(
+        '¡Packing finalizado! OV $numOvStr enviada a FACTURACIÓN con $cantBultos $_tipoEmpaquePack(S) ($lpnRangoTexto).',
+        color: const Color(0xFF047857),
+      );
       setState(() {
         _lineasAuditoriaPacking = [];
         _lpnConsolidadoMapa.clear();
