@@ -604,6 +604,150 @@ Future generarPdfEtiquetaPackingBultos15x10({
 }
 
 // =====================================================================
+// GENERADOR DE ETIQUETA 15x10 CM DE PACKING / BULTOS (1 DE N, 2 DE N...)
+// =====================================================================
+Future generarPdfEtiquetaPackingBultos15x10({
+  required String lpn,
+  required String numeroOv,
+  required String cliente,
+  required String comuna,
+  required String tipoEmpaque,
+  required int totalBultos,
+}) async {
+  final doc = pw.Document();
+  const format15x10 = PdfPageFormat(150 * PdfPageFormat.mm, 100 * PdfPageFormat.mm);
+  final int cantBultos = totalBultos < 1 ? 1 : (totalBultos > 200 ? 200 : totalBultos);
+  final String fechaHora = DateFormat('dd-MM-yyyy HH:mm').format(DateTime.now());
+  final String ovTexto = (numeroOv.toUpperCase().startsWith('OV') || numeroOv.toUpperCase().startsWith('OT'))
+      ? numeroOv.toUpperCase()
+      : 'OV ${numeroOv.toUpperCase()}';
+
+  for (int b = 1; b <= cantBultos; b++) {
+    final int bActual = b;
+    doc.addPage(
+      pw.Page(
+        pageFormat: format15x10,
+        margin: const pw.EdgeInsets.all(4 * PdfPageFormat.mm),
+        build: (pw.Context context) {
+          return pw.Container(
+            decoration: pw.BoxDecoration(border: pw.Border.all(width: 1.8)),
+            padding: const pw.EdgeInsets.all(6),
+            child: pw.Column(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                // 1. CABECERA: LPN + FECHA | QR
+                pw.Container(
+                  padding: const pw.EdgeInsets.only(bottom: 4),
+                  decoration: const pw.BoxDecoration(
+                    border: pw.Border(bottom: pw.BorderSide(width: 1.2)),
+                  ),
+                  child: pw.Row(
+                    mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                    children: [
+                      pw.Expanded(
+                        child: pw.Column(
+                          crossAxisAlignment: pw.CrossAxisAlignment.start,
+                          children: [
+                            pw.Text(
+                              lpn.toUpperCase(),
+                              style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold),
+                            ),
+                            pw.SizedBox(height: 2),
+                            pw.Text(
+                              'EMPAQUE: $fechaHora',
+                              style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                      ),
+                      pw.BarcodeWidget(
+                        barcode: pw.Barcode.qrCode(),
+                        data: '$lpn|$ovTexto|$tipoEmpaque:$bActual/$cantBultos',
+                        width: 20 * PdfPageFormat.mm,
+                        height: 20 * PdfPageFormat.mm,
+                      ),
+                    ],
+                  ),
+                ),
+
+                // 2. OV / OT GIGANTE
+                pw.Container(
+                  width: double.infinity,
+                  padding: const pw.EdgeInsets.symmetric(vertical: 4),
+                  decoration: pw.BoxDecoration(border: pw.Border.all(width: 1.2)),
+                  alignment: pw.Alignment.center,
+                  child: pw.Text(
+                    ovTexto,
+                    style: pw.TextStyle(fontSize: 24, fontWeight: pw.FontWeight.bold),
+                  ),
+                ),
+
+                // 3. CLIENTE
+                pw.Container(
+                  width: double.infinity,
+                  padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                  decoration: pw.BoxDecoration(border: pw.Border.all(width: 1.0)),
+                  child: pw.Column(
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    children: [
+                      pw.Text('CLIENTE / DESTINO:', style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold)),
+                      pw.Text(
+                        cliente.toUpperCase(),
+                        style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold),
+                        maxLines: 1,
+                      ),
+                    ],
+                  ),
+                ),
+
+                // 4. COMUNA DE DESPACHO
+                pw.Container(
+                  width: double.infinity,
+                  padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                  decoration: pw.BoxDecoration(border: pw.Border.all(width: 1.0)),
+                  child: pw.Column(
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    children: [
+                      pw.Text('COMUNA DE DESPACHO:', style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold)),
+                      pw.Text(
+                        comuna.toUpperCase(),
+                        style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold),
+                        maxLines: 1,
+                      ),
+                    ],
+                  ),
+                ),
+
+                // 5. BULTO / PALLET (1 DE 3, 2 DE 3...)
+                pw.Container(
+                  width: double.infinity,
+                  padding: const pw.EdgeInsets.symmetric(vertical: 6),
+                  color: PdfColor.fromHex('#0F172A'),
+                  alignment: pw.Alignment.center,
+                  child: pw.Text(
+                    '${tipoEmpaque.toUpperCase()}: $bActual DE $cantBultos',
+                    style: pw.TextStyle(
+                      color: PdfColors.white,
+                      fontSize: 20,
+                      fontWeight: pw.FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  await Printing.layoutPdf(
+    onLayout: (PdfPageFormat format) async => doc.save(),
+    name: 'Packing_${ovTexto.replaceAll(" ", "_")}_$lpn.pdf',
+  );
+}
+
+// =====================================================================
 // GENERADOR DE PACKING LIST FARMACIA (A4 LANDSCAPE + LOGO + LOTES)
 // =====================================================================
 Future<void> generarPdfPackingListFA(Map<String, dynamic> ovCabecera, List< Map<String, dynamic> > lineas) async {
@@ -2307,7 +2451,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     );
   }
   // ===================================================================
-  // MÓDULOS DE PICKING (NORMAL VS FARMACIA) + AUDITORÍA PACKING POR BULTOS
+  // MÓDULOS DE PICKING (NORMAL VS FARMACIA) + PACKING POR BULTOS
   // ===================================================================
   String _ovSeleccionadaKey = 'SIN_OV';
   Map? _ovCabeceraActiva;
@@ -2317,7 +2461,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   final TextEditingController _txtScanFarmacia = TextEditingController();
   bool _cargandoOv = false;
 
-  // Ordenador oficial por Marca (1. Churu -> 2. Ferall -> 3. Giwi -> 4. Arenas -> 5. Resto) y SKU de menor a mayor
+  // Ordenador oficial por Marca: 1° Churu/Inaba -> 2° Ferall -> 3° Giwi -> 4° Arenas -> 5° Resto (y SKU de menor a mayor)
   int _obtenerPrioridadMarcaPicking(Map linea) {
     final sku = (linea['sku'] ?? '').toString().toUpperCase().trim();
     final marca = (linea['marca'] ?? '').toString().toUpperCase().trim();
@@ -2325,18 +2469,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final texto = '$sku $marca $desc';
 
     if (texto.contains('CHURU') || texto.contains('INABA') || sku.startsWith('USA') || sku.startsWith('USD')) {
-      return 1; // 1° Siempre Churu / Inaba al principio
+      return 1;
     }
     if (texto.contains('FERALL') || sku.startsWith('FER')) {
-      return 2; // 2° Ferall
+      return 2;
     }
     if (texto.contains('GIGWI') || texto.contains('GIWI') || sku.startsWith('GIG') || sku.startsWith('GIW')) {
-      return 3; // 3° Giwi / Gigwi
+      return 3;
     }
     if (texto.contains('ARENA') || texto.contains('SANITARIA') || texto.contains('LITTER')) {
-      return 4; // 4° Arenas
+      return 4;
     }
-    return 5; // 5° El resto
+    return 5;
   }
 
   String _etiquetaGrupoMarca(Map linea) {
@@ -2438,11 +2582,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         final numOvP = (primera['numero_ov'] ?? '').toString().toUpperCase();
         final esFaP = numOvP.endsWith('-FA') || numOvP.startsWith('OT-');
         if (modoFarmacia && !esFaP) {
-          _notificar('La OV $numOvP es ESTÁNDAR. Ábrala en el módulo de Picking Normal.', color: Colors.orange);
+          _notificar('La OV $numOvP es ESTÁNDAR. Ábrala en Picking Normal.', color: Colors.orange);
           setState(() => _cargandoOv = false);
           return;
         } else if (!modoFarmacia && esFaP) {
-          _notificar('La orden $numOvP es de FARMACIA (-FA) / OT. Ábrala en el módulo Picking Farmacia.', color: Colors.orange);
+          _notificar('La orden $numOvP es de FARMACIA (-FA) / OT. Ábrala en Picking Farmacia.', color: Colors.orange);
           setState(() => _cargandoOv = false);
           return;
         }
@@ -2457,7 +2601,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       final estadoActual = (elegida['estado_ns'] ?? elegida['estado'] ?? 'PENDIENTE_PICKING').toString().toUpperCase();
       if (estadoActual == 'PENDIENTE_FACTURACION' || estadoActual == 'FACTURADO') {
-        _notificar('La OV ${elegida['numero_ov']} ya fue empacada y está en Facturación.', color: Colors.orange);
+        _notificar('La OV ${elegida['numero_ov']} ya fue empacada y enviada a Facturación.', color: Colors.orange);
         setState(() => _cargandoOv = false);
         return;
       }
@@ -2545,7 +2689,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           });
         }
 
-        // Ordenar: 1° Churu -> 2° Ferall -> 3° Giwi -> 4° Arenas -> 5° Resto (y SKU de menor a mayor)
         _ordenarLineasPorMarcaYSku(lineasCargadas);
 
         setState(() {
@@ -2586,7 +2729,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               Text(tituloMod, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: colorTema)),
               const SizedBox(height: 4),
               const Text(
-                'Digite o escanee el N° de OV. Los productos se ordenan automáticamente: Churu -> Ferall -> Giwi -> Arenas -> Resto (de menor a mayor SKU).',
+                'Digite o escanee el N° de OV. Orden automático: Churu -> Ferall -> Giwi -> Arenas -> Resto (de menor a mayor SKU).',
                 style: TextStyle(fontSize: 11, color: Color(0xFF475569)),
               ),
               const SizedBox(height: 10),
@@ -2599,7 +2742,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                       inputFormatters: [UpperCaseTextFormatter()],
                       onSubmitted: (_) => _buscarYCargarOvPorNumero(modoFarmacia: esModoFarmacia),
                       decoration: InputDecoration(
-                        labelText: esModoFarmacia ? 'Escribir N° OV Farmacia (Ej: 131625)' : 'Escribir N° OV Normal (Ej: 132810)',
+                        labelText: esModoFarmacia ? 'Escribir N° OV Farmacia (Ej: 132945)' : 'Escribir N° OV Normal (Ej: 132719)',
                         prefixIcon: Icon(Icons.receipt_long_rounded, color: colorTema),
                         suffixIcon: IconButton(
                           icon: Icon(Icons.qr_code_scanner, color: colorTema),
@@ -2637,7 +2780,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                     border: Border.all(color: colorBorde),
                   ),
                   child: Text(
-                    'OV ACTIVA: ${_ovCabeceraActiva!['numero_ov']}  |  CLIENTE: ${_ovCabeceraActiva!['cliente_nombre'] ?? 'CLIENTE'}  |  ESTADO: ${_ovCabeceraActiva!['estado_ns'] ?? 'PENDIENTE_PICKING'}',
+                    'OV ACTIVA: ${_ovCabeceraActiva!['numero_ov']}  |  CLIENTE: ${_ovCabeceraActiva!['cliente_nombre'] ?? 'CLIENTE'}',
                     style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
                   ),
                 ),
@@ -2791,6 +2934,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                                     'cliente_nombre': 'CLIENTE',
                                   };
 
+                              // ACTUALIZA EL ESTATUS DESDE MAIN.DART A PENDIENTE_PACKING (ENCIENDE CÍRCULO VERDE DE PICKING EN EL PC)
                               if (ovMap['id'] != null) {
                                 try {
                                   await supabase.from('netsuite_ordenes_venta').update({'estado_ns': 'PENDIENTE_PACKING'}).eq('id', ovMap['id']);
@@ -2801,7 +2945,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                                 }
                               }
 
-                              _notificar('¡Picking terminado! La OV ${ovMap['numero_ov']} pasó a PENDIENTE DE PACKING.', color: const Color(0xFF047857));
+                              _notificar('¡Picking completado! La OV ${ovMap['numero_ov']} pasó a PACKING.', color: const Color(0xFF047857));
                               setState(() {
                                 _lineasOvFarmacia = [];
                                 _ovCabeceraActiva = null;
@@ -2812,8 +2956,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                               _notificar('Error cerrando picking: $e', color: Colors.red);
                             }
                           },
-                    icon: const Icon(Icons.inventory_2_rounded),
-                    label: const Text('FINALIZAR PICKING -> PASAR A PENDIENTE DE PACKING', style: TextStyle(fontWeight: FontWeight.bold)),
+                    icon: const Icon(Icons.check_circle_outline_rounded),
+                    label: const Text('FINALIZAR PICKING -> PASAR A PACKING', style: TextStyle(fontWeight: FontWeight.bold)),
                   ),
                 ),
               ],
@@ -3043,7 +3187,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   // ===================================================================
-  // MÓDULO 8: PACKING POR BULTOS / PALLET -> PASA A FACTURACIÓN
+  // MÓDULO 8: ESTACIÓN DE PACKING POR BULTOS / PALLET -> ENVÍA A FACTURACIÓN
   // ===================================================================
   String _ovPackingAuditKey = 'SIN_OV';
   Map? _ovPackingCabeceraActiva;
@@ -3315,7 +3459,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   Future _cerrarPackingYConsolidarLpn({required bool soloEtiquetaLpn}) async {
     if (_lpnConsolidadoMapa.isEmpty) {
-      _notificar('Aún no ha auditado ningún artículo en Packing.', color: Colors.orange);
+      _notificar('Aún no ha validado los artículos en Packing.', color: Colors.orange);
       return;
     }
 
@@ -3376,10 +3520,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
       }
 
+      // ACTUALIZA EL ESTATUS DESDE MAIN.DART A PENDIENTE_FACTURACION (ENCIENDE EN VERDE PACKING Y ENVIADO A FACTURACIÓN EN EL PC)
       if (ovMap['id'] != null) {
         try {
           await supabase.from('netsuite_ordenes_venta').update({'estado_ns': 'PENDIENTE_FACTURACION'}).eq('id', ovMap['id']);
-        } catch (_) {}
+        } catch (_) {
+          try {
+            await supabase.from('netsuite_ordenes_venta').update({'estado': 'PENDIENTE_FACTURACION'}).eq('id', ovMap['id']);
+          } catch (_) {}
+        }
       }
 
       final detalleJsonTorre = listaConsolidada.map((rawItem) {
@@ -3450,7 +3599,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                '1. ESTACIÓN DE PACKING (EMPAQUE POR BULTO O PALLET)',
+                '1. ESTACIÓN DE PACKING (POR BULTO O PALLET)',
                 style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: Color(0xFF0F766E)),
               ),
               const SizedBox(height: 6),
@@ -3618,7 +3767,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                         style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF047857), foregroundColor: Colors.white, minimumSize: const Size(0, 46)),
                         onPressed: _guardandoPackingLpn ? null : () => _cerrarPackingYConsolidarLpn(soloEtiquetaLpn: false),
                         icon: const Icon(Icons.verified_rounded, size: 18),
-                        label: const Text('CERRAR PACKING -> FACTURAR', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                        label: const Text('CERRAR PACKING -> ENVIAR A FACTURACIÓN', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
                       ),
                     ),
                   ],
