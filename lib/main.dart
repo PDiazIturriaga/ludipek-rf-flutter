@@ -824,7 +824,7 @@ Future<void> generarPdfContenidoPalletLpn({
         ),
         pw.SizedBox(height: 14),
         pw.TableHelper.fromTextArray(
-          headers: ['SKU', 'Descripción', 'Lote', 'Vencimiento', 'Cajas', 'Unidades'],
+          headers: ['SKU', 'Descripción', 'Lote', 'Vencimiento', 'Cajas', 'Displays', 'Unidades'],
           headerStyle: pw.TextStyle(color: PdfColors.white, fontWeight: pw.FontWeight.bold, fontSize: 9),
           headerDecoration: pw.BoxDecoration(color: PdfColor.fromHex('#0F766E')),
           cellStyle: const pw.TextStyle(fontSize: 8.5),
@@ -834,7 +834,8 @@ Future<void> generarPdfContenidoPalletLpn({
             2: const pw.FlexColumnWidth(1.7),
             3: const pw.FlexColumnWidth(1.5),
             4: const pw.FlexColumnWidth(0.8),
-            5: const pw.FlexColumnWidth(1.0),
+            5: const pw.FlexColumnWidth(0.9),
+            6: const pw.FlexColumnWidth(1.0),
           },
           data: lineas.map((item) => [
             (item['sku'] ?? '').toString(),
@@ -842,6 +843,7 @@ Future<void> generarPdfContenidoPalletLpn({
             (item['lote'] ?? 'S/L').toString(),
             (item['fecha_vencimiento_cl'] ?? 'S/F').toString(),
             (item['cajas'] ?? 0).toString(),
+            (item['displays'] ?? 0).toString(),
             (item['unidades_totales'] ?? 0).toString(),
           ]).toList(),
         ),
@@ -3642,6 +3644,91 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     });
   }
 
+  Future<List<Map<String, dynamic>>> _cargarLotesDisponiblesPacking(String sku) async {
+    final String skuRaiz = sku.trim().toUpperCase().split('-').first;
+    final Map<String, Map<String, dynamic>> agrupado = {};
+
+    void agregarOpcion({
+      required String lote,
+      String? vencimiento,
+      int stock = 0,
+      String origen = 'INVENTARIO',
+    }) {
+      final loteLimpio = lote.trim().isEmpty ? 'S/L' : lote.trim().toUpperCase();
+      final vencNorm = normalizarFechaSql(vencimiento)?.replaceAll('-', '/') ?? 'S/F';
+      final key = '$loteLimpio|$vencNorm';
+      final actual = agrupado[key];
+      if (actual == null) {
+        agrupado[key] = {
+          'key': key,
+          'lote': loteLimpio,
+          'vencimiento': vencNorm,
+          'stock': stock,
+          'origen': origen,
+        };
+      } else {
+        actual['stock'] = ((actual['stock'] as num?)?.toInt() ?? 0) + stock;
+      }
+    }
+
+    try {
+      final resInv = await supabase
+          .from('bodega_inventario_ubicacion')
+          .select('lote, fecha_vencimiento_cl, cantidad_unidades, bodega, codigo_ubicacion')
+          .ilike('sku', '$skuRaiz%');
+      for (final raw in (resInv as List)) {
+        final fila = raw as Map;
+        if (!_perteneceABodegaActiva(fila)) continue;
+        final ubicacion = (fila['codigo_ubicacion'] ?? '').toString().toUpperCase();
+        if (ubicacion == 'ZONA-MERMA') continue;
+        final stock = (fila['cantidad_unidades'] as num?)?.toInt() ?? 0;
+        if (stock <= 0) continue;
+        agregarOpcion(
+          lote: (fila['lote'] ?? 'S/L').toString().split('|QA:').first,
+          vencimiento: fila['fecha_vencimiento_cl']?.toString(),
+          stock: stock,
+          origen: ubicacion.isEmpty ? 'INVENTARIO' : ubicacion,
+        );
+      }
+    } catch (_) {}
+
+    try {
+      final resRec = await supabase
+          .from('registro_recepcion')
+          .select('lote, fecha_vencimiento_cl, unidades_totales, bodega')
+          .ilike('sku', '$skuRaiz%');
+      for (final raw in (resRec as List)) {
+        final fila = raw as Map;
+        if (!_perteneceABodegaActiva(fila)) continue;
+        agregarOpcion(
+          lote: (fila['lote'] ?? 'S/L').toString().split('|QA:').first,
+          vencimiento: fila['fecha_vencimiento_cl']?.toString(),
+          stock: (fila['unidades_totales'] as num?)?.toInt() ?? 0,
+          origen: 'RECEPCIÓN',
+        );
+      }
+    } catch (_) {}
+
+    final opciones = agrupado.values.toList();
+    DateTime fechaOrden(Map<String, dynamic> item) {
+      final raw = (item['vencimiento'] ?? 'S/F').toString();
+      if (raw == 'S/F') return DateTime(2099, 12, 31);
+      final norm = normalizarFechaSql(raw);
+      if (norm == null) return DateTime(2099, 12, 31);
+      try {
+        return DateFormat('dd-MM-yyyy').parseStrict(norm);
+      } catch (_) {
+        return DateTime(2099, 12, 31);
+      }
+    }
+    opciones.sort((a, b) {
+      final cmp = fechaOrden(a).compareTo(fechaOrden(b));
+      if (cmp != 0) return cmp;
+      return (b['stock'] as int).compareTo(a['stock'] as int);
+    });
+    return opciones;
+  }
+
   Future _abrirModalAuditarLineaPacking(Map linea) async {
     if (_txtLpnConsolidadoPack.text.trim().isEmpty) {
       _generarLpnConsolidadoAuto();
@@ -3659,90 +3746,246 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
 
-    final txtUnid = TextEditingController(text: saldoPendiente.toString());
+    final opcionesLote = await _cargarLotesDisponiblesPacking(sku);
+    final int multiploCaja = mult < 1 ? 1 : mult;
+    final int cajasSugeridas = saldoPendiente ~/ multiploCaja;
+    final int displaysSugeridos = saldoPendiente % multiploCaja;
+    final txtCajas = TextEditingController(text: cajasSugeridas.toString());
+    final txtDisplays = TextEditingController(text: displaysSugeridos.toString());
     final txtLote = TextEditingController(text: (linea['lote_auditado'] ?? 'S/L').toString());
     final txtVenc = TextEditingController(text: (linea['venc_auditado'] ?? '').toString());
+    String loteSeleccionado = 'MANUAL';
+    if (opcionesLote.isNotEmpty) {
+      final loteActual = txtLote.text.trim().toUpperCase();
+      final vencActual = normalizarFechaSql(txtVenc.text.trim())?.replaceAll('-', '/') ?? 'S/F';
+      final coincidente = opcionesLote.where((o) =>
+          o['lote'].toString() == loteActual && o['vencimiento'].toString() == vencActual).toList();
+      final inicial = coincidente.isNotEmpty ? coincidente.first : opcionesLote.first;
+      loteSeleccionado = inicial['key'].toString();
+      txtLote.text = inicial['lote'].toString();
+      txtVenc.text = inicial['vencimiento'] == 'S/F' ? '' : inicial['vencimiento'].toString();
+    }
 
     if (!mounted) return;
     final conf = await showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: Text('AUDITAR $sku - ${linea['descripcion']}', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w900)),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFEFF6FF),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: const Color(0xFF93C5FD)),
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setStateDialog) => AlertDialog(
+          title: Text('AUDITAR $sku - ${linea['descripcion']}',
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w900)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFEFF6FF),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF93C5FD)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Solicitado: $solicitado UN', style: const TextStyle(fontWeight: FontWeight.bold)),
+                      Text('Ya distribuido: $yaDistribuido UN'),
+                      Text('Saldo pendiente: $saldoPendiente UN',
+                          style: const TextStyle(color: Color(0xFF1D4ED8), fontWeight: FontWeight.w900)),
+                    ],
+                  ),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                const SizedBox(height: 10),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF0FDFA),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF99F6E4)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Conversión de empaque: 1 caja = $multiploCaja UN',
+                          style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF0F766E))),
+                      const SizedBox(height: 3),
+                      Text(
+                        displaysSugeridos > 0
+                            ? 'Saldo sugerido: $cajasSugeridas caja(s) + $displaysSugeridos display(s) = $saldoPendiente UN'
+                            : 'Saldo sugerido: $cajasSugeridas caja(s) = $saldoPendiente UN',
+                        style: const TextStyle(fontSize: 11, color: Color(0xFF334155)),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
                   children: [
-                    Text('Solicitado: $solicitado UN', style: const TextStyle(fontWeight: FontWeight.bold)),
-                    Text('Ya distribuido: $yaDistribuido UN'),
-                    Text('Saldo pendiente: $saldoPendiente UN',
-                        style: const TextStyle(color: Color(0xFF1D4ED8), fontWeight: FontWeight.w900)),
+                    Expanded(
+                      child: TextField(
+                        controller: txtCajas,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(
+                          labelText: '1. Cajas completas',
+                          prefixIcon: Icon(Icons.inventory_2_outlined),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: txtDisplays,
+                        keyboardType: TextInputType.number,
+                        decoration: InputDecoration(
+                          labelText: 'Displays / saldo',
+                          helperText: 'Máximo ${multiploCaja - 1}',
+                          prefixIcon: const Icon(Icons.view_module_outlined),
+                        ),
+                      ),
+                    ),
                   ],
                 ),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: txtUnid,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(labelText: '1. Unidades Empacadas'),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: txtLote,
-                textCapitalization: TextCapitalization.characters,
-                inputFormatters: [UpperCaseTextFormatter()],
-                decoration: const InputDecoration(labelText: '2. Lote Físico'),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: txtVenc,
-                keyboardType: TextInputType.number,
-                inputFormatters: [FechaInputFormatter()],
-                decoration: const InputDecoration(labelText: '3. Fecha Vencimiento (DD/MM/YYYY)'),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, null), child: const Text('Cancelar', style: TextStyle(color: Colors.red))),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
-            icon: const Icon(Icons.check),
-            label: const Text('CONFIRMAR EN PACKING'),
-            onPressed: () {
-              final u = int.tryParse(txtUnid.text.trim()) ?? 0;
-              final l = txtLote.text.trim().isEmpty ? 'S/L' : txtLote.text.trim().toUpperCase();
-              final v = normalizarFechaSql(txtVenc.text.trim()) ?? 'S/F';
-              if (u <= 0) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('La cantidad debe ser mayor que cero.'), backgroundColor: Colors.orange),
-                );
-                return;
-              }
-              if (u > saldoPendiente) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text('No puede asignar $u UN. Saldo pendiente de $sku: $saldoPendiente UN.'),
-                    backgroundColor: Colors.red,
+                const SizedBox(height: 10),
+                DropdownButtonFormField<String>(
+                  value: loteSeleccionado,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    labelText: '2. Fecha de vencimiento y lote asignado',
+                    prefixIcon: Icon(Icons.inventory_2_outlined, color: Color(0xFF0F766E)),
                   ),
-                );
-                return;
-              }
-              Navigator.pop(ctx, {'unid': u, 'lote': l, 'venc': v});
-            },
+                  items: [
+                    ...opcionesLote.map((o) => DropdownMenuItem<String>(
+                          value: o['key'].toString(),
+                          child: Text(
+                            'Venc: ${o['vencimiento']} | Lote: ${o['lote']} | ${o['stock']} UN | ${o['origen']}',
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                        )),
+                    const DropdownMenuItem<String>(
+                      value: 'MANUAL',
+                      child: Text('OTRO LOTE / INGRESO MANUAL',
+                          style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1D4ED8))),
+                    ),
+                  ],
+                  onChanged: (valor) {
+                    setStateDialog(() {
+                      loteSeleccionado = valor ?? 'MANUAL';
+                      if (loteSeleccionado != 'MANUAL') {
+                        final opcion = opcionesLote.firstWhere((o) => o['key'] == loteSeleccionado);
+                        txtLote.text = opcion['lote'].toString();
+                        final venc = opcion['vencimiento'].toString();
+                        txtVenc.text = venc == 'S/F' ? '' : venc;
+                      } else {
+                        txtLote.clear();
+                        txtVenc.clear();
+                      }
+                    });
+                  },
+                ),
+                if (opcionesLote.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 6),
+                    child: Text('No se encontraron lotes programados para este SKU. Ingrese lote y fecha manualmente.',
+                        style: TextStyle(fontSize: 10.5, color: Color(0xFFB45309))),
+                  ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: txtLote,
+                  readOnly: loteSeleccionado != 'MANUAL',
+                  textCapitalization: TextCapitalization.characters,
+                  inputFormatters: [UpperCaseTextFormatter()],
+                  decoration: InputDecoration(
+                    labelText: '3. Lote asignado a la fecha',
+                    prefixIcon: const Icon(Icons.sell_outlined),
+                    helperText: loteSeleccionado == 'MANUAL' ? 'Disponible para ingreso manual' : 'Cargado desde lote programado',
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: txtVenc,
+                  readOnly: loteSeleccionado != 'MANUAL',
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [FechaInputFormatter()],
+                  decoration: InputDecoration(
+                    labelText: '4. Fecha vencimiento (DD/MM/YYYY)',
+                    prefixIcon: const Icon(Icons.event_outlined),
+                    suffixIcon: loteSeleccionado == 'MANUAL'
+                        ? IconButton(
+                            icon: const Icon(Icons.edit_calendar_rounded, color: Color(0xFF0F766E)),
+                            onPressed: () async {
+                              final hoy = DateTime.now();
+                              final fecha = await showDatePicker(
+                                context: context,
+                                initialDate: hoy.add(const Duration(days: 365)),
+                                firstDate: DateTime(2020),
+                                lastDate: DateTime(2045),
+                                helpText: 'FECHA DE VENCIMIENTO DEL LOTE',
+                              );
+                              if (fecha != null) txtVenc.text = DateFormat('dd/MM/yyyy').format(fecha);
+                            },
+                          )
+                        : const Icon(Icons.lock_outline, color: Color(0xFF64748B)),
+                  ),
+                ),
+              ],
+            ),
           ),
-        ],
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, null),
+              child: const Text('Cancelar', style: TextStyle(color: Colors.red)),
+            ),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
+              icon: const Icon(Icons.check),
+              label: const Text('CONFIRMAR EN PACKING'),
+              onPressed: () {
+                final cajas = int.tryParse(txtCajas.text.trim()) ?? 0;
+                final displays = int.tryParse(txtDisplays.text.trim()) ?? 0;
+                final u = (cajas * multiploCaja) + displays;
+                final l = txtLote.text.trim().isEmpty ? 'S/L' : txtLote.text.trim().toUpperCase();
+                final v = normalizarFechaSql(txtVenc.text.trim()) ?? 'S/F';
+                if (cajas < 0 || displays < 0) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Cajas y displays no pueden ser negativos.'), backgroundColor: Colors.orange),
+                  );
+                  return;
+                }
+                if (displays >= multiploCaja && multiploCaja > 1) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('El saldo debe ser menor a $multiploCaja. Si llega a $multiploCaja corresponde a una caja completa.'), backgroundColor: Colors.orange),
+                  );
+                  return;
+                }
+                if (u <= 0) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Ingrese al menos una caja o un display.'), backgroundColor: Colors.orange),
+                  );
+                  return;
+                }
+                if (u > saldoPendiente) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('No puede asignar $u UN. Saldo pendiente de $sku: $saldoPendiente UN.'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                  return;
+                }
+                if (l == 'S/L' && txtVenc.text.trim().isNotEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Ingrese el lote físico asociado a la fecha de vencimiento.'), backgroundColor: Colors.orange),
+                  );
+                  return;
+                }
+                Navigator.pop(ctx, {'unid': u, 'cajas': cajas, 'displays': displays, 'lote': l, 'venc': v});
+              },
+            ),
+          ],
+        ),
       ),
     );
 
@@ -3750,9 +3993,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     final Map confMap = conf as Map;
     final int unidAudit = (confMap['unid'] as num).toInt();
+    final int cajasAudit = (confMap['cajas'] as num?)?.toInt() ?? 0;
+    final int displaysAudit = (confMap['displays'] as num?)?.toInt() ?? 0;
     final String loteAudit = confMap['lote'].toString();
     final String vencAudit = confMap['venc'].toString();
-    final int cajasEst = (unidAudit / (mult < 1 ? 1 : mult)).ceil();
 
     final String lpnActual = _txtLpnConsolidadoPack.text.trim().toUpperCase();
     final String claveConsolidacion = '$lpnActual|$idDetalle|$loteAudit';
@@ -3774,8 +4018,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'solicitado': solicitado,
         'pickeado': unidAudit,
         'unidades_totales': unidAudit,
-        'cajas': cajasEst < 1 ? 1 : cajasEst,
-        'multiplo_aplicado': mult,
+        'cajas': cajasAudit,
+        'displays': displaysAudit,
+        'multiplo_aplicado': multiploCaja,
         'lote': loteAudit,
         'fecha_vencimiento_cl': vencAudit == 'S/F' ? null : vencAudit,
       };
@@ -4161,7 +4406,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           const Divider(height: 22), const Text('CONTENIDO DEL PALLET', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF047857))),
           ..._lpnConsolidadoMapa.values.map((raw) { final i=raw as Map; return ListTile(dense:true, contentPadding:EdgeInsets.zero,
             leading:const Icon(Icons.check_circle_outline,color:Color(0xFF047857)), title:Text('${i['sku']} - ${i['descripcion']}',style:const TextStyle(fontSize:11,fontWeight:FontWeight.bold)),
-            subtitle:Text('${i['unidades_totales']} UN | Lote ${i['lote']}',style:const TextStyle(fontSize:10))); }),
+            subtitle:Text(
+              ((i['displays'] as num?)?.toInt() ?? 0) > 0
+                  ? '${i['cajas'] ?? 0} caja(s) + ${i['displays']} display(s) | ${i['unidades_totales']} UN | Lote ${i['lote']} | Venc: ${i['fecha_vencimiento_cl'] ?? 'S/F'}'
+                  : '${i['cajas'] ?? 0} caja(s) | ${i['unidades_totales']} UN | Lote ${i['lote']} | Venc: ${i['fecha_vencimiento_cl'] ?? 'S/F'}',
+              style:const TextStyle(fontSize:10))); }),
         ],
         const SizedBox(height: 10),
         SizedBox(width: double.infinity, height: 48, child: ElevatedButton.icon(
