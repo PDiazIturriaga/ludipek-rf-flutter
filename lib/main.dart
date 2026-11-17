@@ -3497,12 +3497,13 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
-  List<Map<String, dynamic>> _detallePersistentePacking({required String estado}) {
-    final List<Map<String, dynamic>> detalle = [];
+  List<Map<String, dynamic>> _serializarPackingPersistente(String estado) {
+    final List<Map<String, dynamic>> salida = [];
     for (final entry in _palletsPackingCerrados.entries) {
       for (final raw in entry.value) {
-        detalle.add({
-          ...Map<String, dynamic>.from(raw),
+        final item = Map<String, dynamic>.from(raw);
+        salida.add({
+          ...item,
           'lpn_pallet': entry.key,
           'lpn_consolidado': entry.key,
           '_estado_packing': estado,
@@ -3510,25 +3511,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         });
       }
     }
-    for (final raw in _lpnConsolidadoMapa.values) {
-      final item = Map<String, dynamic>.from(raw as Map);
-      detalle.add({
-        ...item,
-        'lpn_pallet': (item['lpn_pallet'] ?? _txtLpnConsolidadoPack.text).toString().toUpperCase(),
-        'lpn_consolidado': (item['lpn_pallet'] ?? _txtLpnConsolidadoPack.text).toString().toUpperCase(),
-        '_estado_packing': estado,
-        '_pallet_cerrado': false,
-      });
-    }
-    return detalle;
+    return salida;
   }
 
-  Future<bool> _guardarBorradorPacking({required String estado}) async {
+  Future<bool> _persistirPalletsPacking(String estado) async {
     final ov = _ovPackingCabeceraActiva;
     if (ov == null || ov['id'] == null) return false;
-    final detalle = _detallePersistentePacking(estado: estado);
+    final detalle = _serializarPackingPersistente(estado);
     if (detalle.isEmpty) return false;
-    final payload = {
+    final payload = <String, dynamic>{
       'orden_id': ov['id'],
       'numero_ov': (ov['numero_ov'] ?? _txtBuscarOvPacking.text).toString().toUpperCase(),
       'cliente_nombre': (ov['cliente_nombre'] ?? 'CLIENTE').toString(),
@@ -3538,14 +3529,25 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       'bodega': bodegaActiva,
     };
     try {
-      setState(() => _sincronizandoPacking = true);
-      dynamic respuesta;
+      if (mounted) setState(() => _sincronizandoPacking = true);
+      Map<String, dynamic>? fila;
       if (_packingDraftId != null) {
-        respuesta = await supabase.from('wms_packing_lists_fa').update(payload).eq('id', _packingDraftId!).select('id').maybeSingle();
+        final raw = await supabase
+            .from('wms_packing_lists_fa')
+            .update(payload)
+            .eq('id', _packingDraftId!)
+            .select('id')
+            .maybeSingle();
+        if (raw != null) fila = Map<String, dynamic>.from(raw);
       } else {
-        respuesta = await supabase.from('wms_packing_lists_fa').insert(payload).select('id').single();
+        final raw = await supabase
+            .from('wms_packing_lists_fa')
+            .insert(payload)
+            .select('id')
+            .single();
+        fila = Map<String, dynamic>.from(raw);
       }
-      final id = (respuesta?['id'] as num?)?.toInt();
+      final id = (fila?['id'] as num?)?.toInt();
       if (id != null) _packingDraftId = id;
       return _packingDraftId != null;
     } catch (e) {
@@ -3556,39 +3558,50 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
-  Future<void> _restaurarBorradorPacking(int ordenId) async {
+  Future<void> _restaurarPalletsPacking(int ordenId) async {
     try {
-      final res = await supabase
+      final raw = await supabase
           .from('wms_packing_lists_fa')
           .select('id, detalle_json, fecha_emision')
           .eq('orden_id', ordenId)
           .order('id', ascending: false)
           .limit(1);
-      if ((res as List).isEmpty) return;
-      final fila = Map<String, dynamic>.from(res.first as Map);
-      dynamic rawDetalle = fila['detalle_json'];
-      if (rawDetalle is String) rawDetalle = jsonDecode(rawDetalle);
-      if (rawDetalle is! List || rawDetalle.isEmpty) return;
-      final lista = rawDetalle.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
-      final estado = (lista.first['_estado_packing'] ?? '').toString().toUpperCase();
+      final filas = raw as List;
+      if (filas.isEmpty) return;
+      final fila = Map<String, dynamic>.from(filas.first as Map);
+      dynamic detalleRaw = fila['detalle_json'];
+      if (detalleRaw is String) detalleRaw = jsonDecode(detalleRaw);
+      if (detalleRaw is! List || detalleRaw.isEmpty) return;
+
+      final items = detalleRaw
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+      if (items.isEmpty) return;
+      final estado = (items.first['_estado_packing'] ?? '').toString().toUpperCase();
       if (estado != 'PACKING_EN_PROCESO') return;
-      final Map<String, List<Map<String, dynamic>>> restaurados = {};
-      for (final item in lista) {
+
+      final Map<String, List<Map<String, dynamic>>> porLpn = {};
+      for (final item in items) {
         if (item['_pallet_cerrado'] != true) continue;
-        final lpn = (item['lpn_pallet'] ?? item['lpn_consolidado'] ?? '').toString().toUpperCase();
+        final lpn = (item['lpn_pallet'] ?? item['lpn_consolidado'] ?? '').toString().trim().toUpperCase();
         if (lpn.isEmpty) continue;
-        restaurados.putIfAbsent(lpn, () => []).add(item);
+        porLpn.putIfAbsent(lpn, () => []).add(item);
       }
-      if (restaurados.isEmpty) return;
-      if (!mounted) return;
+      if (porLpn.isEmpty || !mounted) return;
       setState(() {
         _packingDraftId = (fila['id'] as num?)?.toInt();
         _palletsPackingCerrados
           ..clear()
-          ..addAll(restaurados);
+          ..addAll(porLpn);
+        _lpnConsolidadoMapa.clear();
+        _txtLpnConsolidadoPack.clear();
         _pasoPackingLpn = 1;
       });
-      _notificar('Packing recuperado: ${restaurados.length} pallet(s) restaurados desde Supabase.', color: const Color(0xFF047857));
+      _notificar(
+        'Packing recuperado: ${porLpn.length} pallet(s) y ${items.length} línea(s) restaurados.',
+        color: const Color(0xFF047857),
+      );
     } catch (e) {
       _notificar('No se pudo recuperar el Packing guardado: $e', color: Colors.orange);
     }
@@ -3689,6 +3702,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       if (mounted) {
         setState(() => _lineasAuditoriaPacking = listaTemp);
       }
+      await _restaurarPalletsPacking(idNum);
     } catch (e) {
       _notificar('Error cargando orden para Packing: $e', color: Colors.red);
     } finally {
@@ -3749,7 +3763,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   void _cambiarOrdenPacking() {
     setState(() {
-      _pasoPackingLpn = 0; _ovPackingAuditKey = 'SIN_OV'; _ovPackingCabeceraActiva = null;
+      _pasoPackingLpn = 0; _packingDraftId = null; _ovPackingAuditKey = 'SIN_OV'; _ovPackingCabeceraActiva = null;
       _lineasAuditoriaPacking.clear(); _lpnConsolidadoMapa.clear(); _palletsPackingCerrados.clear();
       _txtBuscarOvPacking.clear(); _txtLpnConsolidadoPack.clear(); _txtScanAuditoriaPack.clear();
     });
@@ -4179,8 +4193,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   Future<void> _cerrarPalletActualYCrearOtro() async {
-    if (_lpnConsolidadoMapa.isEmpty || _sincronizandoPacking) {
-      if (_lpnConsolidadoMapa.isEmpty) _notificar('Revise al menos un SKU antes de cerrar el pallet.', color: Colors.orange);
+    if (_sincronizandoPacking) return;
+    if (_lpnConsolidadoMapa.isEmpty) {
+      _notificar('Revise al menos un SKU antes de cerrar el pallet.', color: Colors.orange);
       return;
     }
     var lpn = _txtLpnConsolidadoPack.text.trim().toUpperCase();
@@ -4192,34 +4207,51 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _notificar('El LPN $lpn ya fue usado en esta OV.', color: Colors.red);
       return;
     }
-    final lineas = _lpnConsolidadoMapa.values.map((e) => Map<String, dynamic>.from(e as Map)).toList();
-    // Se agrega temporalmente y se confirma contra Supabase antes de limpiar la pantalla.
+    final lineas = _lpnConsolidadoMapa.values
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+
+    // Agrega temporalmente el pallet y persiste TODOS los pallets en la misma fila.
     _palletsPackingCerrados[lpn] = lineas;
-    final guardado = await _guardarBorradorPacking(estado: 'PACKING_EN_PROCESO');
+    final guardado = await _persistirPalletsPacking('PACKING_EN_PROCESO');
     if (!guardado) {
       _palletsPackingCerrados.remove(lpn);
-      _notificar('PALLET NO GUARDADO. Revise Internet y vuelva a cerrar el pallet.', color: Colors.red);
+      _notificar('PALLET NO GUARDADO. Revise la conexión y vuelva a cerrar.', color: Colors.red);
       return;
     }
+
     setState(() {
       _lpnConsolidadoMapa.clear();
-      for (final raw in _lineasAuditoriaPacking) {
-        (raw as Map)['consolidado_en_lpn'] = false;
-      }
       _txtLpnConsolidadoPack.clear();
       _txtScanAuditoriaPack.clear();
       _pasoPackingLpn = 1;
     });
+
     final saldo = _saldoUnidadesPacking();
-    final totalUnidades = lineas.fold<int>(0, (a, i) => a + ((i['unidades_totales'] as num?)?.toInt() ?? 0));
+    final totalUnidades = lineas.fold<int>(
+      0,
+      (suma, item) => suma + ((item['unidades_totales'] as num?)?.toInt() ?? 0),
+    );
     if (!mounted) return;
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
-        title: const Row(children: [Icon(Icons.cloud_done_rounded, color: Color(0xFF047857)), SizedBox(width: 8), Expanded(child: Text('PALLET GENERADO Y GUARDADO'))]),
-        content: Text('$lpn\n${lineas.length} SKU | $totalUnidades UN\n\n${saldo > 0 ? 'Quedan ${_skusPendientesPacking()} SKU y $saldo UN. Ingrese otro LPN.' : 'Todos los productos están distribuidos. Finalice el Packing.'}'),
-        actions: [ElevatedButton(onPressed: () => Navigator.pop(ctx), child: Text(saldo > 0 ? 'INGRESAR OTRO LPN' : 'CONTINUAR'))],
+        title: const Row(children: [
+          Icon(Icons.cloud_done_rounded, color: Color(0xFF047857)),
+          SizedBox(width: 8),
+          Expanded(child: Text('PALLET GENERADO Y GUARDADO')),
+        ]),
+        content: Text(
+          '$lpn\n${lineas.length} SKU | $totalUnidades UN\n\n'
+          '${saldo > 0 ? 'Quedan ${_skusPendientesPacking()} SKU y $saldo UN. Ingrese otro LPN.' : 'Todos los productos están distribuidos. Finalice el Packing.'}',
+        ),
+        actions: [
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(saldo > 0 ? 'INGRESAR OTRO LPN' : 'CONTINUAR'),
+          ),
+        ],
       ),
     );
   }
@@ -4352,17 +4384,24 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       final detalleJsonTorre = listaConsolidada.map((rawItem) {
         final item = rawItem as Map;
+        final lpnPallet = (item['lpn_pallet'] ?? lpnMaster).toString().toUpperCase();
+        final unidades = (item['unidades_totales'] as num?)?.toInt() ?? 0;
+        final cajas = (item['cajas'] as num?)?.toInt() ?? 0;
+        final displays = (item['displays'] as num?)?.toInt() ?? 0;
+        final multiplo = (item['multiplo_aplicado'] as num?)?.toInt() ?? 1;
         return {
-          'lpn_consolidado': lpnMaster,
+          ...Map<String, dynamic>.from(item),
+          'lpn_consolidado': lpnPallet,
+          'lpn_pallet': lpnPallet,
           'lpn_rango': lpnRangoTexto,
           'comuna': comunaStr,
-          'tipo_empaque': _tipoEmpaquePack,
-          'bultos': cantBultos,
-          'sku': item['sku'],
-          'descripcion': item['descripcion'],
-          'solicitado': item['solicitado'],
-          'pickeado': item['unidades_totales'],
-          'lotes': '${item['lote']} / ${item['fecha_vencimiento_cl'] ?? 'S/F'} (${item['unidades_totales']} UN)',
+          'tipo_empaque': 'PALLET',
+          'bultos': 1,
+          'pickeado': unidades,
+          'unidades_totales': unidades,
+          'cajas': cajas,
+          'displays': displays,
+          'multiplo_aplicado': multiplo,
           '_estado_packing': 'PENDIENTE_FACTURACION',
           '_pallet_cerrado': true,
         };
@@ -4380,8 +4419,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       if (_packingDraftId != null) {
         await supabase.from('wms_packing_lists_fa').update(payloadPl).eq('id', _packingDraftId!);
       } else {
-        final filaGuardada = await supabase.from('wms_packing_lists_fa').insert(payloadPl).select('id').single();
-        _packingDraftId = (filaGuardada['id'] as num?)?.toInt();
+        final fila = await supabase.from('wms_packing_lists_fa').insert(payloadPl).select('id').single();
+        _packingDraftId = (fila['id'] as num?)?.toInt();
       }
 
       await generarPdfEtiquetaPackingBultos15x10(
