@@ -3529,14 +3529,25 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         final List barcodes = [];
 
         if (matchesM.isNotEmpty) {
-          final m0 = matchesM.first;
-          if ((m0['descripcion'] ?? '').toString().trim().isNotEmpty) {
-            descProd = m0['descripcion'].toString().toUpperCase();
+          // Un SKU puede tener varias filas en maestra_sku: unidad, display y caja.
+          // Para convertir el Excel de Concepción (que viene en UN) a cajas,
+          // Packing debe usar el mayor múltiplo válido del SKU, no la primera fila.
+          final matchesOrdenados = List<Map>.from(matchesM.map((e) => Map.from(e as Map)))
+            ..sort((a, b) {
+              final ma = (a['multiplo'] as num?)?.toInt() ?? 1;
+              final mb = (b['multiplo'] as num?)?.toInt() ?? 1;
+              return mb.compareTo(ma);
+            });
+          final mCaja = matchesOrdenados.first;
+          if ((mCaja['descripcion'] ?? '').toString().trim().isNotEmpty) {
+            descProd = mCaja['descripcion'].toString().toUpperCase();
           }
-          marcaProd = (m0['marca'] ?? 'ESTANDAR').toString().toUpperCase();
-          multEmpaque = (m0['multiplo'] as num?)?.toInt() ?? 1;
-          for (final m in matchesM) {
-            barcodes.add((m['codigo_barras'] ?? '').toString().toUpperCase());
+          marcaProd = (mCaja['marca'] ?? 'ESTANDAR').toString().toUpperCase();
+          multEmpaque = (mCaja['multiplo'] as num?)?.toInt() ?? 1;
+          if (multEmpaque < 1) multEmpaque = 1;
+          for (final m in matchesOrdenados) {
+            final codigo = (m['codigo_barras'] ?? '').toString().toUpperCase();
+            if (codigo.isNotEmpty && !barcodes.contains(codigo)) barcodes.add(codigo);
           }
         }
 
@@ -3603,13 +3614,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
     }
     return total;
-  }
-
-  String _formatearEmpaquePacking(int unidades, int multiplo) {
-    final m = multiplo < 1 ? 1 : multiplo;
-    final cajas = unidades ~/ m;
-    final displays = unidades % m;
-    return displays > 0 ? '$cajas caja(s) + $displays display(s)' : '$cajas caja(s)';
   }
 
   int _saldoUnidadesPacking() {
@@ -3815,8 +3819,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Conversión de empaque: 1 caja = $multiploCaja UN',
-                          style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF0F766E))),
+                      Text(
+                        multiploCaja > 1
+                            ? 'Conversión de empaque: 1 caja = $multiploCaja UN'
+                            : 'SIN MÚLTIPLO DE CAJA: revise MAESTRA SKU ($sku)',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w900,
+                          color: multiploCaja > 1 ? const Color(0xFF0F766E) : const Color(0xFFDC2626),
+                        ),
+                      ),
                       const SizedBox(height: 3),
                       Text(
                         displaysSugeridos > 0
@@ -3846,8 +3857,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                         controller: txtDisplays,
                         keyboardType: TextInputType.number,
                         decoration: InputDecoration(
-                          labelText: 'Displays / saldo',
-                          helperText: 'Máximo ${multiploCaja - 1}',
+                          labelText: 'Display / UN sueltas',
+                          helperText: multiploCaja > 1 ? 'Máximo ${multiploCaja - 1}' : 'Configure múltiplo',
                           prefixIcon: const Icon(Icons.view_module_outlined),
                         ),
                       ),
@@ -3950,6 +3961,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               icon: const Icon(Icons.check),
               label: const Text('CONFIRMAR EN PACKING'),
               onPressed: () {
+                if (multiploCaja <= 1) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('El SKU $sku no tiene un múltiplo de caja válido en MAESTRA SKU. Configure el empaque antes de continuar.'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                  return;
+                }
                 final cajas = int.tryParse(txtCajas.text.trim()) ?? 0;
                 final displays = int.tryParse(txtDisplays.text.trim()) ?? 0;
                 final u = (cajas * multiploCaja) + displays;
@@ -4069,51 +4089,40 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       lpn = _txtLpnConsolidadoPack.text.trim().toUpperCase();
     }
     if (_palletsPackingCerrados.containsKey(lpn)) {
-      _notificar('El LPN $lpn ya fue usado en esta OV.', color: Colors.red);
+      _notificar('El LPN $lpn ya fue usado en esta OV. Genere o escanee otro LPN.', color: Colors.red);
       return;
     }
-    final lineas = _lpnConsolidadoMapa.values.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    final lineas = _lpnConsolidadoMapa.values
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+    final ov = (_ovPackingCabeceraActiva?['numero_ov'] ?? _txtBuscarOvPacking.text).toString().toUpperCase();
+    final cliente = (_ovPackingCabeceraActiva?['cliente_nombre'] ?? 'CLIENTE').toString().toUpperCase();
+    final comuna = _txtComunaDespachoPack.text.trim().toUpperCase();
+
     setState(() {
       _palletsPackingCerrados[lpn] = lineas;
       _lpnConsolidadoMapa.clear();
       for (final raw in _lineasAuditoriaPacking) {
-        (raw as Map)['consolidado_en_lpn'] = false;
+        final linea = raw as Map;
+        linea['consolidado_en_lpn'] = false;
       }
       _txtLpnConsolidadoPack.clear();
       _txtScanAuditoriaPack.clear();
       _pasoPackingLpn = 1;
     });
-    final saldo = _saldoUnidadesPacking();
-    final totalUnidadesPallet = lineas.fold<int>(0, (sum, item) => sum + ((item['unidades_totales'] as num?)?.toInt() ?? 0));
-    if (!mounted) return;
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Row(children: [
-          Icon(Icons.check_circle_rounded, color: Color(0xFF047857)),
-          SizedBox(width: 8),
-          Expanded(child: Text('PALLET GENERADO', style: TextStyle(fontWeight: FontWeight.w900))),
-        ]),
-        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(lpn, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w900, color: Color(0xFF0F766E))),
-          const SizedBox(height: 8),
-          Text('${lineas.length} SKU | $totalUnidadesPallet UN asignadas'),
-          const SizedBox(height: 8),
-          Text(saldo > 0
-              ? 'Quedan ${_skusPendientesPacking()} SKU y $saldo UN. Ingrese el siguiente LPN.'
-              : 'Todos los productos están distribuidos. Finalice el Packing para enviarlo al módulo PC.',
-              style: const TextStyle(fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          const Text('El PDF quedará disponible en Olas y Packing del PC.', style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
-        ]),
-        actions: [ElevatedButton(
-          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF047857), foregroundColor: Colors.white),
-          onPressed: () => Navigator.pop(ctx),
-          child: Text(saldo > 0 ? 'INGRESAR OTRO LPN' : 'CONTINUAR A CIERRE'),
-        )],
-      ),
+
+    await generarPdfContenidoPalletLpn(
+      lpn: lpn,
+      numeroOv: ov,
+      cliente: cliente,
+      comuna: comuna,
+      lineas: lineas,
     );
+    final saldo = _saldoUnidadesPacking();
+    _notificar(saldo > 0
+        ? 'Pallet $lpn cerrado. Quedan ${_skusPendientesPacking()} SKU y $saldo UN. Ingrese otro LPN.'
+        : 'Pallet $lpn cerrado. Todos los productos están distribuidos; finalice el Packing.',
+        color: const Color(0xFF047857));
   }
 
   Future _cerrarPackingYConsolidarLpn({required bool soloEtiquetaLpn}) async {
@@ -4157,6 +4166,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final int cantBultos = (int.tryParse(_txtCantidadBultosPack.text.trim()) ?? 1).clamp(1, 200);
 
     if (soloEtiquetaLpn) {
+      await generarPdfEtiquetaPackingBultos15x10(
+        lpn: lpnMaster,
+        numeroOv: numOvStr,
+        cliente: clienteStr,
+        comuna: comunaStr,
+        tipoEmpaque: _tipoEmpaquePack,
+        totalBultos: cantBultos,
+      );
       return;
     }
 
@@ -4176,32 +4193,27 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final String auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'PACKING_RF').toString().toUpperCase();
       final String lpnRangoTexto = cantBultos > 1 ? '$lpnMaster-B1..B$cantBultos' : lpnMaster;
 
-      final Map<int, Map<String, dynamic>> detalleAgrupado = {};
       for (final rawItem in listaConsolidada) {
         final item = rawItem as Map;
-        final idDet = (item['id_detalle'] as num?)?.toInt();
-        if (idDet == null) continue;
-        final cant = (item['unidades_totales'] as num?)?.toInt() ?? 0;
-        final lpnItem = (item['lpn_pallet'] ?? lpnMaster).toString().toUpperCase();
-        final lote = (item['lote'] ?? 'S/L').toString();
-        final venc = (item['fecha_vencimiento_cl'] ?? 'S/F').toString();
-        final cajas = (item['cajas'] as num?)?.toInt() ?? 0;
-        final displays = (item['displays'] as num?)?.toInt() ?? 0;
-        final multiplo = (item['multiplo_aplicado'] as num?)?.toInt() ?? 1;
-        final traza = '[$lpnItem] $lote / $venc ($cant UN; $cajas CJ; $displays DSP; x$multiplo)';
-        final acum = detalleAgrupado.putIfAbsent(idDet, () => {'unidades': 0, 'trazas': <String>[]});
-        acum['unidades'] = ((acum['unidades'] as num?)?.toInt() ?? 0) + cant;
-        (acum['trazas'] as List<String>).add(traza);
+        final idDet = item['id_detalle'];
+        final int cantAudit = (item['unidades_totales'] as num?)?.toInt() ?? 0;
+        final String loteStr = item['lote'].toString();
+        final String vencStr = (item['fecha_vencimiento_cl'] ?? 'S/F').toString();
+        final String lpnItem = (item['lpn_pallet'] ?? lpnMaster).toString().toUpperCase();
+        final String trazabilidadCompleta =
+            '[$lpnItem|BULTOS:$cantBultos|TIPO:$_tipoEmpaquePack|COMUNA:$comunaStr] $loteStr / $vencStr ($cantAudit UN)';
+
+        if (idDet != null) {
+          try {
+            await supabase.from('netsuite_detalle_ov').update({
+              'cantidad_pickeada': cantAudit,
+              'lotes_pickeados': trazabilidadCompleta,
+              'estado_linea': 'CONSOLIDADO_LPN',
+            }).eq('id', idDet);
+          } catch (_) {}
+        }
       }
-      for (final entry in detalleAgrupado.entries) {
-        try {
-          await supabase.from('netsuite_detalle_ov').update({
-            'cantidad_pickeada': entry.value['unidades'],
-            'lotes_pickeados': (entry.value['trazas'] as List<String>).join(' | '),
-            'estado_linea': 'CONSOLIDADO_LPN',
-          }).eq('id', entry.key);
-        } catch (_) {}
-      }
+
       // Actualizar estado_ns y guardar Bultos + LPN + Comuna directamente en canal_venta de netsuite_ordenes_venta
       if (ovMap['id'] != null) {
         final String canalPrevio = (ovMap['canal_venta'] ?? '').toString().trim();
@@ -4241,34 +4253,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
       final detalleJsonTorre = listaConsolidada.map((rawItem) {
         final item = rawItem as Map;
-        final lpnPallet = (item['lpn_pallet'] ?? lpnMaster).toString().toUpperCase();
-        final lote = (item['lote'] ?? 'S/L').toString();
-        final venc = (item['fecha_vencimiento_cl'] ?? 'S/F').toString();
-        final unidades = (item['unidades_totales'] as num?)?.toInt() ?? 0;
-        final cajas = (item['cajas'] as num?)?.toInt() ?? 0;
-        final displays = (item['displays'] as num?)?.toInt() ?? 0;
-        final multiplo = (item['multiplo_aplicado'] as num?)?.toInt() ?? 1;
         return {
-          'lpn_consolidado': lpnPallet,
-          'lpn_pallet': lpnPallet,
+          'lpn_consolidado': lpnMaster,
           'lpn_rango': lpnRangoTexto,
           'comuna': comunaStr,
-          'tipo_empaque': 'PALLET',
-          'bultos': 1,
-          'id_detalle': item['id_detalle'],
+          'tipo_empaque': _tipoEmpaquePack,
+          'bultos': cantBultos,
           'sku': item['sku'],
           'descripcion': item['descripcion'],
           'solicitado': item['solicitado'],
-          'pickeado': unidades,
-          'unidades_totales': unidades,
-          'cajas': cajas,
-          'displays': displays,
-          'multiplo_aplicado': multiplo,
-          'lote': lote,
-          'fecha_vencimiento_cl': venc == 'S/F' ? null : venc,
-          'lotes': '[$lpnPallet] $lote / $venc ($unidades UN; $cajas CJ; $displays DSP; x$multiplo)',
+          'pickeado': item['unidades_totales'],
+          'lotes': '${item['lote']} / ${item['fecha_vencimiento_cl'] ?? 'S/F'} (${item['unidades_totales']} UN)',
         };
       }).toList();
+
       final payloadPl = {
         'bodega': bodegaActiva,
         'orden_id': ovMap['id'],
@@ -4297,7 +4295,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       );
 
       _notificar(
-        '¡Packing finalizado! OV $numOvStr enviada al módulo PC. Descargue allí los PDF y el Excel NS.',
+        '¡Packing finalizado! OV $numOvStr enviada a FACTURACIÓN con $cantBultos $_tipoEmpaquePack(S) ($lpnRangoTexto).',
         color: const Color(0xFF047857),
       );
       setState(() {
@@ -4429,10 +4427,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             decoration: BoxDecoration(color: const Color(0xFFF8FAFC), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFCBD5E1))),
             child: Row(children: [const Icon(Icons.add_circle_outline, color: Color(0xFF0F766E)), const SizedBox(width: 8),
               Expanded(child: Text('${l['sku']} - ${l['descripcion']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
-              Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                  Text(_formatearEmpaquePacking(pend, (l['multiplo'] as num?)?.toInt() ?? 1), style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFFB45309), fontSize: 11)),
-                  Text('$pend UN', style: const TextStyle(fontSize: 9, color: Color(0xFF64748B))),
-                ])])));
+              Text('SALDO $pend UN', style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFFB45309), fontSize: 11))])));
         }),
         if (_lpnConsolidadoMapa.isNotEmpty) ...[
           const Divider(height: 22), const Text('CONTENIDO DEL PALLET', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF047857))),
@@ -4448,7 +4443,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         SizedBox(width: double.infinity, height: 48, child: ElevatedButton.icon(
           style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
           onPressed: _lpnConsolidadoMapa.isEmpty ? null : _cerrarPalletActualYCrearOtro,
-          icon: const Icon(Icons.print), label: const Text('CERRAR PALLET Y GENERAR REGISTRO'))),
+          icon: const Icon(Icons.print), label: const Text('CERRAR PALLET, GENERAR PDF Y PEDIR OTRO LPN'))),
       ])),
     ]);
   }
