@@ -3438,6 +3438,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   final TextEditingController _txtScanAuditoriaPack = TextEditingController();
   bool _cargandoAuditoriaPack = false;
   bool _guardandoPackingLpn = false;
+  // 0: buscar orden, 1: solicitar LPN, 2: agregar productos al pallet.
+  int _pasoPackingLpn = 0;
 
   void _generarLpnConsolidadoAuto() {
     final sufijo = DateFormat('yyMMdd-HHmmss').format(DateTime.now());
@@ -3458,6 +3460,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _lpnConsolidadoMapa.clear();
       _palletsPackingCerrados.clear();
       _txtLpnConsolidadoPack.clear();
+      _pasoPackingLpn = 0;
     });
     try {
       final sinFa = q.replaceAll('-FA', '').trim();
@@ -3480,6 +3483,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final cli = (_ovPackingCabeceraActiva!['cliente_nombre'] ?? '').toString().toUpperCase();
       _txtComunaDespachoPack.text = cli.contains('CONCEPCION') ? 'CONCEPCIÓN' : 'SANTIAGO';
       await _cargarOrdenParaAuditoriaPacking(_ovPackingCabeceraActiva!['id'].toString());
+      if (mounted && _lineasAuditoriaPacking.isNotEmpty) {
+        setState(() { _pasoPackingLpn = 1; _txtLpnConsolidadoPack.clear(); });
+      }
     } catch (e) {
       _notificar('Error buscando orden: $e', color: Colors.red);
       setState(() => _cargandoAuditoriaPack = false);
@@ -3498,10 +3504,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _palletsPackingCerrados.clear();
       _cargandoAuditoriaPack = true;
     });
-
-    if (_txtLpnConsolidadoPack.text.trim().isEmpty) {
-      _generarLpnConsolidadoAuto();
-    }
 
     try {
       final idNum = int.tryParse(key) ?? 0;
@@ -3599,6 +3601,45 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
     }
     return total;
+  }
+
+  int _saldoUnidadesPacking() {
+    int total = 0;
+    for (final raw in _lineasAuditoriaPacking) {
+      final l = raw as Map;
+      final id = (l['id_detalle'] as num?)?.toInt() ?? 0;
+      final solicitado = (l['solicitado'] as num?)?.toInt() ?? 0;
+      total += (solicitado - _cantidadSkuYaDistribuidaEnPallets(id)).clamp(0, solicitado);
+    }
+    return total;
+  }
+
+  int _skusPendientesPacking() => _lineasAuditoriaPacking.where((raw) {
+    final l = raw as Map;
+    final id = (l['id_detalle'] as num?)?.toInt() ?? 0;
+    final solicitado = (l['solicitado'] as num?)?.toInt() ?? 0;
+    return _cantidadSkuYaDistribuidaEnPallets(id) < solicitado;
+  }).length;
+
+  void _iniciarPalletPacking() {
+    final lpn = _txtLpnConsolidadoPack.text.trim().toUpperCase();
+    if (lpn.isEmpty) {
+      _notificar('Ingrese, escanee o genere un LPN.', color: Colors.orange);
+      return;
+    }
+    if (_palletsPackingCerrados.containsKey(lpn)) {
+      _notificar('El LPN $lpn ya fue usado en esta orden.', color: Colors.red);
+      return;
+    }
+    setState(() { _txtLpnConsolidadoPack.text = lpn; _lpnConsolidadoMapa.clear(); _pasoPackingLpn = 2; });
+  }
+
+  void _cambiarOrdenPacking() {
+    setState(() {
+      _pasoPackingLpn = 0; _ovPackingAuditKey = 'SIN_OV'; _ovPackingCabeceraActiva = null;
+      _lineasAuditoriaPacking.clear(); _lpnConsolidadoMapa.clear(); _palletsPackingCerrados.clear();
+      _txtBuscarOvPacking.clear(); _txtLpnConsolidadoPack.clear(); _txtScanAuditoriaPack.clear();
+    });
   }
 
   Future _abrirModalAuditarLineaPacking(Map linea) async {
@@ -3794,8 +3835,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         linea['consolidado_en_lpn'] = false;
       }
       _txtLpnConsolidadoPack.clear();
+      _txtScanAuditoriaPack.clear();
+      _pasoPackingLpn = 1;
     });
-    _generarLpnConsolidadoAuto();
 
     await generarPdfContenidoPalletLpn(
       lpn: lpn,
@@ -3804,7 +3846,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       comuna: comuna,
       lineas: lineas,
     );
-    _notificar('Pallet $lpn cerrado con ${lineas.length} SKU. Puede comenzar el siguiente pallet.',
+    final saldo = _saldoUnidadesPacking();
+    _notificar(saldo > 0
+        ? 'Pallet $lpn cerrado. Quedan ${_skusPendientesPacking()} SKU y $saldo UN. Ingrese otro LPN.'
+        : 'Pallet $lpn cerrado. Todos los productos están distribuidos; finalice el Packing.',
         color: const Color(0xFF047857));
   }
 
@@ -3987,6 +4032,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         _palletsPackingCerrados.clear();
         _ovPackingCabeceraActiva = null;
         _txtBuscarOvPacking.clear();
+        _txtLpnConsolidadoPack.clear();
+        _pasoPackingLpn = 0;
       });
     } catch (e) {
       _notificar('Error cerrando Packing: $e', color: Colors.red);
@@ -3996,290 +4043,134 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   Widget _construirVistaAuditoriaPackingLpn() {
-    final int totalSkusOrden = _lineasAuditoriaPacking.length;
-    final int totalSkusEnLpn = _lpnConsolidadoMapa.length;
-    int totalUnidEnLpn = 0;
-    for (final val in _lpnConsolidadoMapa.values) {
-      final m = val as Map;
-      totalUnidEnLpn += (m['unidades_totales'] as num?)?.toInt() ?? 0;
+    final saldo = _saldoUnidadesPacking();
+    final pendientes = _skusPendientesPacking();
+    final ov = (_ovPackingCabeceraActiva?['numero_ov'] ?? '').toString().toUpperCase();
+    final cliente = (_ovPackingCabeceraActiva?['cliente_nombre'] ?? 'CLIENTE').toString().toUpperCase();
+
+    Widget cabecera() => Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(10)),
+      child: Row(children: [
+        const Icon(Icons.inventory_2_rounded, color: Color(0xFF5EEAD4)), const SizedBox(width: 9),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(ov, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 15)),
+          Text(cliente, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 10)),
+          Text('$pendientes SKU | $saldo UN pendientes', style: const TextStyle(color: Color(0xFF5EEAD4), fontSize: 10, fontWeight: FontWeight.bold)),
+        ])),
+        TextButton.icon(onPressed: _cambiarOrdenPacking, icon: const Icon(Icons.swap_horiz, color: Colors.white),
+          label: const Text('CAMBIAR OV', style: TextStyle(color: Colors.white, fontSize: 10))),
+      ]),
+    );
+
+    if (_pasoPackingLpn == 0) {
+      return ListView(padding: const EdgeInsets.fromLTRB(12,12,12,86), children: [
+        _TarjetaMovil(borderColor: const Color(0xFF0D9488), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('BUSCAR ORDEN PARA PACKING', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: Color(0xFF0F766E))),
+          const SizedBox(height: 6),
+          const Text('Al cargar la OV/OT, esta pantalla se cerrará y pasará directamente al LPN.', style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+          const SizedBox(height: 12),
+          TextField(controller: _txtBuscarOvPacking, autofocus: true, textCapitalization: TextCapitalization.characters,
+            inputFormatters: [UpperCaseTextFormatter()], onSubmitted: (_) => _buscarOrdenParaPackingPorTexto(),
+            decoration: InputDecoration(labelText: 'N° OV / OT', prefixIcon: const Icon(Icons.local_shipping_outlined),
+              suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: () async {
+                await _escanearParaCampo(_txtBuscarOvPacking, 'Escanear OV / OT');
+                if (_txtBuscarOvPacking.text.isNotEmpty) await _buscarOrdenParaPackingPorTexto();
+              }))),
+          const SizedBox(height: 12),
+          SizedBox(width: double.infinity, height: 48, child: ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
+            onPressed: _cargandoAuditoriaPack ? null : _buscarOrdenParaPackingPorTexto,
+            icon: const Icon(Icons.arrow_forward_rounded), label: const Text('CARGAR ORDEN Y CONTINUAR'))),
+        ])),
+      ]);
     }
 
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 86),
-      children: [
-        _TarjetaMovil(
-          borderColor: const Color(0xFF0D9488),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                '1. ESTACIÓN DE PACKING (POR BULTO O PALLET)',
-                style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: Color(0xFF0F766E)),
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _txtBuscarOvPacking,
-                      textCapitalization: TextCapitalization.characters,
-                      inputFormatters: [UpperCaseTextFormatter()],
-                      onSubmitted: (_) => _buscarOrdenParaPackingPorTexto(),
-                      decoration: InputDecoration(
-                        labelText: 'Escribir N° de OV / OT a Empacar',
-                        prefixIcon: const Icon(Icons.local_shipping_outlined, color: Color(0xFF0F766E)),
-                        suffixIcon: IconButton(
-                          icon: const Icon(Icons.qr_code_scanner, color: Color(0xFF0F766E)),
-                          onPressed: () async {
-                            await _escanearParaCampo(_txtBuscarOvPacking, 'Escanear N° OV / OT');
-                            if (_txtBuscarOvPacking.text.isNotEmpty) {
-                              await _buscarOrdenParaPackingPorTexto();
-                            }
-                          },
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  ElevatedButton(
-                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white, minimumSize: const Size(0, 46)),
-                    onPressed: _cargandoAuditoriaPack ? null : _buscarOrdenParaPackingPorTexto,
-                    child: const Text('CARGAR OV', style: TextStyle(fontWeight: FontWeight.bold)),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _txtComunaDespachoPack,
-                      textCapitalization: TextCapitalization.characters,
-                      inputFormatters: [UpperCaseTextFormatter()],
-                      decoration: const InputDecoration(
-                        labelText: 'Comuna de Despacho',
-                        prefixIcon: Icon(Icons.location_city_rounded, color: Color(0xFF0F766E)),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: DropdownButtonFormField(
-                      value: _tipoEmpaquePack,
-                      decoration: const InputDecoration(labelText: 'Empaque'),
-                      items: const [
-                        DropdownMenuItem(value: 'BULTO', child: Text('POR BULTO')),
-                        DropdownMenuItem(value: 'PALLET', child: Text('POR PALLET')),
-                      ],
-                      onChanged: (v) => setState(() => _tipoEmpaquePack = (v ?? 'BULTO').toString()),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  SizedBox(
-                    width: 95,
-                    child: TextField(
-                      controller: _txtCantidadBultosPack,
-                      keyboardType: TextInputType.number,
-                      textAlign: TextAlign.center,
-                      decoration: const InputDecoration(labelText: 'N° Bultos'),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-        if (_cargandoAuditoriaPack)
-          const Padding(padding: EdgeInsets.all(24), child: Center(child: CircularProgressIndicator())),
-        if (!_cargandoAuditoriaPack && _lineasAuditoriaPacking.isNotEmpty) ...[
+    if (_pasoPackingLpn == 1) {
+      return ListView(padding: const EdgeInsets.fromLTRB(12,12,12,86), children: [
+        cabecera(), const SizedBox(height: 10),
+        _TarjetaMovil(borderColor: const Color(0xFF14B8A6), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(saldo > 0 ? 'INGRESAR LPN DEL SIGUIENTE PALLET' : 'ORDEN COMPLETAMENTE DISTRIBUIDA',
+            style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: Color(0xFF0F766E))),
+          const SizedBox(height: 6),
+          if (saldo > 0) ...[
+            TextField(controller: _txtLpnConsolidadoPack, autofocus: true, textCapitalization: TextCapitalization.characters,
+              inputFormatters: [UpperCaseTextFormatter()], onSubmitted: (_) => _iniciarPalletPacking(),
+              decoration: InputDecoration(labelText: 'Escanear / ingresar LPN', prefixIcon: const Icon(Icons.qr_code_2),
+                suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner),
+                  onPressed: () => _escanearParaCampo(_txtLpnConsolidadoPack, 'Escanear LPN')))),
+            const SizedBox(height: 8),
+            Row(children: [
+              Expanded(child: OutlinedButton.icon(onPressed: _generarLpnConsolidadoAuto, icon: const Icon(Icons.auto_awesome), label: const Text('LPN AUTO'))),
+              const SizedBox(width: 8),
+              Expanded(child: ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
+                onPressed: _iniciarPalletPacking, icon: const Icon(Icons.inventory_2), label: const Text('INICIAR PALLET'))),
+            ]),
+          ] else ...[
+            const Text('Todos los productos fueron asignados. Finalice el Packing para enviar la orden a Facturación.'),
             const SizedBox(height: 10),
-            _TarjetaMovil(
-              borderColor: const Color(0xFF14B8A6),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('2. LPN DEL PALLET ACTUAL',
-                      style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: Color(0xFF0F766E))),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _txtLpnConsolidadoPack,
-                          textCapitalization: TextCapitalization.characters,
-                          inputFormatters: [UpperCaseTextFormatter()],
-                          decoration: InputDecoration(
-                            labelText: 'Escanear / ingresar LPN del pallet',
-                            prefixIcon: const Icon(Icons.qr_code_2_rounded, color: Color(0xFF0F766E)),
-                            suffixIcon: IconButton(
-                              icon: const Icon(Icons.qr_code_scanner_rounded, color: Color(0xFF0F766E)),
-                              onPressed: () => _escanearParaCampo(_txtLpnConsolidadoPack, 'Escanear LPN del Pallet'),
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
-                        onPressed: _generarLpnConsolidadoAuto,
-                        icon: const Icon(Icons.auto_awesome_rounded, size: 18),
-                        label: const Text('AUTO'),
-                      ),
-                    ],
-                  ),
-                  if (_palletsPackingCerrados.isNotEmpty) ...[
-                    const SizedBox(height: 10),
-                    Text('PALLETS CERRADOS: ${_palletsPackingCerrados.length}',
-                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
-                    ..._palletsPackingCerrados.entries.map((entry) => ListTile(
-                          dense: true,
-                          contentPadding: EdgeInsets.zero,
-                          leading: const Icon(Icons.inventory_2_rounded, color: Color(0xFF047857)),
-                          title: Text(entry.key, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                          subtitle: Text('${entry.value.length} SKU | ${entry.value.fold<int>(0, (s, i) => s + ((i['unidades_totales'] as num?)?.toInt() ?? 0))} UN'),
-                          trailing: IconButton(
-                            tooltip: 'Reimprimir contenido del pallet',
-                            icon: const Icon(Icons.picture_as_pdf_rounded, color: Color(0xFFDC2626)),
-                            onPressed: () => generarPdfContenidoPalletLpn(
-                              lpn: entry.key,
-                              numeroOv: (_ovPackingCabeceraActiva?['numero_ov'] ?? '').toString(),
-                              cliente: (_ovPackingCabeceraActiva?['cliente_nombre'] ?? 'CLIENTE').toString(),
-                              comuna: _txtComunaDespachoPack.text.trim().toUpperCase(),
-                              lineas: entry.value,
-                            ),
-                          ),
-                        )),
-                  ],
-                ],
-              ),
-            ),
-          const SizedBox(height: 10),
-          _TarjetaMovil(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Expanded(child: Text('3. REVISAR Y MARCAR ARTÍCULOS DEL PALLET ACTUAL', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13))),
-                    TextButton.icon(
-                      onPressed: () {
-                        setState(() {
-                          final lpnActual = _txtLpnConsolidadoPack.text.trim().toUpperCase();
-                          for (final rawL in _lineasAuditoriaPacking) {
-                            final l = rawL as Map;
-                            final int idDetalle = (l['id_detalle'] as num?)?.toInt() ?? 0;
-                            final int solicitado = (l['solicitado'] as num?)?.toInt() ?? 0;
-                            final int distribuido = _cantidadSkuYaDistribuidaEnPallets(idDetalle);
-                            final int saldo = (solicitado - distribuido).clamp(0, solicitado);
-                            if (saldo <= 0) continue;
-                            final sku = l['sku'].toString();
-                            final lote = (l['lote_auditado'] ?? 'S/L').toString();
-                            final clave = '$lpnActual|$idDetalle|$lote';
-                            _lpnConsolidadoMapa[clave] = {
-                              'id_detalle': idDetalle,
-                              'lpn_pallet': lpnActual,
-                              'sku': sku,
-                              'descripcion': l['descripcion'],
-                              'solicitado': solicitado,
-                              'pickeado': saldo,
-                              'unidades_totales': saldo,
-                              'cajas': 1,
-                              'multiplo_aplicado': l['multiplo'],
-                              'lote': lote,
-                              'fecha_vencimiento_cl': l['venc_auditado'],
-                            };
-                            l['auditado_unid'] = solicitado;
-                            l['distribuido_pallets'] = solicitado;
-                            l['saldo_packing'] = 0;
-                            l['consolidado_en_lpn'] = true;
-                          }
-                        });
-                      },
-                      icon: const Icon(Icons.done_all_rounded, size: 18),
-                      label: const Text('VALIDAR TODOS', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                    ),
-                  ],
-                ),
-                ..._lineasAuditoriaPacking.map((rawLin) {
-                  final l = rawLin as Map;
-                  final int idDetalle = (l['id_detalle'] as num?)?.toInt() ?? 0;
-                  final int sol = (l['solicitado'] as num?)?.toInt() ?? 0;
-                  final int distribuido = _cantidadSkuYaDistribuidaEnPallets(idDetalle);
-                  final int saldo = (sol - distribuido).clamp(0, sol);
-                  final bool yaEnLpn = saldo == 0 && sol > 0;
-                  return InkWell(
-                    onTap: () => _abrirModalAuditarLineaPacking(l),
-                    child: Container(
-                      margin: const EdgeInsets.only(bottom: 8),
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: yaEnLpn ? const Color(0xFFECFDF5) : const Color(0xFFF8FAFC),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: yaEnLpn ? const Color(0xFF10B981) : const Color(0xFFCBD5E1)),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(yaEnLpn ? Icons.check_circle_rounded : Icons.pending_actions_rounded, color: yaEnLpn ? const Color(0xFF047857) : const Color(0xFF64748B)),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(_etiquetaGrupoMarca(l), style: const TextStyle(fontSize: 9.5, fontWeight: FontWeight.w900, color: Color(0xFF0F766E))),
-                                Text('${l['sku']} - ${l['descripcion']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                              ],
-                            ),
-                          ),
-                          Text(yaEnLpn ? '$distribuido / $sol UN ✓' : '$distribuido / $sol UN | Saldo: $saldo', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
-                        ],
-                      ),
-                    ),
-                  );
-                }),
-                const SizedBox(height: 12),
-                Text('Auditados: $totalSkusEnLpn de $totalSkusOrden SKUs ($totalUnidEnLpn UN)', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                const SizedBox(height: 10),
-                SizedBox(
-                  width: double.infinity,
-                  height: 46,
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
-                    onPressed: _lpnConsolidadoMapa.isEmpty ? null : _cerrarPalletActualYCrearOtro,
-                    icon: const Icon(Icons.inventory_2_rounded),
-                    label: const Text('CERRAR ESTE PALLET + PDF DE CONTENIDO + CREAR OTRO',
-                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: () => _cerrarPackingYConsolidarLpn(soloEtiquetaLpn: true),
-                        icon: const Icon(Icons.qr_code_2_rounded, size: 18),
-                        label: const Text('ETIQUETAS BULTOS (15x10)', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF047857), foregroundColor: Colors.white, minimumSize: const Size(0, 46)),
-                        onPressed: _guardandoPackingLpn ? null : () => _cerrarPackingYConsolidarLpn(soloEtiquetaLpn: false),
-                        icon: const Icon(Icons.verified_rounded, size: 18),
-                        label: const Text('CERRAR PACKING -> ENVIAR A FACTURACIÓN', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ],
-      ],
-    );
-  }
+            SizedBox(width: double.infinity, height: 48, child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF047857), foregroundColor: Colors.white),
+              onPressed: _guardandoPackingLpn ? null : () => _cerrarPackingYConsolidarLpn(soloEtiquetaLpn: false),
+              icon: const Icon(Icons.verified), label: const Text('FINALIZAR PACKING'))),
+          ],
+          if (_palletsPackingCerrados.isNotEmpty) ...[
+            const Divider(height: 24),
+            Text('PALLETS CERRADOS: ${_palletsPackingCerrados.length}', style: const TextStyle(fontWeight: FontWeight.bold)),
+            ..._palletsPackingCerrados.entries.map((e) => ListTile(dense: true, contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.check_circle, color: Color(0xFF047857)), title: Text(e.key),
+              subtitle: Text('${e.value.length} SKU | ${e.value.fold<int>(0,(a,i)=>a+((i['unidades_totales'] as num?)?.toInt()??0))} UN'),
+              trailing: IconButton(icon: const Icon(Icons.picture_as_pdf, color: Colors.red), onPressed: () => generarPdfContenidoPalletLpn(
+                lpn: e.key, numeroOv: ov, cliente: cliente, comuna: _txtComunaDespachoPack.text, lineas: e.value)))),
+          ],
+        ])),
+      ]);
+    }
 
+    final lpn = _txtLpnConsolidadoPack.text.trim().toUpperCase();
+    return ListView(padding: const EdgeInsets.fromLTRB(12,12,12,86), children: [
+      cabecera(), const SizedBox(height: 10),
+      _TarjetaMovil(borderColor: const Color(0xFF14B8A6), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [const Icon(Icons.inventory_2, color: Color(0xFF0F766E)), const SizedBox(width: 8),
+          Expanded(child: Text('PALLET ACTUAL: $lpn', style: const TextStyle(fontWeight: FontWeight.w900))),
+          TextButton(onPressed: _lpnConsolidadoMapa.isEmpty ? () => setState(() => _pasoPackingLpn = 1) : null, child: const Text('CAMBIAR LPN'))]),
+        const SizedBox(height: 8),
+        Row(children: [Expanded(child: TextField(controller: _txtScanAuditoriaPack, autofocus: true,
+          textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()],
+          onSubmitted: (_) => _procesarEscaneoAuditoriaPacking(),
+          decoration: const InputDecoration(labelText: 'Escanear SKU / EAN para agregar', prefixIcon: Icon(Icons.barcode_reader)))),
+          const SizedBox(width: 8), ElevatedButton(onPressed: () async {
+            await _escanearParaCampo(_txtScanAuditoriaPack, 'Escanear producto');
+            if (_txtScanAuditoriaPack.text.isNotEmpty) await _procesarEscaneoAuditoriaPacking();
+          }, child: const Icon(Icons.qr_code_scanner))]),
+      ])),
+      const SizedBox(height: 10),
+      _TarjetaMovil(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('PRODUCTOS PENDIENTES', style: TextStyle(fontWeight: FontWeight.bold)), const SizedBox(height: 8),
+        ..._lineasAuditoriaPacking.map((raw) {
+          final l = raw as Map; final id=(l['id_detalle'] as num?)?.toInt()??0; final sol=(l['solicitado'] as num?)?.toInt()??0;
+          final dist=_cantidadSkuYaDistribuidaEnPallets(id); final pend=(sol-dist).clamp(0,sol);
+          if (pend<=0) return const SizedBox.shrink();
+          return InkWell(onTap: ()=>_abrirModalAuditarLineaPacking(l), child: Container(margin: const EdgeInsets.only(bottom: 7), padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(color: const Color(0xFFF8FAFC), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFCBD5E1))),
+            child: Row(children: [const Icon(Icons.add_circle_outline, color: Color(0xFF0F766E)), const SizedBox(width: 8),
+              Expanded(child: Text('${l['sku']} - ${l['descripcion']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+              Text('SALDO $pend UN', style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFFB45309), fontSize: 11))])));
+        }),
+        if (_lpnConsolidadoMapa.isNotEmpty) ...[
+          const Divider(height: 22), const Text('CONTENIDO DEL PALLET', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF047857))),
+          ..._lpnConsolidadoMapa.values.map((raw) { final i=raw as Map; return ListTile(dense:true, contentPadding:EdgeInsets.zero,
+            leading:const Icon(Icons.check_circle_outline,color:Color(0xFF047857)), title:Text('${i['sku']} - ${i['descripcion']}',style:const TextStyle(fontSize:11,fontWeight:FontWeight.bold)),
+            subtitle:Text('${i['unidades_totales']} UN | Lote ${i['lote']}',style:const TextStyle(fontSize:10))); }),
+        ],
+        const SizedBox(height: 10),
+        SizedBox(width: double.infinity, height: 48, child: ElevatedButton.icon(
+          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
+          onPressed: _lpnConsolidadoMapa.isEmpty ? null : _cerrarPalletActualYCrearOtro,
+          icon: const Icon(Icons.print), label: const Text('CERRAR PALLET, GENERAR PDF Y PEDIR OTRO LPN'))),
+      ])),
+    ]);
+  }
 
   // ===================================================================
   // CARGA Y VALIDACIÓN VISUAL DE UBICACIONES EN MAESTRA
