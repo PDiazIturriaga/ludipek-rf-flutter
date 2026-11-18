@@ -3442,6 +3442,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   bool _guardandoPackingLpn = false;
   // 0: buscar orden, 1: solicitar LPN, 2: agregar productos al pallet.
   int _pasoPackingLpn = 0;
+  int? _packingDraftId;
+  bool _sincronizandoPacking = false;
 
   void _generarLpnConsolidadoAuto() {
     final sufijo = DateFormat('yyMMdd-HHmmss').format(DateTime.now());
@@ -3463,6 +3465,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _palletsPackingCerrados.clear();
       _txtLpnConsolidadoPack.clear();
       _pasoPackingLpn = 0;
+      _packingDraftId = null;
     });
     try {
       final sinFa = q.replaceAll('-FA', '').trim();
@@ -3491,6 +3494,117 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     } catch (e) {
       _notificar('Error buscando orden: $e', color: Colors.red);
       setState(() => _cargandoAuditoriaPack = false);
+    }
+  }
+
+  String _extraerLpnPersistido(Map<String, dynamic> item) {
+    final directo = (item['lpn_pallet'] ?? item['lpn_consolidado'] ?? '').toString().trim().toUpperCase();
+    if (directo.isNotEmpty) return directo;
+    final trazabilidad = (item['lotes'] ?? '').toString();
+    final coincidencia = RegExp(r'\[([^\]|]+)').firstMatch(trazabilidad);
+    return coincidencia?.group(1)?.trim().toUpperCase() ?? '';
+  }
+
+  List<Map<String, dynamic>> _serializarPalletsPacking(String estado) {
+    final salida = <Map<String, dynamic>>[];
+    for (final entry in _palletsPackingCerrados.entries) {
+      for (final raw in entry.value) {
+        salida.add({
+          ...Map<String, dynamic>.from(raw),
+          'lpn_pallet': entry.key,
+          'lpn_consolidado': entry.key,
+          '_estado_packing': estado,
+          '_pallet_cerrado': true,
+        });
+      }
+    }
+    return salida;
+  }
+
+  Future<bool> _guardarPalletsPackingEnSupabase(String estado) async {
+    final ov = _ovPackingCabeceraActiva;
+    if (ov == null || ov['id'] == null) return false;
+    final detalle = _serializarPalletsPacking(estado);
+    if (detalle.isEmpty) return false;
+    final payload = <String, dynamic>{
+      'orden_id': ov['id'],
+      'numero_ov': (ov['numero_ov'] ?? _txtBuscarOvPacking.text).toString().toUpperCase(),
+      'cliente_nombre': (ov['cliente_nombre'] ?? 'CLIENTE').toString(),
+      'usuario_picking': (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'PACKING_RF').toString().toUpperCase(),
+      'detalle_json': detalle,
+      'fecha_emision': DateTime.now().toIso8601String(),
+      'bodega': bodegaActiva,
+    };
+    try {
+      if (mounted) setState(() => _sincronizandoPacking = true);
+      dynamic respuesta;
+      if (_packingDraftId != null) {
+        respuesta = await supabase.from('wms_packing_lists_fa').update(payload).eq('id', _packingDraftId!).select('id').maybeSingle();
+      } else {
+        respuesta = await supabase.from('wms_packing_lists_fa').insert(payload).select('id').single();
+      }
+      final id = (respuesta?['id'] as num?)?.toInt();
+      if (id != null) _packingDraftId = id;
+      return _packingDraftId != null;
+    } catch (e) {
+      _notificar('No se pudo guardar el pallet en Supabase: $e', color: Colors.red);
+      return false;
+    } finally {
+      if (mounted) setState(() => _sincronizandoPacking = false);
+    }
+  }
+
+  Future<void> _restaurarPalletsPackingDesdeSupabase(int ordenId, String numeroOv) async {
+    try {
+      final raw = await supabase
+          .from('wms_packing_lists_fa')
+          .select('id, orden_id, numero_ov, detalle_json, fecha_emision')
+          .or('orden_id.eq.$ordenId,numero_ov.eq.$numeroOv')
+          .order('id', ascending: false)
+          .limit(10);
+      final filas = raw as List;
+      if (filas.isEmpty) return;
+
+      final porLpn = <String, List<Map<String, dynamic>>>{};
+      int? idBorrador;
+      for (final rawFila in filas) {
+        final fila = Map<String, dynamic>.from(rawFila as Map);
+        dynamic contenido = fila['detalle_json'];
+        if (contenido is String) contenido = jsonDecode(contenido);
+        if (contenido is! List) continue;
+        bool filaAporta = false;
+        for (final rawItem in contenido.whereType<Map>()) {
+          final item = Map<String, dynamic>.from(rawItem);
+          final lpn = _extraerLpnPersistido(item);
+          if (lpn.isEmpty) continue;
+          // Evita duplicar una misma línea si existen registros históricos repetidos.
+          final idDetalle = (item['id_detalle'] ?? item['sku'] ?? '').toString();
+          final lote = (item['lote'] ?? 'S/L').toString();
+          final clave = '$idDetalle|$lote|${item['unidades_totales'] ?? item['pickeado'] ?? 0}';
+          final lista = porLpn.putIfAbsent(lpn, () => []);
+          if (!lista.any((x) => '${x['id_detalle'] ?? x['sku']}|${x['lote'] ?? 'S/L'}|${x['unidades_totales'] ?? x['pickeado'] ?? 0}' == clave)) {
+            item['lpn_pallet'] = lpn;
+            item['lpn_consolidado'] = lpn;
+            item['unidades_totales'] = (item['unidades_totales'] as num?)?.toInt() ?? (item['pickeado'] as num?)?.toInt() ?? 0;
+            lista.add(item);
+            filaAporta = true;
+          }
+        }
+        if (filaAporta && idBorrador == null) idBorrador = (fila['id'] as num?)?.toInt();
+      }
+      if (porLpn.isEmpty || !mounted) return;
+      setState(() {
+        _packingDraftId = idBorrador;
+        _palletsPackingCerrados
+          ..clear()
+          ..addAll(porLpn);
+        _lpnConsolidadoMapa.clear();
+        _txtLpnConsolidadoPack.clear();
+        _pasoPackingLpn = 1;
+      });
+      _notificar('Packing recuperado: ${porLpn.length} LPN cargados desde Supabase.', color: const Color(0xFF047857));
+    } catch (e) {
+      _notificar('No se pudieron recuperar los LPN guardados: $e', color: Colors.orange);
     }
   }
 
@@ -3589,6 +3703,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       if (mounted) {
         setState(() => _lineasAuditoriaPacking = listaTemp);
       }
+      final numeroOvCarga = (_ovPackingCabeceraActiva?['numero_ov'] ?? _txtBuscarOvPacking.text).toString().toUpperCase();
+      await _restaurarPalletsPackingDesdeSupabase(idNum, numeroOvCarga);
     } catch (e) {
       _notificar('Error cargando orden para Packing: $e', color: Colors.red);
     } finally {
@@ -4079,6 +4195,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   Future<void> _cerrarPalletActualYCrearOtro() async {
+    if (_sincronizandoPacking) return;
     if (_lpnConsolidadoMapa.isEmpty) {
       _notificar('Revise al menos un SKU antes de cerrar el pallet.', color: Colors.orange);
       return;
@@ -4089,40 +4206,33 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       lpn = _txtLpnConsolidadoPack.text.trim().toUpperCase();
     }
     if (_palletsPackingCerrados.containsKey(lpn)) {
-      _notificar('El LPN $lpn ya fue usado en esta OV. Genere o escanee otro LPN.', color: Colors.red);
+      _notificar('El LPN $lpn ya fue usado en esta OT.', color: Colors.red);
       return;
     }
-    final lineas = _lpnConsolidadoMapa.values
-        .map((e) => Map<String, dynamic>.from(e as Map))
-        .toList();
-    final ov = (_ovPackingCabeceraActiva?['numero_ov'] ?? _txtBuscarOvPacking.text).toString().toUpperCase();
-    final cliente = (_ovPackingCabeceraActiva?['cliente_nombre'] ?? 'CLIENTE').toString().toUpperCase();
-    final comuna = _txtComunaDespachoPack.text.trim().toUpperCase();
-
+    final lineas = _lpnConsolidadoMapa.values.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    _palletsPackingCerrados[lpn] = lineas;
+    final guardado = await _guardarPalletsPackingEnSupabase('PACKING_EN_PROCESO');
+    if (!guardado) {
+      _palletsPackingCerrados.remove(lpn);
+      _notificar('PALLET NO GUARDADO. Vuelva a intentar.', color: Colors.red);
+      return;
+    }
     setState(() {
-      _palletsPackingCerrados[lpn] = lineas;
       _lpnConsolidadoMapa.clear();
-      for (final raw in _lineasAuditoriaPacking) {
-        final linea = raw as Map;
-        linea['consolidado_en_lpn'] = false;
-      }
       _txtLpnConsolidadoPack.clear();
       _txtScanAuditoriaPack.clear();
       _pasoPackingLpn = 1;
     });
-
-    await generarPdfContenidoPalletLpn(
-      lpn: lpn,
-      numeroOv: ov,
-      cliente: cliente,
-      comuna: comuna,
-      lineas: lineas,
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('PALLET GENERADO Y GUARDADO', style: TextStyle(fontWeight: FontWeight.w900)),
+        content: Text('$lpn\n${lineas.length} SKU guardados en Supabase.'),
+        actions: [ElevatedButton(onPressed: () => Navigator.pop(ctx), child: const Text('CONTINUAR'))],
+      ),
     );
-    final saldo = _saldoUnidadesPacking();
-    _notificar(saldo > 0
-        ? 'Pallet $lpn cerrado. Quedan ${_skusPendientesPacking()} SKU y $saldo UN. Ingrese otro LPN.'
-        : 'Pallet $lpn cerrado. Todos los productos están distribuidos; finalice el Packing.',
-        color: const Color(0xFF047857));
   }
 
   Future _cerrarPackingYConsolidarLpn({required bool soloEtiquetaLpn}) async {
