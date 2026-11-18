@@ -2820,8 +2820,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final res = await supabase
           .from('netsuite_ordenes_venta')
           .select()
+          .or('estado_ns.eq.PENDIENTE_PICKING,estado_ns.is.null')
           .order('id', ascending: true)
-          .limit(300);
+          .limit(500);
 
       final List candidatas = (res as List).where((rawOv) {
         final ov = Map.from(rawOv as Map);
@@ -2985,7 +2986,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final fin = (i + 100) > buscar.length ? buscar.length : i + 100;
       final res = await supabase
           .from('maestra_sku')
-          .select('sku, descripcion, multiplo, codigo_barras, marca')
+          .select('sku, descripcion, multiplo, codigo_barras, marca, peso_kg, peso_gr')
           .inFilter('sku', buscar.sublist(i, fin));
       for (final f in (res as List)) {
         salida.add(Map<String, dynamic>.from(f as Map));
@@ -3375,20 +3376,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
       }
 
-      // 2) Guardar cantidades y lotes en las líneas de la OV
-      for (var rawL in _lineasOvFarmacia) {
-        final l = rawL as Map;
-        final int idLinea = (l['id_detalle'] as num).toInt();
-        final int cantPick = (l['pickeado'] as num?)?.toInt() ?? 0;
-        final Map lotesMap = (l['lotes_pickeados'] as Map?) ?? {};
-        String lotesStr = lotesMap.entries.map((e) => '${e.key} (${e.value} UN)').join(' | ');
-
-        await supabase.from('netsuite_detalle_ov').update({
-          'cantidad_pickeada': cantPick,
-          'lotes_pickeados': lotesStr,
-        }).eq('id', idLinea);
-      }
-
+      // 2) Guardar líneas + cambiar estado en UNA transacción del servidor (wms_cerrar_picking).
+      //    Antes eran escrituras sueltas con errores silenciados: el celular decía "pasó a PACKING"
+      //    aunque Supabase no cambiara el estado (caso OV 133409-FA).
       final Map ovMap = _ovCabeceraActiva ??
           {
             'id': int.tryParse(_ovSeleccionadaKey),
@@ -3396,17 +3386,39 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             'cliente_nombre': 'CLIENTE',
           };
       final String numeroOv = (ovMap['numero_ov'] ?? 'S/OV').toString().toUpperCase();
-
-
-      // ACTUALIZA EL ESTATUS DESDE MAIN.DART A PENDIENTE_PACKING (ENCIENDE CÍRCULO VERDE DE PICKING EN EL PC)
-      if (ovMap['id'] != null) {
-        try {
-          await supabase.from('netsuite_ordenes_venta').update({'estado_ns': 'PENDIENTE_PACKING'}).eq('id', ovMap['id']);
-        } catch (_) {
-          try {
-            await supabase.from('netsuite_ordenes_venta').update({'estado': 'PENDIENTE_PACKING'}).eq('id', ovMap['id']);
-          } catch (_) {}
+      final int? ordenId = int.tryParse('${ovMap['id'] ?? ''}');
+      if (ordenId == null) {
+        _notificar('No se identificó la OV en Supabase. Vuelva a cargarla.', color: Colors.red);
+        return;
+      }
+      final lineasPayload = _lineasOvFarmacia.map((rawL) {
+        final l = rawL as Map;
+        final Map lotesMap = (l['lotes_pickeados'] as Map?) ?? {};
+        return {
+          'id': (l['id_detalle'] as num).toInt(),
+          'cantidad_pickeada': (l['pickeado'] as num?)?.toInt() ?? 0,
+          'lotes_pickeados': lotesMap.entries.map((e) => '${e.key} (${e.value} UN)').join(' | '),
+        };
+      }).toList();
+      try {
+        await supabase.rpc('wms_cerrar_picking', params: {
+          'p_orden_id': ordenId,
+          'p_lineas': lineasPayload,
+          'p_usuario': _usuarioRf(),
+        });
+      } catch (e) {
+        if (mounted) {
+          await showDialog<void>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text('La OV NO pasó a packing', style: TextStyle(fontWeight: FontWeight.bold)),
+              content: Text('${_mensajeError(e)}\n\nEl stock ya descontado no se vuelve a descontar. '
+                  'Revise la conexión y presione FINALIZAR otra vez.'),
+              actions: [TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('ENTENDIDO'))],
+            ),
+          );
         }
+        return;
       }
 
       _notificar('¡Picking completado! La OV $numeroOv pasó a PACKING.', color: const Color(0xFF047857));
@@ -3741,6 +3753,45 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   int _pasoPackingLpn = 0;
   int? _packingDraftId;
   bool _sincronizandoPacking = false;
+  // Modo de packing: OV normal/farmacia = BULTOS (cuenta bultos y peso); traslado OT = PALLETS (LPN obligatorio)
+  bool _packingEsTraslado = false;
+  // BULTOS: unidades verificadas por línea (id_detalle -> UN)
+  final Map<int, int> _verificadoBultos = {};
+  final TextEditingController _txtPesoRealPack = TextEditingController();
+
+  int _esperadoPacking(Map l) => (l['esperado'] as num?)?.toInt() ?? 0;
+
+  double _pesoEsperadoPackingKg() {
+    double total = 0;
+    for (final raw in _lineasAuditoriaPacking) {
+      final l = raw as Map;
+      total += _esperadoPacking(l) * ((l['peso_unit_kg'] as num?)?.toDouble() ?? 0);
+    }
+    return total;
+  }
+
+  bool _lineasSinPeso() => _lineasAuditoriaPacking.any((raw) {
+        final l = raw as Map;
+        return _esperadoPacking(l) > 0 && ((l['peso_unit_kg'] as num?)?.toDouble() ?? 0) <= 0;
+      });
+
+  /// "L1 / 22-05-2028 [Rack: B-01] (5 UN) | L2 / S/F (3 UN)" -> [{lote, venc, unidades}]
+  List<Map<String, dynamic>> _parsearLotesPickeados(String raw) {
+    final salida = <Map<String, dynamic>>[];
+    for (final bloque in raw.split('|')) {
+      final b = bloque.replaceAll(RegExp(r'^\s*\[[^\]]*\]\s*'), '').trim();
+      if (b.isEmpty) continue;
+      final mUn = RegExp(r'\((\d+)\s*UN\)').allMatches(b).toList();
+      final unidades = mUn.isEmpty ? 0 : int.parse(mUn.last.group(1)!);
+      final cabeza = b.split('(').first.split('[Rack:').first.trim();
+      final partes = cabeza.split('/');
+      final lote = partes.first.trim().isEmpty ? 'S/L' : partes.first.trim().toUpperCase();
+      String venc = partes.length > 1 ? partes.sublist(1).join('/').trim() : '';
+      venc = (venc.isEmpty || venc.toUpperCase() == 'S/F') ? 'S/F' : (normalizarFechaSql(venc) ?? venc);
+      salida.add({'lote': lote, 'venc': venc, 'unidades': unidades});
+    }
+    return salida;
+  }
 
   void _generarLpnConsolidadoAuto() {
     final sufijo = DateFormat('yyMMdd-HHmmss').format(DateTime.now());
@@ -3781,12 +3832,77 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         setState(() => _cargandoAuditoriaPack = false);
         return;
       }
-      _ovPackingCabeceraActiva = lista.first as Map;
-      final cli = (_ovPackingCabeceraActiva!['cliente_nombre'] ?? '').toString().toUpperCase();
-      _txtComunaDespachoPack.text = cli.contains('CONCEPCION') ? 'CONCEPCIÓN' : 'SANTIAGO';
-      await _cargarOrdenParaAuditoriaPacking(_ovPackingCabeceraActiva!['id'].toString());
+      // Preferir coincidencia exacta (133409 no debe abrir 1133409-FA)
+      lista.sort((a, b) {
+        final ea = ((a as Map)['numero_ov'] ?? '').toString().toUpperCase().replaceAll('-FA', '') == sinFa ? 0 : 1;
+        final eb = ((b as Map)['numero_ov'] ?? '').toString().toUpperCase().replaceAll('-FA', '') == sinFa ? 0 : 1;
+        return ea.compareTo(eb);
+      });
+      final ov = Map.from(lista.first as Map);
+      final numOv = (ov['numero_ov'] ?? '').toString().toUpperCase();
+      final estado = (ov['estado_ns'] ?? ov['estado'] ?? '').toString().toUpperCase();
+      const yaEmpacada = {'PENDIENTE_FACTURACION', 'FACTURADO', 'DESPACHADO', 'EN_TRANSITO_CCP',
+        'RECEPCION_CCP_EN_PROCESO', 'RECIBIDO_CCP', 'RECIBIDO_CCP_CON_DIFERENCIAS', 'ANULADO', 'CERRADO'};
+      if (yaEmpacada.contains(estado)) {
+        _notificar('La orden $numOv ya está en $estado: no requiere packing.', color: Colors.orange);
+        setState(() => _cargandoAuditoriaPack = false);
+        return;
+      }
+      if (estado != 'PENDIENTE_PACKING' && estado != 'PACKING_EN_PROCESO') {
+        // Picking hecho en el celular pero el estado no cambió en Supabase (versión anterior de la app)
+        final det = await supabase.from('netsuite_detalle_ov')
+            .select('id, cantidad_pickeada, lotes_pickeados').eq('orden_id', ov['id']);
+        final pickeadas = (det as List).fold<int>(0, (a, d) => a + (((d as Map)['cantidad_pickeada'] as num?)?.toInt() ?? 0));
+        if (pickeadas == 0) {
+          _notificar('La orden $numOv aún no tiene unidades pickeadas ($estado).', color: Colors.red);
+          setState(() => _cargandoAuditoriaPack = false);
+          return;
+        }
+        if (!mounted) return;
+        final cerrar = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Picking sin cerrar en el sistema', style: TextStyle(fontWeight: FontWeight.bold)),
+            content: Text('$numOv tiene $pickeadas UN pickeadas pero sigue en ${estado.isEmpty ? 'PENDIENTE' : estado}.\n\n'
+                '¿Cerrar el picking con lo registrado y continuar al packing?'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
+              ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('CERRAR PICKING Y SEGUIR')),
+            ],
+          ),
+        );
+        if (cerrar != true) {
+          setState(() => _cargandoAuditoriaPack = false);
+          return;
+        }
+        try {
+          await supabase.rpc('wms_cerrar_picking', params: {
+            'p_orden_id': ov['id'],
+            'p_lineas': det.map((d) => {
+                  'id': (d as Map)['id'],
+                  'cantidad_pickeada': d['cantidad_pickeada'] ?? 0,
+                  'lotes_pickeados': d['lotes_pickeados'] ?? '',
+                }).toList(),
+            'p_usuario': _usuarioRf(),
+          });
+          ov['estado_ns'] = 'PENDIENTE_PACKING';
+        } catch (e) {
+          _notificar('No se pudo cerrar el picking: ${_mensajeError(e)}', color: Colors.red);
+          setState(() => _cargandoAuditoriaPack = false);
+          return;
+        }
+      }
+      _ovPackingCabeceraActiva = ov;
+      _packingEsTraslado = numOv.startsWith('OT-');
+      _verificadoBultos.clear();
+      _txtPesoRealPack.clear();
+      _txtCantidadBultosPack.clear();
+      _tipoEmpaquePack = _packingEsTraslado ? 'PALLET' : 'CAJA';
+      final cli = (ov['cliente_nombre'] ?? '').toString().toUpperCase();
+      _txtComunaDespachoPack.text = (cli.contains('CONCEPCION') || _packingEsTraslado) ? 'CONCEPCIÓN' : 'SANTIAGO';
+      await _cargarOrdenParaAuditoriaPacking(ov['id'].toString());
       if (mounted && _lineasAuditoriaPacking.isNotEmpty) {
-        setState(() { _pasoPackingLpn = 1; _txtLpnConsolidadoPack.clear(); });
+        setState(() { _pasoPackingLpn = _packingEsTraslado ? 1 : 3; _txtLpnConsolidadoPack.clear(); });
       }
     } catch (e) {
       _notificar('Error buscando orden: $e', color: Colors.red);
@@ -3889,7 +4005,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
         if (filaAporta && idBorrador == null) idBorrador = (fila['id'] as num?)?.toInt();
       }
-      if (porLpn.isEmpty || !mounted) return;
+      // Solo los traslados (PALLETS) retoman pallets guardados; una OV por bultos parte limpia
+      if (porLpn.isEmpty || !mounted || !_packingEsTraslado) return;
       setState(() {
         _packingDraftId = idBorrador;
         _palletsPackingCerrados
@@ -3964,6 +4081,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
         final int solicitado = (det['cantidad_pedida'] as num?)?.toInt() ?? 0;
         final int pickeadoPrevio = (det['cantidad_pickeada'] as num?)?.toInt() ?? 0;
+        // Peso por unidad: fila de unidad de la maestra o peso de la caja / múltiplo
+        double pesoUnitKg = 0;
+        final filasPeso = matchesM.map((e) => Map.from(e as Map)).toList()
+          ..sort((a, b) => ((a['multiplo'] as num?)?.toInt() ?? 1).compareTo((b['multiplo'] as num?)?.toInt() ?? 1));
+        for (final m in filasPeso) {
+          final kg = (m['peso_kg'] as num?)?.toDouble() ?? (((m['peso_gr'] as num?)?.toDouble() ?? 0) / 1000);
+          if (kg > 0) {
+            final mm = (m['multiplo'] as num?)?.toInt() ?? 1;
+            pesoUnitKg = kg / (mm < 1 ? 1 : mm);
+            break;
+          }
+        }
         final String rawLotes = (det['lotes_pickeados'] ?? '').toString().trim();
 
         String loteInicial = 'S/L';
@@ -3988,6 +4117,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           'barcodes': barcodes,
           'solicitado': solicitado,
           'pickeado_rf': pickeadoPrevio,
+          // Packing revisa lo PICKEADO (antes exigía lo pedido y con quiebre nunca se podía cerrar)
+          'esperado': pickeadoPrevio,
+          'peso_unit_kg': pesoUnitKg,
+          'lotes_pick': _parsearLotesPickeados(rawLotes),
           'auditado_unid': pickeadoPrevio > 0 ? pickeadoPrevio : solicitado,
           'lote_auditado': loteInicial,
           'venc_auditado': vencInicial,
@@ -4034,8 +4167,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     for (final raw in _lineasAuditoriaPacking) {
       final l = raw as Map;
       final id = (l['id_detalle'] as num?)?.toInt() ?? 0;
-      final solicitado = (l['solicitado'] as num?)?.toInt() ?? 0;
-      total += (solicitado - _cantidadSkuYaDistribuidaEnPallets(id)).clamp(0, solicitado);
+      final esperado = _esperadoPacking(l);
+      final hecho = _packingEsTraslado ? _cantidadSkuYaDistribuidaEnPallets(id) : (_verificadoBultos[id] ?? 0);
+      total += (esperado - hecho).clamp(0, esperado);
     }
     return total;
   }
@@ -4043,8 +4177,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   int _skusPendientesPacking() => _lineasAuditoriaPacking.where((raw) {
     final l = raw as Map;
     final id = (l['id_detalle'] as num?)?.toInt() ?? 0;
-    final solicitado = (l['solicitado'] as num?)?.toInt() ?? 0;
-    return _cantidadSkuYaDistribuidaEnPallets(id) < solicitado;
+    final hecho = _packingEsTraslado ? _cantidadSkuYaDistribuidaEnPallets(id) : (_verificadoBultos[id] ?? 0);
+    return hecho < _esperadoPacking(l);
   }).length;
 
   void _iniciarPalletPacking() {
@@ -4064,6 +4198,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     setState(() {
       _pasoPackingLpn = 0; _ovPackingAuditKey = 'SIN_OV'; _ovPackingCabeceraActiva = null;
       _lineasAuditoriaPacking.clear(); _lpnConsolidadoMapa.clear(); _palletsPackingCerrados.clear();
+      _verificadoBultos.clear(); _txtPesoRealPack.clear(); _txtCantidadBultosPack.clear(); _packingDraftId = null;
       _txtBuscarOvPacking.clear(); _txtLpnConsolidadoPack.clear(); _txtScanAuditoriaPack.clear();
     });
   }
@@ -4160,7 +4295,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     final sku = linea['sku'].toString();
     final int idDetalle = (linea['id_detalle'] as num?)?.toInt() ?? 0;
-    final int solicitado = (linea['solicitado'] as num?)?.toInt() ?? 0;
+    final int solicitado = _esperadoPacking(linea);
     final int mult = (linea['multiplo'] as num?)?.toInt() ?? 1;
     final int yaDistribuido = _cantidadSkuYaDistribuidaEnPallets(idDetalle);
     final int saldoPendiente = (solicitado - yaDistribuido).clamp(0, solicitado);
@@ -4170,7 +4305,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
 
-    final opcionesLote = await _cargarLotesDisponiblesPacking(sku);
+    // Lotes: los que se PICKEARON (el inventario ya fue descontado en el picking)
+    final lotesPick = ((linea['lotes_pick'] as List?) ?? []).whereType<Map>().toList();
+    final opcionesLote = lotesPick.isNotEmpty
+        ? lotesPick.map((o) => <String, dynamic>{
+              'key': '${o['lote']}|${(o['venc'] ?? 'S/F').toString().replaceAll('-', '/')}',
+              'lote': o['lote'],
+              'vencimiento': (o['venc'] ?? 'S/F').toString().replaceAll('-', '/'),
+              'stock': o['unidades'],
+              'origen': 'PICKING',
+            }).fold<Map<String, Map<String, dynamic>>>({}, (acc, o) {
+              acc.putIfAbsent(o['key'] as String, () => o);
+              return acc;
+            }).values.toList()
+        : await _cargarLotesDisponiblesPacking(sku);
     final int multiploCaja = mult < 1 ? 1 : mult;
     final int cajasSugeridas = saldoPendiente ~/ multiploCaja;
     final int displaysSugeridos = saldoPendiente % multiploCaja;
@@ -4213,7 +4361,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Solicitado: $solicitado UN', style: const TextStyle(fontWeight: FontWeight.bold)),
+                      Text('Pickeado: $solicitado UN', style: const TextStyle(fontWeight: FontWeight.bold)),
                       Text('Ya distribuido: $yaDistribuido UN'),
                       Text('Saldo pendiente: $saldoPendiente UN',
                           style: const TextStyle(color: Color(0xFF1D4ED8), fontWeight: FontWeight.w900)),
@@ -4235,10 +4383,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                       Text(
                         multiploCaja > 1
                             ? 'Conversión de empaque: 1 caja = $multiploCaja UN'
-                            : 'SIN MÚLTIPLO DE CAJA: revise MAESTRA SKU ($sku)',
+                            : 'Producto por unidad (sin caja en MAESTRA SKU): ingrese UN en "Display / UN sueltas"',
                         style: TextStyle(
                           fontWeight: FontWeight.w900,
-                          color: multiploCaja > 1 ? const Color(0xFF0F766E) : const Color(0xFFDC2626),
+                          color: multiploCaja > 1 ? const Color(0xFF0F766E) : const Color(0xFFB45309),
                         ),
                       ),
                       const SizedBox(height: 3),
@@ -4271,7 +4419,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                         keyboardType: TextInputType.number,
                         decoration: InputDecoration(
                           labelText: 'Display / UN sueltas',
-                          helperText: multiploCaja > 1 ? 'Máximo ${multiploCaja - 1}' : 'Configure múltiplo',
+                          helperText: multiploCaja > 1 ? 'Máximo ${multiploCaja - 1}' : 'Unidades',
                           prefixIcon: const Icon(Icons.view_module_outlined),
                         ),
                       ),
@@ -4374,15 +4522,6 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               icon: const Icon(Icons.check),
               label: const Text('CONFIRMAR EN PACKING'),
               onPressed: () {
-                if (multiploCaja <= 1) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('El SKU $sku no tiene un múltiplo de caja válido en MAESTRA SKU. Configure el empaque antes de continuar.'),
-                      backgroundColor: Colors.red,
-                    ),
-                  );
-                  return;
-                }
                 final cajas = int.tryParse(txtCajas.text.trim()) ?? 0;
                 final displays = int.tryParse(txtDisplays.text.trim()) ?? 0;
                 final u = (cajas * multiploCaja) + displays;
@@ -4532,220 +4671,350 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     );
   }
 
-  Future _cerrarPackingYConsolidarLpn({required bool soloEtiquetaLpn}) async {
-    if (!soloEtiquetaLpn) {
-      final pendientes = _lineasAuditoriaPacking.where((raw) {
-        final linea = raw as Map;
-        final int idDetalle = (linea['id_detalle'] as num?)?.toInt() ?? 0;
-        final int solicitado = (linea['solicitado'] as num?)?.toInt() ?? 0;
-        return _cantidadSkuYaDistribuidaEnPallets(idDetalle) != solicitado;
-      }).toList();
-      if (pendientes.isNotEmpty) {
-        _notificar(
-          'No se puede cerrar el Packing. Quedan ${pendientes.length} líneas con saldo sin asignar a pallets.',
-          color: Colors.red,
-        );
-        return;
+  /// Verificación de una línea en modo BULTOS (OV): confirma las unidades revisadas.
+  Future<void> _verificarLineaBultos(Map linea, {int? sugerido}) async {
+    final id = (linea['id_detalle'] as num?)?.toInt() ?? 0;
+    final esperado = _esperadoPacking(linea);
+    final hecho = _verificadoBultos[id] ?? 0;
+    final pendiente = (esperado - hecho).clamp(0, esperado);
+    if (esperado == 0) {
+      _notificar('${linea['sku']} no fue pickeado (quiebre): no va en este despacho.', color: Colors.orange);
+      return;
+    }
+    if (pendiente == 0) {
+      _notificar('${linea['sku']} ya está verificado ($esperado UN).', color: Colors.orange);
+      return;
+    }
+    if (pendiente == 1 || sugerido == 1) {
+      setState(() => _verificadoBultos[id] = hecho + 1);
+      return;
+    }
+    final txt = TextEditingController(text: '$pendiente');
+    final cant = await showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('${linea['sku']}', style: const TextStyle(fontWeight: FontWeight.w900)),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('${linea['descripcion']}', style: const TextStyle(fontSize: 12)),
+          const SizedBox(height: 8),
+          Text('Pickeado: $esperado UN · verificado: $hecho UN', style: const TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 10),
+          TextField(controller: txt, autofocus: true, keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Unidades que está empacando')),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCELAR')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, int.tryParse(txt.text.trim())), child: const Text('CONFIRMAR')),
+        ],
+      ),
+    );
+    if (cant == null || cant <= 0) return;
+    if (cant > pendiente) {
+      _notificar('No puede empacar $cant UN de ${linea['sku']}: solo quedan $pendiente UN pickeadas.', color: Colors.red);
+      return;
+    }
+    setState(() => _verificadoBultos[id] = hecho + cant);
+  }
+
+  Future<void> _procesarEscaneoBultos() async {
+    final scan = _txtScanAuditoriaPack.text.trim().toUpperCase();
+    _txtScanAuditoriaPack.clear();
+    if (scan.isEmpty) return;
+    final candidatas = _lineasAuditoriaPacking.where((el) {
+      final m = el as Map;
+      return m['sku'] == scan || ((m['barcodes'] as List?) ?? []).contains(scan);
+    }).toList();
+    if (candidatas.isEmpty) {
+      _notificar('El código $scan NO pertenece a esta orden.', color: Colors.red);
+      return;
+    }
+    // Si el SKU aparece en varias líneas, usar la primera con saldo
+    final linea = candidatas.firstWhere((raw) {
+      final l = raw as Map;
+      return (_verificadoBultos[(l['id_detalle'] as num?)?.toInt() ?? 0] ?? 0) < _esperadoPacking(l);
+    }, orElse: () => candidatas.first) as Map;
+    await _verificarLineaBultos(linea, sugerido: 1);
+  }
+
+  /// Ítems del packing en modo BULTOS: un ítem por lote pickeado de cada línea verificada.
+  List<Map<String, dynamic>> _detallePackingBultos() {
+    final salida = <Map<String, dynamic>>[];
+    for (final raw in _lineasAuditoriaPacking) {
+      final l = raw as Map;
+      final id = (l['id_detalle'] as num?)?.toInt() ?? 0;
+      final unidades = _verificadoBultos[id] ?? 0;
+      if (unidades <= 0) continue;
+      final lotes = ((l['lotes_pick'] as List?) ?? []).whereType<Map>().toList();
+      final sumaLotes = lotes.fold<int>(0, (a, o) => a + ((o['unidades'] as num?)?.toInt() ?? 0));
+      final base = <String, dynamic>{
+        'id_detalle': id, 'sku': l['sku'], 'descripcion': l['descripcion'],
+        'solicitado': l['solicitado'], 'multiplo_aplicado': l['multiplo'],
+        'peso_unit_kg': l['peso_unit_kg'], '_estado_packing': 'PACKING_COMPLETO',
+      };
+      if (lotes.isNotEmpty && sumaLotes == unidades) {
+        for (final o in lotes) {
+          final venc = (o['venc'] ?? 'S/F').toString();
+          salida.add({...base, 'unidades_totales': o['unidades'], 'pickeado': o['unidades'], 'lote': o['lote'],
+            'fecha_vencimiento_cl': venc == 'S/F' ? null : venc,
+            'lotes': '${o['lote']} / $venc (${o['unidades']} UN)'});
+        }
+      } else {
+        final lote = lotes.isNotEmpty ? lotes.first['lote'].toString() : 'S/L';
+        final venc = lotes.isNotEmpty ? (lotes.first['venc'] ?? 'S/F').toString() : 'S/F';
+        salida.add({...base, 'unidades_totales': unidades, 'pickeado': unidades, 'lote': lote,
+          'fecha_vencimiento_cl': venc == 'S/F' ? null : venc, 'lotes': '$lote / $venc ($unidades UN)'});
       }
     }
-    if (_lpnConsolidadoMapa.isEmpty && _palletsPackingCerrados.isEmpty) {
-      _notificar('Aún no ha validado artículos ni cerrado pallets en Packing.', color: Colors.orange);
+    return salida;
+  }
+
+  /// Cierre del packing en UNA transacción del servidor (wms_cerrar_packing).
+  /// BULTOS (OV): exige N° de bultos y todo lo pickeado verificado.
+  /// PALLETS (OT a Concepción): cada producto en un pallet con LPN.
+  Future _cerrarPackingYConsolidarLpn({required bool soloEtiquetaLpn}) async {
+    final Map ovMap = _ovPackingCabeceraActiva ?? {};
+    final int? ordenId = int.tryParse('${ovMap['id'] ?? ''}');
+    if (ordenId == null) {
+      _notificar('Cargue primero la orden.', color: Colors.orange);
       return;
     }
-
-    var lpnMaster = _txtLpnConsolidadoPack.text.trim().toUpperCase();
-    if (lpnMaster.isEmpty) {
-      _generarLpnConsolidadoAuto();
-      lpnMaster = _txtLpnConsolidadoPack.text.trim().toUpperCase();
-    }
-
-    final Map ovMap = _ovPackingCabeceraActiva ??
-        {
-          'id': int.tryParse(_ovPackingAuditKey),
-          'numero_ov': _txtBuscarOvPacking.text.trim().toUpperCase(),
-          'cliente_nombre': 'CLIENTE',
-        };
     final String numOvStr = (ovMap['numero_ov'] ?? 'S/OV').toString().toUpperCase();
     final String clienteStr = (ovMap['cliente_nombre'] ?? 'CLIENTE').toString().toUpperCase();
-    final String comunaStr = _txtComunaDespachoPack.text.trim().isEmpty
-        ? 'SANTIAGO'
-        : _txtComunaDespachoPack.text.trim().toUpperCase();
-    final int cantBultos = (int.tryParse(_txtCantidadBultosPack.text.trim()) ?? 1).clamp(1, 200);
+    final String comunaStr = _txtComunaDespachoPack.text.trim().isEmpty ? 'SANTIAGO' : _txtComunaDespachoPack.text.trim().toUpperCase();
 
-    if (soloEtiquetaLpn) {
-      await generarPdfEtiquetaPackingBultos15x10(
-        lpn: lpnMaster,
-        numeroOv: numOvStr,
-        cliente: clienteStr,
-        comuna: comunaStr,
-        tipoEmpaque: _tipoEmpaquePack,
-        totalBultos: cantBultos,
-      );
+    final pendientes = _skusPendientesPacking();
+    if (pendientes > 0) {
+      _notificar(_packingEsTraslado
+          ? 'Quedan $pendientes SKU sin asignar a un pallet.'
+          : 'Quedan $pendientes SKU sin verificar. Escanee todos los productos pickeados.', color: Colors.red);
       return;
+    }
+
+    List<Map<String, dynamic>> detalle;
+    int bultos;
+    String lpnMaster = '';
+    if (_packingEsTraslado) {
+      if (_lpnConsolidadoMapa.isNotEmpty) {
+        _notificar('Cierre primero el pallet actual (${_txtLpnConsolidadoPack.text}).', color: Colors.orange);
+        return;
+      }
+      detalle = [];
+      for (final entry in _palletsPackingCerrados.entries) {
+        for (final item in entry.value) {
+          detalle.add({...item, 'lpn_pallet': entry.key, 'lpn_consolidado': entry.key, '_estado_packing': 'PACKING_COMPLETO',
+            'lotes': '[${entry.key}] ${item['lote'] ?? 'S/L'} / ${item['fecha_vencimiento_cl'] ?? 'S/F'} (${item['unidades_totales']} UN)'});
+        }
+      }
+      bultos = _palletsPackingCerrados.length;
+      lpnMaster = _palletsPackingCerrados.keys.isNotEmpty ? _palletsPackingCerrados.keys.first : '';
+    } else {
+      bultos = int.tryParse(_txtCantidadBultosPack.text.trim()) ?? 0;
+      if (bultos < 1 || bultos > 200) {
+        _notificar('Indique cuántos bultos salen (1 a 200).', color: Colors.red);
+        return;
+      }
+      detalle = _detallePackingBultos();
+    }
+    if (detalle.isEmpty) {
+      _notificar('No hay productos empacados.', color: Colors.orange);
+      return;
+    }
+    final pesoEsperado = _pesoEsperadoPackingKg();
+    final pesoReal = double.tryParse(_txtPesoRealPack.text.trim().replaceAll(',', '.'));
+
+    // Diferencia de peso relevante: pedir confirmación (posible producto de más / de menos)
+    if (!_packingEsTraslado && pesoReal != null && pesoEsperado > 0) {
+      final dif = (pesoReal - pesoEsperado).abs() / pesoEsperado;
+      if (dif > 0.10 && mounted) {
+        final seguir = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Diferencia de peso', style: TextStyle(fontWeight: FontWeight.bold)),
+            content: Text('Esperado ${pesoEsperado.toStringAsFixed(2)} kg · pesado ${pesoReal.toStringAsFixed(2)} kg '
+                '(${(dif * 100).toStringAsFixed(0)}%).\n\nRevise los bultos antes de cerrar.'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('REVISAR')),
+              ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('CERRAR IGUAL')),
+            ],
+          ),
+        );
+        if (seguir != true) return;
+      }
     }
 
     setState(() => _guardandoPackingLpn = true);
-
     try {
-      final List<Map<String, dynamic>> listaConsolidada = [];
-      for (final entry in _palletsPackingCerrados.entries) {
-        for (final item in entry.value) {
-          listaConsolidada.add({...item, 'lpn_pallet': entry.key});
-        }
+      await supabase.rpc('wms_cerrar_packing', params: {
+        'p_orden_id': ordenId,
+        'p_modo': _packingEsTraslado ? 'PALLETS' : 'BULTOS',
+        'p_detalle': detalle,
+        'p_bultos': bultos,
+        'p_tipo_empaque': _tipoEmpaquePack,
+        'p_comuna': comunaStr,
+        'p_lpn': lpnMaster.isEmpty ? null : lpnMaster,
+        'p_peso_esperado_kg': pesoEsperado > 0 ? double.parse(pesoEsperado.toStringAsFixed(3)) : null,
+        'p_peso_real_kg': pesoReal,
+        'p_borrador_id': _packingDraftId,
+        'p_usuario': _usuarioRf(),
+      });
+    } catch (e) {
+      if (mounted) setState(() => _guardandoPackingLpn = false);
+      if (mounted) {
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('El packing NO se cerró', style: TextStyle(fontWeight: FontWeight.bold)),
+            content: Text('${_mensajeError(e)}\n\nNo se perdió nada: revise y vuelva a presionar CERRAR PACKING.'),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('ENTENDIDO'))],
+          ),
+        );
       }
-      for (final raw in _lpnConsolidadoMapa.values) {
-        listaConsolidada.add({...Map<String, dynamic>.from(raw as Map), 'lpn_pallet': lpnMaster});
-      }
-      final String fechaIso = DateTime.now().toIso8601String();
-      final String auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'PACKING_RF').toString().toUpperCase();
-      final String lpnRangoTexto = cantBultos > 1 ? '$lpnMaster-B1..B$cantBultos' : lpnMaster;
+      return;
+    }
 
-      for (final rawItem in listaConsolidada) {
-        final item = rawItem as Map;
-        final idDet = item['id_detalle'];
-        final int cantAudit = (item['unidades_totales'] as num?)?.toInt() ?? 0;
-        final String loteStr = item['lote'].toString();
-        final String vencStr = (item['fecha_vencimiento_cl'] ?? 'S/F').toString();
-        final String lpnItem = (item['lpn_pallet'] ?? lpnMaster).toString().toUpperCase();
-        final String trazabilidadCompleta =
-            '[$lpnItem|BULTOS:$cantBultos|TIPO:$_tipoEmpaquePack|COMUNA:$comunaStr] $loteStr / $vencStr ($cantAudit UN)';
-
-        if (idDet != null) {
-          try {
-            await supabase.from('netsuite_detalle_ov').update({
-              'cantidad_pickeada': cantAudit,
-              'lotes_pickeados': trazabilidadCompleta,
-              'estado_linea': 'CONSOLIDADO_LPN',
-            }).eq('id', idDet);
-          } catch (_) {}
-        }
-      }
-
-      // Traslados OT-CCP pasan a recepción en Concepción; ventas normales pasan a facturación.
-      final String estadoDestinoPacking = numOvStr.startsWith('OT-CCP-')
-          ? 'EN_TRANSITO_CCP'
-          : 'PENDIENTE_FACTURACION';
-      if (ovMap['id'] != null) {
-        final String canalPrevio = (ovMap['canal_venta'] ?? '').toString().trim();
-        final List partesBase = canalPrevio
-            .split('|')
-            .where((p) {
-              final u = p.trim().toUpperCase();
-              return u.isNotEmpty &&
-                  !u.startsWith('LPN:') &&
-                  !u.startsWith('BULTOS:') &&
-                  !u.startsWith('TIPO:') &&
-                  !u.startsWith('COMUNA:');
-            })
-            .toList();
-        if (partesBase.isEmpty) {
-          partesBase.add(numOvStr.endsWith('-FA') || numOvStr.startsWith('OT-') ? 'FARMACIA (-FA)' : 'ESTANDAR');
-        }
-        partesBase.addAll([
-          'LPN:$lpnMaster',
-          'BULTOS:$cantBultos',
-          'TIPO:$_tipoEmpaquePack',
-          'COMUNA:$comunaStr',
-        ]);
-        final String canalActualizado = partesBase.join('|');
-
-        try {
-          await supabase.from('netsuite_ordenes_venta').update({
-            'estado_ns': estadoDestinoPacking,
-            'canal_venta': canalActualizado,
-          }).eq('id', ovMap['id']);
-        } catch (_) {
-          try {
-            await supabase.from('netsuite_ordenes_venta').update({'estado_ns': estadoDestinoPacking}).eq('id', ovMap['id']);
-          } catch (_) {}
-        }
-      }
-
-      final detalleJsonTorre = listaConsolidada.map((rawItem) {
-        final item = rawItem as Map;
-        return {
-          'lpn_consolidado': lpnMaster,
-          // LPN físico de cada pallet: Recepción Concepción (PC m8) lo usa para recibir pallet por pallet
-          'lpn_pallet': (item['lpn_pallet'] ?? lpnMaster).toString().toUpperCase(),
-          'lpn_rango': lpnRangoTexto,
-          'comuna': comunaStr,
-          'tipo_empaque': _tipoEmpaquePack,
-          'bultos': cantBultos,
-          'id_detalle': item['id_detalle'],
-          'sku': item['sku'],
-          'descripcion': item['descripcion'],
-          'solicitado': item['solicitado'],
-          'pickeado': item['unidades_totales'],
-          'unidades_totales': item['unidades_totales'],
-          'cajas': item['cajas'],
-          'displays': item['displays'],
-          'multiplo_aplicado': item['multiplo_aplicado'],
-          'lote': item['lote'],
-          'fecha_vencimiento_cl': item['fecha_vencimiento_cl'],
-          '_estado_packing': 'PACKING_COMPLETO',
-          'lotes': '${item['lote']} / ${item['fecha_vencimiento_cl'] ?? 'S/F'} (${item['unidades_totales']} UN)',
-        };
-      }).toList();
-
-      final payloadPl = {
-        'bodega': bodegaActiva,
-        'orden_id': ovMap['id'],
-        'numero_ov': numOvStr,
-        'cliente_nombre': clienteStr,
-        'usuario_picking': auditorStr,
-        'detalle_json': detalleJsonTorre,
-        'fecha_emision': fechaIso,
-      };
-      // Si existe el borrador de pallets se ACTUALIZA (antes se insertaba otra fila y la OT
-      // quedaba con el detalle duplicado: pallets del borrador + LPN maestro).
-      final int? idBorradorPl = _packingDraftId;
-      try {
-        if (idBorradorPl != null) {
-          await supabase.from('wms_packing_lists_fa').update(payloadPl).eq('id', idBorradorPl);
-        } else {
-          await supabase.from('wms_packing_lists_fa').insert(payloadPl);
-        }
-      } catch (_) {
-        try {
-          final copiaSinBod = Map<String, dynamic>.from(payloadPl)..remove('bodega');
-          if (idBorradorPl != null) {
-            await supabase.from('wms_packing_lists_fa').update(copiaSinBod).eq('id', idBorradorPl);
-          } else {
-            await supabase.from('wms_packing_lists_fa').insert(copiaSinBod);
-          }
-        } catch (_) {}
-      }
-
+    // Etiquetas 15x10: una por bulto (el error de impresión ya no deshace el cierre)
+    try {
       await generarPdfEtiquetaPackingBultos15x10(
-        lpn: lpnMaster,
+        lpn: lpnMaster.isNotEmpty ? lpnMaster : 'PK-${numOvStr.replaceAll(' ', '')}',
         numeroOv: numOvStr,
         cliente: clienteStr,
         comuna: comunaStr,
         tipoEmpaque: _tipoEmpaquePack,
-        totalBultos: cantBultos,
+        totalBultos: bultos,
       );
-
-      _notificar(
-        numOvStr.startsWith('OT-CCP-')
-            ? '¡Packing finalizado! $numOvStr quedó EN TRÁNSITO A CONCEPCIÓN para recepción.'
-            : '¡Packing finalizado! OV $numOvStr enviada a FACTURACIÓN.' ,
-        color: const Color(0xFF047857),
-      );
-      setState(() {
-        _lineasAuditoriaPacking = [];
-        _lpnConsolidadoMapa.clear();
-        _palletsPackingCerrados.clear();
-        _ovPackingCabeceraActiva = null;
-        _txtBuscarOvPacking.clear();
-        _txtLpnConsolidadoPack.clear();
-        _pasoPackingLpn = 0;
-        _packingDraftId = null;
-      });
     } catch (e) {
-      _notificar('Error cerrando Packing: $e', color: Colors.red);
-    } finally {
-      if (mounted) setState(() => _guardandoPackingLpn = false);
+      _notificar('Packing cerrado, pero no se pudieron imprimir las etiquetas: $e', color: Colors.orange);
     }
+
+    _notificar(
+      _packingEsTraslado
+          ? '¡Packing cerrado! $numOvStr quedó EN TRÁNSITO A CONCEPCIÓN ($bultos pallets).'
+          : '¡Packing cerrado! OV $numOvStr: $bultos bultos enviados a FACTURACIÓN.',
+      color: const Color(0xFF047857),
+    );
+    if (mounted) {
+      setState(() => _guardandoPackingLpn = false);
+      _cambiarOrdenPacking();
+    }
+  }
+
+  Widget _construirVistaPackingBultos(Widget cabecera) {
+    final saldo = _saldoUnidadesPacking();
+    final pendientes = _skusPendientesPacking();
+    final pesoEsperado = _pesoEsperadoPackingKg();
+    final sinPeso = _lineasSinPeso();
+    final pesoReal = double.tryParse(_txtPesoRealPack.text.trim().replaceAll(',', '.'));
+    final bultos = int.tryParse(_txtCantidadBultosPack.text.trim()) ?? 0;
+    final listo = pendientes == 0 && bultos >= 1 && !_guardandoPackingLpn;
+    final totalEsperado = _lineasAuditoriaPacking.fold<int>(0, (a, r) => a + _esperadoPacking(r as Map));
+    String? avisoPeso;
+    if (pesoReal != null && pesoEsperado > 0) {
+      final dif = (pesoReal - pesoEsperado) / pesoEsperado * 100;
+      if (dif.abs() > 10) avisoPeso = 'Diferencia de ${dif.toStringAsFixed(0)}% con el peso esperado';
+    }
+
+    return ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 86), children: [
+      cabecera, const SizedBox(height: 10),
+      // 1. Verificación por escaneo
+      _TarjetaMovil(borderColor: const Color(0xFF14B8A6), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('1. VERIFICAR PRODUCTOS  (${totalEsperado - saldo}/$totalEsperado UN)',
+            style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF0F766E))),
+        const SizedBox(height: 6),
+        LinearProgressIndicator(value: totalEsperado == 0 ? 0 : (totalEsperado - saldo) / totalEsperado, minHeight: 6,
+            color: const Color(0xFF0F766E), backgroundColor: const Color(0xFFE2E8F0)),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(child: TextField(controller: _txtScanAuditoriaPack, autofocus: true,
+            textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()],
+            onSubmitted: (_) => _procesarEscaneoBultos(),
+            decoration: const InputDecoration(labelText: 'Escanear SKU / EAN', prefixIcon: Icon(Icons.barcode_reader)))),
+          const SizedBox(width: 8),
+          ElevatedButton(onPressed: () async {
+            await _escanearParaCampo(_txtScanAuditoriaPack, 'Escanear producto');
+            if (_txtScanAuditoriaPack.text.isNotEmpty) await _procesarEscaneoBultos();
+          }, child: const Icon(Icons.qr_code_scanner)),
+        ]),
+        const SizedBox(height: 8),
+        ..._lineasAuditoriaPacking.map((raw) {
+          final l = raw as Map;
+          final id = (l['id_detalle'] as num?)?.toInt() ?? 0;
+          final esp = _esperadoPacking(l);
+          final ver = _verificadoBultos[id] ?? 0;
+          final ok = esp > 0 && ver >= esp;
+          final quiebre = esp == 0;
+          final color = quiebre ? const Color(0xFF94A3B8) : ok ? const Color(0xFF047857) : const Color(0xFFB45309);
+          return InkWell(
+            onTap: quiebre ? null : () => _verificarLineaBultos(l),
+            onLongPress: ver > 0 ? () => setState(() => _verificadoBultos.remove(id)) : null,
+            child: Container(
+              margin: const EdgeInsets.only(bottom: 6), padding: const EdgeInsets.all(9),
+              decoration: BoxDecoration(color: ok ? const Color(0xFFF0FDF4) : const Color(0xFFF8FAFC),
+                  borderRadius: BorderRadius.circular(8), border: Border.all(color: color.withOpacity(.5))),
+              child: Row(children: [
+                Icon(quiebre ? Icons.remove_circle_outline : ok ? Icons.check_circle : Icons.radio_button_unchecked, color: color, size: 20),
+                const SizedBox(width: 8),
+                Expanded(child: Text('${l['sku']} · ${l['descripcion']}', maxLines: 2, overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold))),
+                Text(quiebre ? 'QUIEBRE' : '$ver / $esp UN', style: TextStyle(fontWeight: FontWeight.w900, color: color, fontSize: 11.5)),
+              ]),
+            ),
+          );
+        }),
+        const Text('Toque una línea para ingresar cantidad · mantenga presionado para reiniciarla.',
+            style: TextStyle(fontSize: 10, color: Color(0xFF64748B))),
+      ])),
+      const SizedBox(height: 10),
+      // 2. Datos del despacho
+      _TarjetaMovil(borderColor: const Color(0xFF0284C7), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('2. DATOS DEL DESPACHO', style: TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF0369A1))),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(child: TextField(controller: _txtCantidadBultosPack, keyboardType: TextInputType.number,
+            onChanged: (_) => setState(() {}),
+            decoration: const InputDecoration(labelText: 'N° de bultos *', prefixIcon: Icon(Icons.all_inbox_rounded)))),
+          const SizedBox(width: 8),
+          Expanded(child: DropdownButtonFormField<String>(
+            value: const ['CAJA', 'BOLSA', 'SOBRE', 'BULTO', 'PALLET'].contains(_tipoEmpaquePack) ? _tipoEmpaquePack : 'CAJA',
+            decoration: const InputDecoration(labelText: 'Tipo de empaque'),
+            items: const ['CAJA', 'BOLSA', 'SOBRE', 'BULTO', 'PALLET']
+                .map((t) => DropdownMenuItem(value: t, child: Text(t))).toList(),
+            onChanged: (v) => setState(() => _tipoEmpaquePack = v ?? 'CAJA'),
+          )),
+        ]),
+        const SizedBox(height: 8),
+        TextField(controller: _txtComunaDespachoPack, textCapitalization: TextCapitalization.characters,
+            inputFormatters: [UpperCaseTextFormatter()],
+            decoration: const InputDecoration(labelText: 'Comuna de destino', prefixIcon: Icon(Icons.place_outlined))),
+        const SizedBox(height: 10),
+        Container(
+          width: double.infinity, padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(color: const Color(0xFFEFF6FF), borderRadius: BorderRadius.circular(8)),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(pesoEsperado > 0 ? 'Peso esperado: ${pesoEsperado.toStringAsFixed(2)} kg' : 'Peso esperado: sin datos',
+                style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF1D4ED8))),
+            if (sinPeso) const Text('Hay SKU sin peso en MAESTRA SKU; el esperado puede quedar bajo.',
+                style: TextStyle(fontSize: 10.5, color: Color(0xFFB45309))),
+          ]),
+        ),
+        const SizedBox(height: 8),
+        TextField(controller: _txtPesoRealPack, keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          onChanged: (_) => setState(() {}),
+          decoration: InputDecoration(labelText: 'Peso en balanza (kg, opcional)', prefixIcon: const Icon(Icons.scale_outlined),
+            helperText: avisoPeso, helperStyle: const TextStyle(color: Color(0xFFDC2626), fontWeight: FontWeight.bold))),
+      ])),
+      const SizedBox(height: 12),
+      SizedBox(width: double.infinity, height: 52, child: ElevatedButton.icon(
+        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF047857), foregroundColor: Colors.white,
+            disabledBackgroundColor: const Color(0xFFCBD5E1)),
+        onPressed: listo ? () => _cerrarPackingYConsolidarLpn(soloEtiquetaLpn: false) : null,
+        icon: _guardandoPackingLpn
+            ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+            : const Icon(Icons.verified),
+        label: Text(pendientes > 0
+            ? 'FALTAN $pendientes SKU POR VERIFICAR'
+            : bultos < 1 ? 'INDIQUE N° DE BULTOS' : 'CERRAR PACKING E IMPRIMIR $bultos ETIQUETA(S)'),
+      )),
+    ]);
   }
 
   Widget _construirVistaAuditoriaPackingLpn() {
@@ -4762,19 +5031,22 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text(ov, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 15)),
           Text(cliente, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 10)),
-          Text('$pendientes SKU | $saldo UN pendientes', style: const TextStyle(color: Color(0xFF5EEAD4), fontSize: 10, fontWeight: FontWeight.bold)),
+          Text('${_packingEsTraslado ? 'TRASLADO · PALLETS CON LPN' : 'DESPACHO · BULTOS'}  |  $pendientes SKU · $saldo UN pendientes',
+              style: const TextStyle(color: Color(0xFF5EEAD4), fontSize: 10, fontWeight: FontWeight.bold)),
         ])),
         TextButton.icon(onPressed: _cambiarOrdenPacking, icon: const Icon(Icons.swap_horiz, color: Colors.white),
           label: const Text('CAMBIAR OV', style: TextStyle(color: Colors.white, fontSize: 10))),
       ]),
     );
 
+    if (_pasoPackingLpn == 3) return _construirVistaPackingBultos(cabecera());
+
     if (_pasoPackingLpn == 0) {
       return ListView(padding: const EdgeInsets.fromLTRB(12,12,12,86), children: [
         _TarjetaMovil(borderColor: const Color(0xFF0D9488), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('BUSCAR ORDEN PARA PACKING', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: Color(0xFF0F766E))),
           const SizedBox(height: 6),
-          const Text('Al cargar la OV/OT, esta pantalla se cerrará y pasará directamente al LPN.', style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+          const Text('OV: se verifican los productos y se indican bultos y peso.  OT a Concepción: cada pallet con su LPN.', style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
           const SizedBox(height: 12),
           TextField(controller: _txtBuscarOvPacking, autofocus: true, textCapitalization: TextCapitalization.characters,
             inputFormatters: [UpperCaseTextFormatter()], onSubmitted: (_) => _buscarOrdenParaPackingPorTexto(),
@@ -4813,12 +5085,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 onPressed: _iniciarPalletPacking, icon: const Icon(Icons.inventory_2), label: const Text('INICIAR PALLET'))),
             ]),
           ] else ...[
-            const Text('Todos los productos fueron asignados. Finalice el Packing para enviar la orden a Facturación.'),
+            Text('Todos los productos están en ${_palletsPackingCerrados.length} pallet(s). Cierre el packing para dejar la OT en tránsito a Concepción.'),
             const SizedBox(height: 10),
             SizedBox(width: double.infinity, height: 48, child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF047857), foregroundColor: Colors.white),
               onPressed: _guardandoPackingLpn ? null : () => _cerrarPackingYConsolidarLpn(soloEtiquetaLpn: false),
-              icon: const Icon(Icons.verified), label: const Text('FINALIZAR PACKING'))),
+              icon: const Icon(Icons.verified), label: const Text('CERRAR PACKING (EN TRÁNSITO A CONCEPCIÓN)'))),
           ],
           if (_palletsPackingCerrados.isNotEmpty) ...[
             const Divider(height: 24),
@@ -4854,7 +5126,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _TarjetaMovil(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const Text('PRODUCTOS PENDIENTES', style: TextStyle(fontWeight: FontWeight.bold)), const SizedBox(height: 8),
         ..._lineasAuditoriaPacking.map((raw) {
-          final l = raw as Map; final id=(l['id_detalle'] as num?)?.toInt()??0; final sol=(l['solicitado'] as num?)?.toInt()??0;
+          final l = raw as Map; final id=(l['id_detalle'] as num?)?.toInt()??0; final sol=_esperadoPacking(l);
           final dist=_cantidadSkuYaDistribuidaEnPallets(id); final pend=(sol-dist).clamp(0,sol);
           if (pend<=0) return const SizedBox.shrink();
           return InkWell(onTap: ()=>_abrirModalAuditarLineaPacking(l), child: Container(margin: const EdgeInsets.only(bottom: 7), padding: const EdgeInsets.all(10),
