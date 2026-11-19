@@ -5287,9 +5287,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final String comunaStr = _txtComunaDespachoPack.text.trim().isEmpty ? 'SANTIAGO' : _txtComunaDespachoPack.text.trim().toUpperCase();
 
     final pendientes = _skusPendientesPacking();
-    if (pendientes > 0 && (_packingEsTraslado || _motivoFaltantePack == null)) {
+    if (pendientes > 0 && _motivoFaltantePack == null) {
       _notificar(_packingEsTraslado
-          ? 'Quedan $pendientes SKU sin asignar a un pallet.'
+          ? 'Quedan $pendientes SKU sin asignar a un pallet. Si no hay más producto use "Cerrar con faltante".'
           : 'Quedan $pendientes SKU sin verificar. Escanee todos los productos pickeados.', color: Colors.red);
       return;
     }
@@ -5376,10 +5376,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'p_peso_real_kg': pesoReal,
         'p_borrador_id': _packingDraftId,
         'p_usuario': _usuarioRf(),
-        if (!_packingEsTraslado && _motivoFaltantePack != null) 'p_motivo_faltante': _motivoFaltantePack,
+        if (_motivoFaltantePack != null) 'p_motivo_faltante': _motivoFaltantePack,
       });
     } catch (e) {
-      if (mounted) setState(() => _guardandoPackingLpn = false);
+      if (mounted) setState(() {
+        _guardandoPackingLpn = false;
+        // En traslado el faltante se confirma justo antes de cerrar: si falla, se vuelve a pedir
+        if (_packingEsTraslado) _motivoFaltantePack = null;
+      });
       if (mounted) {
         await showDialog<void>(
           context: context,
@@ -5409,7 +5413,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     _notificar(
       _packingEsTraslado
-          ? '¡Packing cerrado! $numOvStr quedó EN TRÁNSITO A CONCEPCIÓN ($bultos pallets).'
+          ? (_motivoFaltantePack != null
+              ? 'Packing cerrado CON FALTANTE. $numOvStr quedó EN TRÁNSITO A CONCEPCIÓN ($bultos pallets); el PC verá la alerta.'
+              : '¡Packing cerrado! $numOvStr quedó EN TRÁNSITO A CONCEPCIÓN ($bultos pallets).')
           : (_motivoFaltantePack != null
               ? 'Packing cerrado CON FALTANTE. OV $numOvStr: $bultos bultos a facturación; el PC verá la alerta.'
               : '¡Packing cerrado! OV $numOvStr: $bultos bultos enviados a FACTURACIÓN.'),
@@ -5426,9 +5432,19 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final faltantes = _lineasAuditoriaPacking.map((raw) {
       final l = raw as Map;
       final id = (l['id_detalle'] as num?)?.toInt() ?? 0;
-      final f = _esperadoPacking(l) - (_verificadoBultos[id] ?? 0);
+      final hecho = _packingEsTraslado ? _cantidadSkuYaDistribuidaEnPallets(id) : (_verificadoBultos[id] ?? 0);
+      final f = _esperadoPacking(l) - hecho;
       return f > 0 ? '${l['sku']}: faltan $f de ${_esperadoPacking(l)} UN' : null;
     }).whereType<String>().toList();
+    if (_packingEsTraslado && _lpnConsolidadoMapa.isNotEmpty) {
+      _notificar('Cierre primero el pallet actual (${_txtLpnConsolidadoPack.text}).', color: Colors.orange);
+      return;
+    }
+    if (_packingEsTraslado && _palletsPackingCerrados.isEmpty) {
+      _notificar('No hay pallets cerrados: arme al menos un pallet antes de cerrar.', color: Colors.orange);
+      return;
+    }
+    final totalFaltante = _saldoUnidadesPacking();
     const motivos = ['No estaba en lo pickeado', 'Producto dañado', 'Producto vencido o lote incorrecto', 'Otro'];
     String? motivo;
     final txtOtro = TextEditingController();
@@ -5437,6 +5453,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
         title: const Text('Cerrar con faltante', style: TextStyle(fontWeight: FontWeight.bold)),
         content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Faltan $totalFaltante UN en ${faltantes.length} SKU'
+              '${_packingEsTraslado ? ' · salen ${_palletsPackingCerrados.length} pallet(s)' : ''}:',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 6),
           ...faltantes.map((f) => Text('• $f', style: const TextStyle(fontSize: 12.5))),
           const SizedBox(height: 12),
           DropdownButtonFormField<String>(
@@ -5464,6 +5484,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       )),
     );
     if (res == null) return;
+    if (_packingEsTraslado) {
+      // Traslado: no hay paso de datos de despacho; se cierra con los pallets armados
+      setState(() => _motivoFaltantePack = res);
+      await _cerrarPackingYConsolidarLpn(soloEtiquetaLpn: false);
+      return;
+    }
     setState(() {
       _motivoFaltantePack = res;
       _pasoPackingLpn = 4;
@@ -5766,6 +5792,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               Expanded(child: ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
                 onPressed: _iniciarPalletPacking, icon: const Icon(Icons.inventory_2), label: const Text('INICIAR PALLET'))),
             ]),
+            if (_palletsPackingCerrados.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              SizedBox(width: double.infinity, height: 46, child: OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(side: const BorderSide(color: Color(0xFFB45309), width: 1.4)),
+                onPressed: _guardandoPackingLpn ? null : _pedirCierreConFaltante,
+                icon: _guardandoPackingLpn
+                    ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.report_problem_outlined, color: Color(0xFFB45309)),
+                label: Text('NO HAY MÁS PRODUCTO · CERRAR CON FALTANTE ($saldo UN)',
+                    style: const TextStyle(color: Color(0xFFB45309), fontWeight: FontWeight.bold, fontSize: 12)),
+              )),
+            ],
           ] else ...[
             Text('Todos los productos están en ${_palletsPackingCerrados.length} pallet(s). Cierre el packing para dejar la OT en tránsito a Concepción.'),
             const SizedBox(height: 10),
