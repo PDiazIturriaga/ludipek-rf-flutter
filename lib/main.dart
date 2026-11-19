@@ -107,7 +107,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.19.3';
+const String kVersionApp = '2026.11.19.4';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1690,6 +1690,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _cargarUbicacionesVacias();
     } else if (idx == 10) {
       _cargarTrasladosCcp();
+    } else if (idx == 1) {
+      _cargarMisAlmacenamientos();
+    } else if (idx == 3) {
+      _verificarPermisoDepurar();
     }
   }
 
@@ -5933,7 +5937,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   void _validarUbicacionPutaway(String val) {
-    final ubi = val.trim().toUpperCase();
+    final ubi = _normalizarRackOCodigo(val);
     if (ubi.isEmpty) {
       setState(() {
         _colorBordeUbiPutaway = const Color(0xFFCBD5E1);
@@ -6016,6 +6020,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final rack = matchSeparado.group(2)!.padLeft(2, '0');
       final nivel = matchSeparado.group(3)!.padLeft(2, '0');
       return '$zona-$rack-$nivel';
+    }
+
+    // Mezclas: "B25-01", "B-2501", "B 2501" -> "B-25-01"
+    final matchMixto = RegExp(r'^([A-Z])[\s\-_\.]*(\d{2})[\s\-_\.]*N?(\d{2})$').firstMatch(s);
+    if (matchMixto != null) {
+      return '${matchMixto.group(1)}-${matchMixto.group(2)}-${matchMixto.group(3)}';
+    }
+
+    // Arena: "BE0312", "BE 03 12" -> "BE-03-12"
+    final matchArena = RegExp(r'^(MK|ME|BE)[\s\-_\.]*(\d{2})[\s\-_\.]*(\d{2})$').firstMatch(s);
+    if (matchArena != null) {
+      return '${matchArena.group(1)}-${matchArena.group(2)}-${matchArena.group(3)}';
     }
 
     // Ej: búsqueda por rack completo "A01" o "A 01" -> "A-01"
@@ -7133,6 +7149,257 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
+  // ===================================================================
+  // ALMACENAMIENTO: historial del operador y reportes / correcciones
+  // ===================================================================
+  List<Map<String, dynamic>> _misAlmacenamientos = [];
+  bool _cargandoMisAlm = false;
+
+  Future<void> _cargarMisAlmacenamientos() async {
+    setState(() => _cargandoMisAlm = true);
+    try {
+      final res = await supabase.rpc('wms_mis_almacenamientos',
+          params: {'p_bodega': bodegaActiva, 'p_usuario': _usuarioRf(), 'p_horas': 24});
+      final lista = List<Map<String, dynamic>>.from((res as List).map((e) => Map<String, dynamic>.from(e as Map)));
+      if (mounted) setState(() => _misAlmacenamientos = lista);
+    } catch (e) {
+      debugPrint('Historial de almacenamiento: $e');
+    } finally {
+      if (mounted) setState(() => _cargandoMisAlm = false);
+    }
+  }
+
+  Future<void> _dialogoReporteAlmacenamiento(Map fila) async {
+    final lpn = (fila['lpn'] ?? '').toString();
+    final actual = (fila['ubicacion_actual'] ?? fila['destino'] ?? '').toString();
+    final txtNueva = TextEditingController();
+    final txtDetalle = TextEditingController();
+    const tipos = ['Ubicación equivocada', 'Cantidad no coincide', 'Producto dañado', 'Etiqueta LPN dañada o repetida', 'Otro'];
+    String? tipo;
+    final accion = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        title: Text('LPN $lpn', style: const TextStyle(fontWeight: FontWeight.w900)),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Guardado en ${fila['destino']}${actual.isNotEmpty && actual != fila['destino'] ? ' · hoy está en $actual' : ''}',
+              style: const TextStyle(fontSize: 12, color: Color(0xFF475569))),
+          const SizedBox(height: 12),
+          const Text('CORREGIR UBICACIÓN AHORA', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: Color(0xFF047857))),
+          const Text('Si el pallet quedó en otra posición, escanee dónde está realmente.', style: TextStyle(fontSize: 11)),
+          TextField(controller: txtNueva, textCapitalization: TextCapitalization.characters,
+            inputFormatters: [UpperCaseTextFormatter()],
+            decoration: InputDecoration(labelText: 'Ubicación correcta (ej. C-22-03)', prefixIcon: const Icon(Icons.place_outlined),
+              suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: () async {
+                final cod = await showDialog<String>(context: ctx, builder: (_) => const _DialogoEscanerVivo(titulo: 'Escanear ubicación correcta'));
+                if (cod != null && cod.trim().isNotEmpty) setD(() => txtNueva.text = _normalizarRackOCodigo(cod));
+              }))),
+          const SizedBox(height: 16),
+          const Text('O AVISAR AL SUPERVISOR', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: Color(0xFFB45309))),
+          DropdownButtonFormField<String>(
+            value: tipo, isExpanded: true,
+            decoration: const InputDecoration(labelText: 'Qué pasó'),
+            items: tipos.map((t) => DropdownMenuItem(value: t, child: Text(t))).toList(),
+            onChanged: (v) => setD(() => tipo = v),
+          ),
+          TextField(controller: txtDetalle, maxLines: 2, decoration: const InputDecoration(labelText: 'Detalle (opcional)')),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CERRAR')),
+          OutlinedButton(onPressed: tipo == null ? null : () => Navigator.pop(ctx, 'REPORTAR'), child: const Text('ENVIAR REPORTE')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF047857), foregroundColor: Colors.white),
+            onPressed: () => Navigator.pop(ctx, 'MOVER'), child: const Text('CORREGIR UBICACIÓN')),
+        ],
+      )),
+    );
+    if (accion == null) return;
+    try {
+      if (accion == 'MOVER') {
+        final nueva = _normalizarRackOCodigo(txtNueva.text);
+        if (nueva.isEmpty) {
+          _notificar('Escanee la ubicación correcta.', color: Colors.orange);
+          return;
+        }
+        final res = await supabase.rpc('wms_almacenar_lpn', params: {
+          'p_bodega': bodegaActiva, 'p_lpn': lpn, 'p_ubicacion_destino': nueva, 'p_usuario': _usuarioRf(),
+        });
+        final r = Map<String, dynamic>.from(res as Map);
+        _notificar('LPN $lpn corregido: ${r['origen']} → ${r['destino']}.', color: const Color(0xFF047857));
+      } else {
+        await supabase.rpc('wms_crear_reporte_operacion', params: {
+          'p_bodega': bodegaActiva, 'p_modulo': 'ALMACENAMIENTO', 'p_tipo': tipo, 'p_lpn': lpn,
+          'p_ubicacion': actual.isNotEmpty ? actual.split(',').first.trim() : fila['destino'], 'p_sku': null,
+          'p_detalle': [if (txtNueva.text.trim().isNotEmpty) 'Ubicación indicada: ${_normalizarRackOCodigo(txtNueva.text)}',
+                        if (txtDetalle.text.trim().isNotEmpty) txtDetalle.text.trim()].join(' · '),
+          'p_usuario': _usuarioRf(),
+        });
+        _notificar('Reporte enviado. El supervisor lo verá en el PC.', color: const Color(0xFF047857));
+      }
+    } catch (e) {
+      _notificar('No se pudo: ${_mensajeError(e)}', color: Colors.red);
+    }
+    await _cargarMisAlmacenamientos();
+  }
+
+  Widget _tarjetaHistorialAlmacenamiento() {
+    return _TarjetaMovil(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.history_rounded, color: Color(0xFF1D4ED8)),
+          const SizedBox(width: 8),
+          Expanded(child: Text('MIS ALMACENAMIENTOS · ÚLTIMAS 24 H (${_misAlmacenamientos.length})',
+              style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: Color(0xFF1E3A8A)))),
+          IconButton(
+            onPressed: _cargandoMisAlm ? null : _cargarMisAlmacenamientos,
+            icon: _cargandoMisAlm
+                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.sync, size: 20),
+          ),
+        ]),
+        if (_misAlmacenamientos.isEmpty && !_cargandoMisAlm)
+          const Padding(padding: EdgeInsets.only(top: 4),
+              child: Text('Todavía no ha almacenado pallets hoy.', style: TextStyle(fontSize: 12, color: Color(0xFF64748B)))),
+        ..._misAlmacenamientos.map((f) {
+          final esMerma = (f['tipo'] ?? '') == 'ENVIO_MERMA';
+          final destino = (f['destino'] ?? '').toString();
+          final actual = (f['ubicacion_actual'] ?? '').toString();
+          final movido = actual.isNotEmpty && actual != destino;
+          final hora = DateTime.tryParse('${f['fecha'] ?? ''}');
+          return Container(
+            margin: const EdgeInsets.only(top: 8),
+            padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+            decoration: BoxDecoration(
+              color: esMerma ? const Color(0xFFFEF2F2) : const Color(0xFFF8FAFC),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: esMerma ? const Color(0xFFFCA5A5) : const Color(0xFFE2E8F0)),
+            ),
+            child: Row(children: [
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('${f['lpn']}  →  $destino', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13)),
+                Text('${hora == null ? '' : DateFormat('HH:mm').format(hora.toLocal())} · ${f['skus']} SKU · ${f['unidades']} UN'
+                    '${esMerma ? ' · MERMA' : ''}', style: const TextStyle(fontSize: 11, color: Color(0xFF475569))),
+                if (movido)
+                  Text('Hoy está en: $actual', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFFB45309))),
+              ])),
+              TextButton.icon(
+                onPressed: () => _dialogoReporteAlmacenamiento(f),
+                icon: const Icon(Icons.flag_outlined, size: 18, color: Color(0xFFB45309)),
+                label: const Text('REPORTAR', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFFB45309))),
+              ),
+            ]),
+          );
+        }),
+      ]),
+    );
+  }
+
+  // ===================================================================
+  // CONTROL DE STOCK: filas duplicadas (eliminar solo usuarios autorizados)
+  // ===================================================================
+  bool _puedeDepurarStock = false;
+
+  Future<void> _verificarPermisoDepurar() async {
+    try {
+      final res = await supabase.rpc('wms_puede_depurar_stock', params: {'p_usuario': _usuarioRf()});
+      if (mounted) setState(() => _puedeDepurarStock = res == true);
+    } catch (_) {
+      if (mounted) setState(() => _puedeDepurarStock = false);
+    }
+  }
+
+  String _claveDuplicado(Map r) => [
+        (r['codigo_ubicacion'] ?? '').toString().toUpperCase(),
+        (r['sku'] ?? '').toString().toUpperCase(),
+        (r['lote'] ?? 'S/L').toString().toUpperCase(),
+        (r['fecha_vencimiento_cl'] ?? '').toString(),
+        '${r['cantidad_unidades'] ?? 0}',
+      ].join('|');
+
+  Future<void> _eliminarDuplicado(Map r) async {
+    final txtMotivo = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Eliminar fila duplicada', style: TextStyle(fontWeight: FontWeight.bold)),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('${r['codigo_ubicacion']} · LPN ${r['lpn'] ?? '-'}\nSKU ${r['sku']} · lote ${r['lote'] ?? 'S/L'} · ${r['cantidad_unidades']} UN'),
+          const SizedBox(height: 8),
+          const Text('Se borra esta fila y se conserva la otra igual. Queda registrado en el kardex con su usuario.',
+              style: TextStyle(fontSize: 12, color: Color(0xFF92400E))),
+          TextField(controller: txtMotivo, decoration: const InputDecoration(labelText: 'Motivo (opcional)')),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFDC2626), foregroundColor: Colors.white),
+            onPressed: () => Navigator.pop(ctx, true), child: const Text('ELIMINAR DUPLICADO')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      final res = await supabase.rpc('wms_eliminar_stock_duplicado', params: {
+        'p_inventario_id': r['id'], 'p_usuario': _usuarioRf(), 'p_motivo': txtMotivo.text.trim(),
+      });
+      final x = Map<String, dynamic>.from(res as Map);
+      _notificar('Duplicado eliminado en ${x['ubicacion']} (${x['unidades']} UN).', color: const Color(0xFF047857));
+    } catch (e) {
+      _notificar('No se eliminó: ${_mensajeError(e)}', color: Colors.red);
+    }
+    await _ejecutarBusquedaStockConCruceMaestra(_txtScanConsulta.text);
+  }
+
+  // ===================================================================
+  // MOVIMIENTO A PICKING: stock antiguo en ZONA-PICKING -> su ubicación real de nivel 01
+  // ===================================================================
+  List<Map<String, dynamic>> _stockZonaPickingSku = [];
+
+  Future<void> _asignarZonaPickingANivel1(Map fila) async {
+    final txt = TextEditingController(text: _stockPickingSku.isNotEmpty ? (_stockPickingSku.first['codigo_ubicacion'] ?? '').toString() : '');
+    final destino = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        title: const Text('Asignar a nivel 01', style: TextStyle(fontWeight: FontWeight.bold)),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('${fila['sku']} · lote ${fila['lote'] ?? 'S/L'} · ${fila['cajas'] ?? 0} Cj (${fila['cantidad_unidades'] ?? 0} UN)'
+              '${(fila['lpn'] ?? '').toString().isNotEmpty ? '\nLPN ${fila['lpn']}' : ''}'),
+          const SizedBox(height: 8),
+          const Text('Escanee la ubicación de picking donde está físicamente este producto.', style: TextStyle(fontSize: 12)),
+          TextField(controller: txt, textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()],
+            decoration: InputDecoration(labelText: 'Ubicación nivel 01 (ej. B-25-01)',
+              suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: () async {
+                final cod = await showDialog<String>(context: ctx, builder: (_) => const _DialogoEscanerVivo(titulo: 'Escanear ubicación de picking'));
+                if (cod != null && cod.trim().isNotEmpty) setD(() => txt.text = _normalizarRackOCodigo(cod));
+              }))),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCELAR')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, _normalizarRackOCodigo(txt.text)), child: const Text('ASIGNAR')),
+        ],
+      )),
+    );
+    if (destino == null || destino.isEmpty) return;
+    if (!_esUbicacionPicking(destino)) {
+      _notificar('$destino no es picking. Use una ubicación de nivel 01 (ej. B-25-01).', color: Colors.orange);
+      return;
+    }
+    try {
+      final tieneLpn = (fila['lpn'] ?? '').toString().trim().isNotEmpty;
+      final dynamic res = tieneLpn
+          ? await supabase.rpc('wms_mover_lpn_a_picking', params: {
+              'p_inventario_id': fila['id'], 'p_destino': destino, 'p_usuario': _usuarioRf()})
+          : await supabase.rpc('wms_mover_a_picking', params: {
+              'p_inventario_id': fila['id'],
+              'p_cajas': ((fila['cajas'] as num?)?.toInt() ?? 0) > 0 ? (fila['cajas'] as num).toInt() : ((fila['cantidad_unidades'] as num?)?.toInt() ?? 1),
+              'p_destino': destino, 'p_usuario': _usuarioRf()});
+      final r = Map<String, dynamic>.from(res as Map);
+      _notificar('Asignado a ${r['destino']}: ${r['cajas']} Cj (${r['unidades']} UN).', color: const Color(0xFF047857));
+    } catch (e) {
+      _notificar('No se asignó: ${_mensajeError(e)}', color: Colors.red);
+    }
+    await _buscarUbicacionesFefoPorSku(skuForzado: (fila['sku'] ?? '').toString());
+  }
+
   void _reiniciarPasoAlmacenamiento({bool mantenerUbicacion = false}) {
     setState(() {
       _pasoAlmacenamiento = 1;
@@ -7270,6 +7537,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final enPickingTxt = _stockPickingSku.isEmpty
           ? 'Sin stock en picking.'
           : 'En picking: ${_stockPickingSku.map((r) => '${r['codigo_ubicacion']} (${r['cantidad_unidades'] ?? 0} UN)').join(', ')}.';
+      _stockZonaPickingSku = conStock.where((r) => (r['codigo_ubicacion'] ?? '').toString().toUpperCase() == 'ZONA-PICKING').toList();
       final disponibles = conStock.where((r) {
         final ubi = (r['codigo_ubicacion'] ?? '').toString().toUpperCase();
         // Origen = reserva: nunca picking (nivel 01), merma ni la antigua ZONA-PICKING; lotes QA bloqueados tampoco
@@ -7338,11 +7606,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
 
-    String ubiDestino = _txtUbiDestinoPicking.text.trim().toUpperCase()
-        .replaceAll('RACK ', '')
-        .replaceAll('RACK', '')
-        .replaceAll(' ', '-');
-    ubiDestino = ubiDestino.replaceAll(RegExp(r'-+'), '-');
+    // B2501 / B25-01 / B 25 01 -> B-25-01
+    final String ubiDestino = _normalizarRackOCodigo(_txtUbiDestinoPicking.text);
+    if (ubiDestino != _txtUbiDestinoPicking.text.trim().toUpperCase()) setState(() => _txtUbiDestinoPicking.text = ubiDestino);
     if (!_esUbicacionPicking(ubiDestino)) {
       _notificar(ubiDestino.isEmpty
           ? 'Escanee la ubicación de picking de destino (nivel 01, ej. H-02-01).'
@@ -8708,11 +8974,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                             foregroundColor: Colors.white,
                           ),
                           onPressed: () async {
-                            String ubi = _txtPutUbi.text.trim().toUpperCase()
-                                .replaceAll('RACK ', '')
-                                .replaceAll('RACK', '')
-                                .replaceAll(' ', '-');
-                            ubi = ubi.replaceAll(RegExp(r'-+'), '-');
+                            // B2501 / B25-01 / B 25 01 -> B-25-01
+                            final String ubi = _normalizarRackOCodigo(_txtPutUbi.text);
+                            if (ubi != _txtPutUbi.text.trim().toUpperCase()) _txtPutUbi.text = ubi;
 
                             if (lpnActual.isEmpty || ubi.isEmpty) {
                               _notificar('Escanee o digite la Ubicación Destino.', color: const Color(0xFFD97706));
@@ -8741,6 +9005,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                                 camposQueSeMantienen: 'Ubicación Destino ($ubi) pre-cargada para el siguiente LPN',
                               );
                               _reiniciarPasoAlmacenamiento(mantenerUbicacion: mantenerUbi);
+                              _cargarMisAlmacenamientos();
                             } catch (ex) {
                               _notificar('No se almacenó: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
                             } finally {
@@ -8773,6 +9038,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                             });
                             _notificar('LPN $lpnActual enviado a ZONA-MERMA ($bodegaActiva).', color: const Color(0xFFDC2626));
                             _reiniciarPasoAlmacenamiento(mantenerUbicacion: false);
+                            _cargarMisAlmacenamientos();
                           } catch (ex) {
                             _notificar('No se envió a merma: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
                           } finally {
@@ -8788,6 +9054,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               ],
             ),
           ),
+        const SizedBox(height: 12),
+        _tarjetaHistorialAlmacenamiento(),
       ],
     );
   }
@@ -8931,6 +9199,34 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           ),
         ),
         const SizedBox(height: 10),
+
+        // Stock antiguo en ZONA-PICKING: asignarlo a su ubicación real de nivel 01
+        if (_stockZonaPickingSku.isNotEmpty) ...[
+          _TarjetaMovil(
+            borderColor: const Color(0xFFF59E0B),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('STOCK EN ZONA-PICKING (SIN UBICACIÓN REAL)',
+                  style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: Color(0xFFB45309))),
+              const SizedBox(height: 4),
+              const Text('El picking ahora es el nivel 01 de los racks. Asigne este stock a la ubicación (ej. B-25-01) donde está físicamente.',
+                  style: TextStyle(fontSize: 11.5, color: Color(0xFF475569))),
+              ..._stockZonaPickingSku.map((r) => Container(
+                margin: const EdgeInsets.only(top: 8),
+                padding: const EdgeInsets.fromLTRB(10, 6, 4, 6),
+                decoration: BoxDecoration(color: const Color(0xFFFFFBEB), borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFFFCD34D))),
+                child: Row(children: [
+                  Expanded(child: Text(
+                    'Lote ${r['lote'] ?? 'S/L'} · ${normalizarFechaSql(r['fecha_vencimiento_cl']?.toString()) ?? 'S/F'}\n'
+                    '${r['cajas'] ?? 0} Cj (${r['cantidad_unidades'] ?? 0} UN)${(r['lpn'] ?? '').toString().isNotEmpty ? ' · ${r['lpn']}' : ''}',
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
+                  TextButton(onPressed: () => _asignarZonaPickingANivel1(r), child: const Text('ASIGNAR A NIVEL 01')),
+                ]),
+              )),
+            ]),
+          ),
+          const SizedBox(height: 10),
+        ],
 
         if (_stockFefoSeleccionado != null) ...[
           _TarjetaMovil(
@@ -9198,6 +9494,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
   Widget _construirVistaConsulta() {
+    final conteoDuplicados = <String, int>{};
+    for (final r in _resultadosConsulta) {
+      final k = _claveDuplicado(r);
+      conteoDuplicados[k] = (conteoDuplicados[k] ?? 0) + 1;
+    }
     return ListView(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 86),
       children: [
@@ -9294,9 +9595,24 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                           Row(children: [const Icon(Icons.sell_outlined, size: 12, color: Color(0xFF475569)), const SizedBox(width: 4), Text('Lote: ${r['lote'] ?? 'S/L'}', style: const TextStyle(fontSize: 11, color: Color(0xFF475569)))]),
                           const SizedBox(height: 2),
                           Row(children: [const Icon(Icons.calendar_month_rounded, size: 12, color: Color(0xFF047857)), const SizedBox(width: 4), Text('Venc: $vencimientoStr', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF047857)))]),
+                          if ((conteoDuplicados[_claveDuplicado(r)] ?? 0) > 1)
+                            Container(
+                              margin: const EdgeInsets.only(top: 6),
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                              decoration: BoxDecoration(color: const Color(0xFFFEF3C7), borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(color: const Color(0xFFF59E0B))),
+                              child: const Text('POSIBLE DUPLICADO (misma ubicación, lote y cantidad)',
+                                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.w900, color: Color(0xFF92400E))),
+                            ),
                         ],
                       ),
                     ),
+                    if (_puedeDepurarStock && (conteoDuplicados[_claveDuplicado(r)] ?? 0) > 1)
+                      IconButton(
+                        tooltip: 'Eliminar esta fila duplicada',
+                        onPressed: () => _eliminarDuplicado(r),
+                        icon: const Icon(Icons.delete_forever_rounded, color: Color(0xFFDC2626)),
+                      ),
                   ],
                 ),
               ),
