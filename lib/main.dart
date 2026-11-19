@@ -1308,6 +1308,151 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   int? _editandoConteoId;
 
   bool _mostrarMenuCentral = true;
+
+  // ===================================================================
+  // MIS TAREAS DE CONTEO (asignadas desde el PC: Inventario -> Tareas de conteo)
+  // ===================================================================
+  List<Map<String, dynamic>> _misTareasConteo = [];
+  DateTime? _tareasConteoLeidas;
+
+  Future<void> _cargarMisTareasConteo() async {
+    _tareasConteoLeidas = DateTime.now();
+    try {
+      final res = await supabase.rpc('wms_tareas_conteo', params: {
+        'p_bodega': bodegaActiva,
+        'p_usuario': _usuarioRf(),
+        'p_solo_abiertas': true,
+      });
+      final lista = List<Map<String, dynamic>>.from((res as List).map((e) => Map<String, dynamic>.from(e as Map)))
+          .where((t) => t['estado'] == 'PENDIENTE' || t['estado'] == 'EN_PROCESO')
+          .toList();
+      if (mounted) setState(() => _misTareasConteo = lista);
+    } catch (_) {
+      // Sin el script 09 en la base no hay tareas: el menú funciona igual
+    }
+  }
+
+  String _tituloTareaConteo(Map t) {
+    switch ((t['tipo'] ?? '').toString()) {
+      case 'VACIAS':
+        return 'Auditar vacías · pasillo ${t['pasillo']}';
+      case 'SKU':
+        return 'Cíclico SKU ${t['sku']}';
+      default:
+        return 'Contar pasillo ${t['pasillo']}';
+    }
+  }
+
+  Future<void> _abrirTareaConteo(Map t) async {
+    final tipo = (t['tipo'] ?? 'PASILLO').toString();
+    final int idxModulo = tipo == 'VACIAS' ? 6 : (tipo == 'SKU' ? 7 : 3);
+    if (!_tienePermisoModulo(idxModulo)) {
+      _notificar('Su usuario no tiene habilitado el módulo de esta tarea. Avise a su supervisor.', color: const Color(0xFFB91C1C));
+      return;
+    }
+    if (t['estado'] == 'PENDIENTE') {
+      try {
+        await supabase.rpc('wms_actualizar_tarea_conteo', params: {'p_id': t['id'], 'p_estado': 'EN_PROCESO', 'p_usuario': _usuarioRf()});
+      } catch (_) {}
+    }
+    final pasillo = (t['pasillo'] ?? '').toString();
+    if (tipo == 'VACIAS') {
+      setState(() {
+        _tabActual = 6;
+        _mostrarMenuCentral = false;
+      });
+      await _cargarUbicacionesVacias();
+      if (mounted) setState(() => _pasilloFiltro = pasillo);
+    } else if (tipo == 'SKU') {
+      _abrirModulo(7);
+      final sku = (t['sku'] ?? '').toString();
+      _txtSkuCiclicoDirigido.text = sku;
+      await _cargarUbicacionesSkuDirigido(skuForzado: sku);
+    } else {
+      _abrirModulo(3);
+      setState(() => _cicloUbicacionCtrl.text = '$pasillo-');
+      _notificar('Cuente cada ubicación con stock del pasillo $pasillo (${t['avance'] ?? 0} de ${t['total'] ?? 0} hechas).',
+          color: const Color(0xFF4338CA));
+    }
+  }
+
+  Future<void> _terminarTareaConteo(Map t) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('¿Terminó la tarea?', style: TextStyle(fontWeight: FontWeight.bold)),
+        content: Text('${_tituloTareaConteo(t)}\nAvance registrado: ${t['avance'] ?? 0} de ${t['total'] ?? 0}.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('NO')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('SÍ, TERMINÉ')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await supabase.rpc('wms_actualizar_tarea_conteo', params: {'p_id': t['id'], 'p_estado': 'COMPLETADA', 'p_usuario': _usuarioRf()});
+      _notificar('Tarea cerrada. ¡Gracias!', color: const Color(0xFF047857));
+    } catch (e) {
+      _notificar('No se pudo cerrar la tarea: ${_mensajeError(e)}', color: Colors.red);
+    }
+    await _cargarMisTareasConteo();
+  }
+
+  Widget _tarjetaMisTareasConteo() {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 18),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFEEF2FF),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF4338CA).withOpacity(0.4), width: 1.6),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.assignment_ind_rounded, color: Color(0xFF4338CA)),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text('MIS TAREAS DE CONTEO (${_misTareasConteo.length})',
+                  style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF4338CA))),
+            ),
+            IconButton(icon: const Icon(Icons.sync, size: 20), onPressed: _cargarMisTareasConteo),
+          ]),
+          ..._misTareasConteo.map((t) {
+            final int total = (t['total'] as num?)?.toInt() ?? 0;
+            final int avance = (t['avance'] as num?)?.toInt() ?? 0;
+            return Container(
+              margin: const EdgeInsets.only(top: 8),
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10)),
+              child: ListTile(
+                onTap: () => _abrirTareaConteo(t),
+                title: Text(_tituloTareaConteo(t), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const SizedBox(height: 4),
+                  LinearProgressIndicator(
+                    value: total == 0 ? 0.0 : (avance / total).clamp(0.0, 1.0).toDouble(),
+                    minHeight: 6,
+                    color: const Color(0xFF4338CA),
+                    backgroundColor: const Color(0xFFE2E8F0),
+                  ),
+                  const SizedBox(height: 4),
+                  Text('$avance de $total ubicaciones${t['estado'] == 'EN_PROCESO' ? ' · en proceso' : ''}',
+                      style: const TextStyle(fontSize: 11.5)),
+                ]),
+                trailing: IconButton(
+                  tooltip: 'Terminé',
+                  icon: const Icon(Icons.task_alt_rounded, color: Color(0xFF047857)),
+                  onPressed: () => _terminarTareaConteo(t),
+                ),
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
   int _tabActual = 0;
 
   // Banderas anti doble-toque: evitan registros duplicados en Supabase
@@ -3784,9 +3929,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final mUn = RegExp(r'\((\d+)\s*UN\)').allMatches(b).toList();
       final unidades = mUn.isEmpty ? 0 : int.parse(mUn.last.group(1)!);
       final cabeza = b.split('(').first.split('[Rack:').first.trim();
-      final partes = cabeza.split('/');
+      // El separador es " / " (hay lotes con barra: EBA2362/24 / 31/10/2027)
+      final partes = cabeza.contains(' / ') ? cabeza.split(' / ') : cabeza.split('/');
       final lote = partes.first.trim().isEmpty ? 'S/L' : partes.first.trim().toUpperCase();
-      String venc = partes.length > 1 ? partes.sublist(1).join('/').trim() : '';
+      String venc = partes.length > 1 ? partes.sublist(1).join(' / ').trim() : '';
       venc = (venc.isEmpty || venc.toUpperCase() == 'S/F') ? 'S/F' : (normalizarFechaSql(venc) ?? venc);
       salida.add({'lote': lote, 'venc': venc, 'unidades': unidades});
     }
@@ -4100,7 +4246,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         if (rawLotes.isNotEmpty) {
           final primerBloque = rawLotes.split('|').first.split('(').first.split('[Rack:').first.trim();
           if (primerBloque.contains('/')) {
-            final partes = primerBloque.split('/');
+            final partes = primerBloque.contains(' / ') ? primerBloque.split(' / ') : primerBloque.split('/');
             loteInicial = partes.first.trim().toUpperCase();
             vencInicial = normalizarFechaSql(partes.last.trim()) ?? partes.last.trim();
           } else {
@@ -6670,6 +6816,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   Widget _construirMenuCentral() {
+    // Tareas de conteo: se refrescan al volver al menú (como máximo una vez por minuto)
+    if (_tareasConteoLeidas == null || DateTime.now().difference(_tareasConteoLeidas!).inSeconds > 60) {
+      _tareasConteoLeidas = DateTime.now();
+      Future.microtask(_cargarMisTareasConteo);
+    }
     final botones = [
       {'indice': 0, 'titulo': 'RECEPCIÓN EN ANDÉN', 'subtitulo': 'OC, Lectura GS1, Descuento Cajas y LPN', 'icono': Icons.inventory_2_rounded, 'color': const Color(0xFF1D4ED8), 'fondo': const Color(0xFFEFF6FF)},
       {'indice': 1, 'titulo': 'ALMACENAMIENTO', 'subtitulo': 'Paso 1: Escanear LPN -> Paso 2: Escanear Ubicación', 'icono': Icons.warehouse_rounded, 'color': const Color(0xFF047857), 'fondo': const Color(0xFFECFDF5)},
@@ -6710,6 +6861,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 ),
               ),
               const SizedBox(height: 18),
+              if (_misTareasConteo.isNotEmpty) _tarjetaMisTareasConteo(),
               ...botones.where((b) => _tienePermisoModulo(b['indice'] as int)).map((b) {
                 final int idx = b['indice'] as int;
                 final Color colorPrincipal = b['color'] as Color;
