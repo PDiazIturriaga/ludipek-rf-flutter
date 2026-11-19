@@ -107,7 +107,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.19.9';
+const String kVersionApp = '2026.11.20.1';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -119,7 +119,20 @@ Future<String?> versionMinimaServidor() async {
   }
 }
 
-bool versionDesactualizada(String? minima) => minima != null && kVersionApp.compareTo(minima) < 0;
+/// Compara por números (2026.11.19.10 es mayor que 2026.11.19.9; como texto daba al revés).
+int compararVersiones(String a, String b) {
+  final pa = a.split('.').map((x) => int.tryParse(x.trim()) ?? 0).toList();
+  final pb = b.split('.').map((x) => int.tryParse(x.trim()) ?? 0).toList();
+  for (var i = 0; i < (pa.length > pb.length ? pa.length : pb.length); i++) {
+    final x = i < pa.length ? pa[i] : 0;
+    final y = i < pb.length ? pb[i] : 0;
+    if (x != y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+bool versionDesactualizada(String? minima) =>
+    minima != null && minima.trim().isNotEmpty && compararVersiones(kVersionApp, minima.trim()) < 0;
 
 /// Supabase (PostgREST) entrega como máximo 1.000 filas por consulta.
 /// Este helper pide páginas sucesivas hasta traer todas las filas.
@@ -1183,8 +1196,17 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
     setState(() => _isLoading = true);
 
     try {
-      // La contraseña se valida en el servidor (wms_login): el teléfono ya no descarga contraseñas.
-      final dynamic res = await supabase.rpc('wms_login', params: {'p_usuario': user, 'p_password': pass});
+      // La contraseña se valida en el servidor. Con el script 24 además se VINCULA la sesión de
+      // Supabase de este dispositivo al operador: desde ahí la base sabe quién opera (no se le cree al celular).
+      dynamic res;
+      try {
+        await asegurarSesionSupabase();
+        res = await supabase.rpc('wms_iniciar_sesion',
+            params: {'p_usuario': user, 'p_password': pass, 'p_dispositivo': 'RF $_bodegaSeleccionada'});
+      } catch (e) {
+        debugPrint('Sesión verificada no disponible, login clásico: $e');
+        res = await supabase.rpc('wms_login', params: {'p_usuario': user, 'p_password': pass});
+      }
 
       if (res == null) {
         if (!mounted) return;
@@ -1780,8 +1802,21 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   String _usuarioRf() => (usuarioActivo?['usuario'] ?? 'APP_RF').toString();
 
   /// Mensaje legible de un error de Supabase (las funciones wms_* responden "WMS: ...").
+  bool _saliendoPorSesion = false;
+
   String _mensajeError(Object e) {
     final m = e is PostgrestException ? e.message : e.toString();
+    // La sesión del turno venció (o el supervisor la cerró): volver a pedir la contraseña
+    if (m.contains('SESION_EXPIRADA') && !_saliendoPorSesion) {
+      _saliendoPorSesion = true;
+      Future.delayed(const Duration(milliseconds: 1500), () {
+        usuarioActivo = null;
+        if (mounted) {
+          Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const LoginScreenLudipek()));
+        }
+      });
+      return 'Su sesión venció. Vuelva a ingresar su usuario y contraseña.';
+    }
     return m.replaceFirst(RegExp(r'^WMS:\s*'), '');
   }
 
@@ -1980,7 +2015,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _vaciasOcupadasDetalle[ubicacion] = notaFinal;
     });
 
-    final String fechaIso = DateTime.now().toIso8601String();
+    final String fechaIso = DateTime.now().toUtc().toIso8601String();
     final String auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'APP_RF').toString().toUpperCase();
     final String pasillo = ubicacion.contains('-') ? ubicacion.split('-').first : 'S/P';
 
@@ -2176,7 +2211,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     final loteId = 'VAC-${DateFormat('yyyyMMdd-HHmmss').format(DateTime.now())}';
     final fechaReporte = DateFormat('dd/MM/yyyy HH:mm').format(DateTime.now());
-    final fechaIso = DateTime.now().toIso8601String();
+    final fechaIso = DateTime.now().toUtc().toIso8601String();
     final auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'APP_RF').toString().toUpperCase();
 
     final List payloadSupabase = [];
@@ -2661,7 +2696,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     final loteId = 'SKU-${DateFormat('yyyyMMdd-HHmmss').format(DateTime.now())}';
     final auditorStr = (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'APP_RF').toString().toUpperCase();
-    final fechaIso = DateTime.now().toIso8601String();
+    final fechaIso = DateTime.now().toUtc().toIso8601String();
     final fechaReporte = DateFormat('dd/MM/yyyy HH:mm').format(DateTime.now());
 
     final List< Map<String, dynamic> > payload = _ubicacionesSkuDirigido.map((item) {
@@ -4333,7 +4368,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       'cliente_nombre': (ov['cliente_nombre'] ?? 'CLIENTE').toString(),
       'usuario_picking': (usuarioActivo?['nombre_completo'] ?? usuarioActivo?['usuario'] ?? 'PACKING_RF').toString().toUpperCase(),
       'detalle_json': detalle,
-      'fecha_emision': DateTime.now().toIso8601String(),
+      'fecha_emision': DateTime.now().toUtc().toIso8601String(),
       'bodega': bodegaActiva,
     };
     try {
@@ -10576,6 +10611,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             title: const Text('Cerrar Sesión', style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
             onTap: () {
               usuarioActivo = null;
+              () async {   // cierra la sesión en el servidor
+                try { await supabase.rpc('wms_cerrar_sesion'); } catch (_) {}
+              }();
               Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const LoginScreenLudipek()));
             },
           ),
