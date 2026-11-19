@@ -107,7 +107,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.19.4';
+const String kVersionApp = '2026.11.19.6';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1564,6 +1564,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   final TextEditingController _txtUbiDestinoPicking = TextEditingController();
   // Picking = nivel 01 de los racks (ej. H-02-01). Merma = ZONA-MERMA y zona de mermas de arena (ME-..).
   List<Map<String, dynamic>> _stockPickingSku = [];
+  String? _pickingFijoSku;   // ubicación de picking asignada al SKU buscado (wms_picking_fijo_sku)
   bool _esUbicacionPicking(String u) => RegExp(r'^[A-Z]-\d{2}-01$').hasMatch(u.trim().toUpperCase());
   bool _esUbicacionMerma(String u) {
     final x = u.trim().toUpperCase();
@@ -1571,6 +1572,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
   /// Destino sugerido: donde el SKU ya está en picking; si no, el nivel 01 de la misma columna del origen.
   String _destinoPickingPara(Map origen) {
+    if ((_pickingFijoSku ?? '').isNotEmpty) return _pickingFijoSku!;
     if (_stockPickingSku.isNotEmpty) return (_stockPickingSku.first['codigo_ubicacion'] ?? '').toString().toUpperCase();
     final m = RegExp(r'^([A-Z])-(\d{2})-\d{2}$').firstMatch((origen['codigo_ubicacion'] ?? '').toString().toUpperCase());
     return m == null ? '' : '${m.group(1)}-${m.group(2)}-01';
@@ -3346,6 +3348,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           });
         }
 
+        // Ubicación de picking asignada a cada SKU (la lista dirige al operador ahí)
+        try {
+          final fijas = await supabase.rpc('wms_picking_fijo_skus', params: {
+            'p_bodega': bodegaActiva,
+            'p_skus': lineasCargadas.map((l) => (l as Map)['sku'].toString()).toSet().toList(),
+          });
+          final mapa = {for (final f in (fijas as List)) (f as Map)['sku'].toString(): (f['ubicacion'] ?? '').toString()};
+          for (final l in lineasCargadas) {
+            (l as Map)['ubicacion_picking'] = mapa[l['sku'].toString()] ?? '';
+          }
+        } catch (_) {}
+
         _ordenarLineasPorMarcaYSku(lineasCargadas);
 
         setState(() {
@@ -3511,10 +3525,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   final bool completo = pickVal >= solVal && solVal > 0;
                   final String grupoMarca = _etiquetaGrupoMarca(l);
                   return InkWell(
-                    onTap: () {
-                      _txtScanFarmacia.text = l['sku'].toString();
-                      _procesarEscaneoFarmacia();
-                    },
+                    // El producto se confirma SOLO escaneándolo (no tocando la tarjeta)
+                    onTap: () => _avisarSoloEscaneo((l['sku'] ?? '').toString()),
                     child: Container(
                       margin: const EdgeInsets.only(bottom: 6),
                       padding: const EdgeInsets.all(10),
@@ -3538,11 +3550,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                                   '${l['sku']} - ${l['descripcion']}',
                                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, decoration: completo ? TextDecoration.lineThrough : null),
                                 ),
+                                if ((l['ubicacion_picking'] ?? '').toString().isNotEmpty)
+                                  Row(children: [
+                                    const Icon(Icons.place_rounded, size: 13, color: Color(0xFFB91C1C)),
+                                    const SizedBox(width: 2),
+                                    Text('Ir a ${l['ubicacion_picking']}',
+                                        style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w900, color: Color(0xFFB91C1C))),
+                                  ]),
                                 Builder(
                                   builder: (context) {
                                     final Map lotesMap = (l['lotes_pickeados'] as Map?) ?? {};
                                     if (lotesMap.isEmpty) {
-                                      return const Text('Toque o escanee para confirmar extracción', style: TextStyle(fontSize: 10, color: Color(0xFF475569)));
+                                      return const Text('Escanee el producto para confirmar extracción', style: TextStyle(fontSize: 10, color: Color(0xFF475569)));
                                     }
                                     final strLotes = lotesMap.entries.map((e) => '${e.key} (${e.value} UN)').join(' | ');
                                     return Text('Lotes: $strLotes', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF047857)));
@@ -3771,6 +3790,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     return _construirPantallaPickingUnificada(esModoFarmacia: true);
   }
 
+  /// Picking y packing: el producto se confirma escaneando su código, nunca tocando la tarjeta.
+  void _avisarSoloEscaneo(String sku) {
+    _notificar('Escanee el código de barras de $sku para confirmarlo. No se puede confirmar tocando la tarjeta.',
+        color: const Color(0xFFB45309));
+  }
+
   Future _procesarEscaneoFarmacia() async {
     final rawScan = _txtScanFarmacia.text.trim().toUpperCase();
     if (rawScan.isEmpty) return;
@@ -3853,8 +3878,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
         lotesDisponibles = agrupado.entries.map((e) => {'lote_venc': e.key.toString(), 'stock': e.value as int}).toList();
         // Primero lo que está en picking (nivel 01), después reserva; dentro de cada grupo, más stock primero
+        final ubiFija = (linea['ubicacion_picking'] ?? '').toString();
         int prioridadUbi(String k) {
           final u = RegExp(r'\[Rack: ([^\]]+)\]').firstMatch(k)?.group(1) ?? '';
+          if (ubiFija.isNotEmpty && u == ubiFija) return -1;   // su ubicación de picking asignada
           if (_esUbicacionPicking(u)) return 0;
           if (u == 'ZONA-PICKING') return 1;
           return u.isEmpty ? 3 : 2;
@@ -5568,7 +5595,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           final quiebre = esp == 0;
           final color = quiebre ? const Color(0xFF94A3B8) : ok ? const Color(0xFF047857) : const Color(0xFFB45309);
           return InkWell(
-            onTap: quiebre ? null : () => _verificarLineaBultos(l),
+            onTap: quiebre ? null : () => _avisarSoloEscaneo((l['sku'] ?? '').toString()),
             onLongPress: ver > 0 ? () => setState(() { _verificadoBultos.remove(id); _lotesVerificadosBultos.remove(id); }) : null,
             child: Container(
               margin: const EdgeInsets.only(bottom: 6), padding: const EdgeInsets.all(9),
@@ -5881,9 +5908,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           final l = raw as Map; final id=(l['id_detalle'] as num?)?.toInt()??0; final sol=_esperadoPacking(l);
           final dist=_cantidadSkuYaDistribuidaEnPallets(id); final pend=(sol-dist).clamp(0,sol);
           if (pend<=0) return const SizedBox.shrink();
-          return InkWell(onTap: ()=>_abrirModalAuditarLineaPacking(l), child: Container(margin: const EdgeInsets.only(bottom: 7), padding: const EdgeInsets.all(10),
+          return InkWell(onTap: () => _avisarSoloEscaneo((l['sku'] ?? '').toString()), child: Container(margin: const EdgeInsets.only(bottom: 7), padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(color: const Color(0xFFF8FAFC), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFCBD5E1))),
-            child: Row(children: [const Icon(Icons.add_circle_outline, color: Color(0xFF0F766E)), const SizedBox(width: 8),
+            child: Row(children: [const Icon(Icons.qr_code_scanner, color: Color(0xFF0F766E)), const SizedBox(width: 8),
               Expanded(child: Text('${l['sku']} - ${l['descripcion']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
               Text('SALDO $pend UN', style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFFB45309), fontSize: 11))])));
         }),
@@ -7135,7 +7162,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         _lineasLpnAlmacenamiento = lineas;
         _origenLpnAlmacenamiento = origen;
         _pasoAlmacenamiento = 2;
+        _sugerenciasPutaway = [];
       });
+      _cargarSugerenciasPutaway(lpn);
       _notificar(
         estado == 'EN_RACK'
             ? 'LPN $lpn validado (Origen: $origen). Ahora escanee la Ubicación.'
@@ -7153,6 +7182,23 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // ALMACENAMIENTO: historial del operador y reportes / correcciones
   // ===================================================================
   List<Map<String, dynamic>> _misAlmacenamientos = [];
+  List<Map<String, dynamic>> _sugerenciasPutaway = [];
+
+  /// Almacenamiento dirigido: dónde dejar el pallet según la ubicación de picking de su SKU.
+  Future<void> _cargarSugerenciasPutaway(String lpn) async {
+    try {
+      final res = await supabase.rpc('wms_sugerir_ubicacion_lpn', params: {'p_bodega': bodegaActiva, 'p_lpn': lpn});
+      final lista = List<Map<String, dynamic>>.from((res as List).map((e) => Map<String, dynamic>.from(e as Map)));
+      if (!mounted) return;
+      setState(() => _sugerenciasPutaway = lista);
+      if (lista.isNotEmpty && _txtPutUbi.text.trim().isEmpty) {
+        _txtPutUbi.text = (lista.first['ubicacion'] ?? '').toString();
+        _validarUbicacionPutaway(_txtPutUbi.text);
+      }
+    } catch (e) {
+      debugPrint('Sugerencia de almacenamiento: $e');
+    }
+  }
   bool _cargandoMisAlm = false;
 
   Future<void> _cargarMisAlmacenamientos() async {
@@ -7355,7 +7401,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   List<Map<String, dynamic>> _stockZonaPickingSku = [];
 
   Future<void> _asignarZonaPickingANivel1(Map fila) async {
-    final txt = TextEditingController(text: _stockPickingSku.isNotEmpty ? (_stockPickingSku.first['codigo_ubicacion'] ?? '').toString() : '');
+    final txt = TextEditingController(text: _pickingFijoSku ??
+        (_stockPickingSku.isNotEmpty ? (_stockPickingSku.first['codigo_ubicacion'] ?? '').toString() : ''));
     final destino = await showDialog<String>(
       context: context,
       builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
@@ -7523,6 +7570,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .select()
           .eq('sku', skuBuscar);
 
+      try {
+        final fija = await supabase.rpc('wms_picking_fijo_sku', params: {'p_bodega': bodegaActiva, 'p_sku': skuBuscar});
+        _pickingFijoSku = (fija == null || fija.toString().trim().isEmpty) ? null : fija.toString().trim().toUpperCase();
+      } catch (_) {
+        _pickingFijoSku = null;
+      }
       final conStock = (res as List)
           .map((e) => Map<String, dynamic>.from(e as Map))
           .where((r) {
@@ -7534,9 +7587,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       // Lo que ya está en picking (nivel 01) no se vuelve a bajar: solo se informa
       _stockPickingSku = conStock.where((r) => _esUbicacionPicking((r['codigo_ubicacion'] ?? '').toString())).toList()
         ..sort((a, b) => ((b['cantidad_unidades'] as num?) ?? 0).compareTo((a['cantidad_unidades'] as num?) ?? 0));
-      final enPickingTxt = _stockPickingSku.isEmpty
+      final enPickingTxt = (_pickingFijoSku != null ? 'Picking asignado: $_pickingFijoSku. ' : 'Sin picking asignado. ') +
+          (_stockPickingSku.isEmpty
           ? 'Sin stock en picking.'
-          : 'En picking: ${_stockPickingSku.map((r) => '${r['codigo_ubicacion']} (${r['cantidad_unidades'] ?? 0} UN)').join(', ')}.';
+          : 'En picking: ${_stockPickingSku.map((r) => '${r['codigo_ubicacion']} (${r['cantidad_unidades'] ?? 0} UN)').join(', ')}.');
       _stockZonaPickingSku = conStock.where((r) => (r['codigo_ubicacion'] ?? '').toString().toUpperCase() == 'ZONA-PICKING').toList();
       final disponibles = conStock.where((r) {
         final ubi = (r['codigo_ubicacion'] ?? '').toString().toUpperCase();
@@ -7609,6 +7663,23 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     // B2501 / B25-01 / B 25 01 -> B-25-01
     final String ubiDestino = _normalizarRackOCodigo(_txtUbiDestinoPicking.text);
     if (ubiDestino != _txtUbiDestinoPicking.text.trim().toUpperCase()) setState(() => _txtUbiDestinoPicking.text = ubiDestino);
+    if (_pickingFijoSku != null && _esUbicacionPicking(ubiDestino) && ubiDestino != _pickingFijoSku) {
+      final seguir = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Ubicación distinta', style: TextStyle(fontWeight: FontWeight.bold)),
+          content: Text('El picking de este producto es $_pickingFijoSku. ¿Bajarlo igual a $ubiDestino?'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text('USAR $_pickingFijoSku')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: Text('SÍ, A $ubiDestino')),
+          ],
+        ),
+      );
+      if (seguir != true) {
+        setState(() => _txtUbiDestinoPicking.text = _pickingFijoSku!);
+        return;
+      }
+    }
     if (!_esUbicacionPicking(ubiDestino)) {
       _notificar(ubiDestino.isEmpty
           ? 'Escanee la ubicación de picking de destino (nivel 01, ej. H-02-01).'
@@ -8930,6 +9001,31 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                     ],
                   ),
                 ),
+                if (_sugerenciasPutaway.isNotEmpty) ...[
+                  const Text('UBICACIÓN SUGERIDA', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12, color: Color(0xFF065F46))),
+                  const SizedBox(height: 4),
+                  Text((_sugerenciasPutaway.first['motivo'] ?? '').toString(),
+                      style: const TextStyle(fontSize: 11, color: Color(0xFF475569))),
+                  const SizedBox(height: 6),
+                  Wrap(spacing: 6, runSpacing: 6, children: _sugerenciasPutaway.map((sug) {
+                    final u = (sug['ubicacion'] ?? '').toString();
+                    final sel = _txtPutUbi.text.trim().toUpperCase() == u;
+                    return ChoiceChip(
+                      label: Text(u, style: TextStyle(fontWeight: FontWeight.w900, color: sel ? Colors.white : const Color(0xFF065F46))),
+                      selected: sel,
+                      selectedColor: const Color(0xFF047857),
+                      tooltip: (sug['motivo'] ?? '').toString(),
+                      onSelected: (_) => setState(() {
+                        _txtPutUbi.text = u;
+                        _validarUbicacionPutaway(u);
+                      }),
+                    );
+                  }).toList()),
+                  const SizedBox(height: 4),
+                  const Text('Escanee la etiqueta de la ubicación para confirmar dónde lo dejó.',
+                      style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B))),
+                  const SizedBox(height: 10),
+                ],
                 TextField(
                   controller: _txtPutUbi,
                   autofocus: true,
