@@ -1624,6 +1624,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     7: ['RF_INVENTARIO'],
     8: ['RF_PICKING'],
     9: ['RF_PICKING'],
+    10: ['RF_RECEPCION', 'RF_TRASLADOS'],
   };
 
   bool _tienePermisoModulo(int idx) {
@@ -1674,6 +1675,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _cargarOVsPendientes();
     } else if (idx == 6) {
       _cargarUbicacionesVacias();
+    } else if (idx == 10) {
+      _cargarTrasladosCcp();
     }
   }
 
@@ -7389,6 +7392,679 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     );
   }
 
+  // ===================================================================
+  // MÓDULO 10: RECEPCIÓN DE TRASLADOS EN CONCEPCIÓN (OT-CCP en pallets)
+  // Paso 0: OT en camino · Paso 1: pallets de la OT · Paso 2: revisar un pallet
+  // ===================================================================
+  bool get _esBodegaConcepcion => bodegaActiva.toUpperCase().replaceAll('Ó', 'O').contains('CONCEPCION');
+
+  List<Map<String, dynamic>> _trasladosCcp = [];
+  bool _cargandoTraslados = false;
+  bool _guardandoTraslado = false;
+  int _pasoTraslado = 0;
+  Map<String, dynamic>? _trasladoActivo;
+  Map<String, dynamic>? _palletTraslado;
+  final Map<String, int> _recibidoTraslado = {}; // clave -> UN contadas (línea revisada)
+  final Map<String, String> _loteRecibidoTraslado = {};
+  final Map<String, String> _vencRecibidoTraslado = {};
+  final TextEditingController _txtLpnTraslado = TextEditingController();
+  final TextEditingController _txtScanTraslado = TextEditingController();
+
+  int _aEntero(dynamic v) => v is num ? v.toInt() : (int.tryParse('${v ?? ''}') ?? 0);
+
+  String _textoCajasTraslado(int unidades, int multiplo) {
+    if (multiplo <= 1) return '$unidades UN';
+    final cajas = unidades ~/ multiplo;
+    final sueltas = unidades % multiplo;
+    return '$cajas cj${sueltas > 0 ? ' + $sueltas un' : ''} ($unidades UN)';
+  }
+
+  String _fechaCortaTraslado(dynamic iso) {
+    final d = DateTime.tryParse('${iso ?? ''}');
+    return d == null ? '' : DateFormat('dd-MM HH:mm').format(d.toLocal());
+  }
+
+  List<Map<String, dynamic>> get _palletsTraslado => List<Map<String, dynamic>>.from(
+      ((_trasladoActivo?['pallets'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)));
+
+  List<Map<String, dynamic>> _lineasPalletTraslado(Map p) => List<Map<String, dynamic>>.from(
+      ((p['lineas'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)));
+
+  Future<void> _cargarTrasladosCcp() async {
+    if (!_esBodegaConcepcion) return;
+    setState(() => _cargandoTraslados = true);
+    try {
+      final res = await supabase.rpc('wms_traslados_ccp', params: {'p_solo_abiertos': true});
+      final lista = List<Map<String, dynamic>>.from((res as List).map((e) => Map<String, dynamic>.from(e as Map)));
+      if (mounted) setState(() => _trasladosCcp = lista);
+    } catch (e) {
+      _notificar('No se pudieron leer los traslados: ${_mensajeError(e)}', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _cargandoTraslados = false);
+    }
+  }
+
+  Future<void> _abrirTrasladoCcp(int ordenId) async {
+    setState(() => _cargandoTraslados = true);
+    try {
+      final res = await supabase.rpc('wms_traslado_ccp_detalle', params: {'p_orden_id': ordenId});
+      if (!mounted) return;
+      setState(() {
+        _trasladoActivo = Map<String, dynamic>.from(res as Map);
+        _palletTraslado = null;
+        _pasoTraslado = 1;
+      });
+    } catch (e) {
+      _notificar('No se pudo abrir la OT: ${_mensajeError(e)}', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _cargandoTraslados = false);
+    }
+  }
+
+  void _volverBandejaTraslados() {
+    setState(() {
+      _pasoTraslado = 0;
+      _trasladoActivo = null;
+      _palletTraslado = null;
+    });
+    _cargarTrasladosCcp();
+  }
+
+  void _seleccionarPalletTraslado(String leido) {
+    var lpn = leido.trim().toUpperCase();
+    if (RegExp(r'^\d{18}$').hasMatch(lpn)) lpn = 'SSCC-$lpn';
+    if (lpn.isEmpty) {
+      _notificar('Escanee o escriba el LPN del pallet.', color: Colors.orange);
+      return;
+    }
+    final encontrados = _palletsTraslado.where((x) => (x['lpn'] ?? '').toString().toUpperCase() == lpn).toList();
+    if (encontrados.isEmpty) {
+      _notificar('El LPN $lpn no viene en esta OT. Revise la etiqueta.', color: Colors.red);
+      return;
+    }
+    final pallet = encontrados.first;
+    if (pallet['pendiente'] != true) {
+      _notificar('El pallet $lpn ya está registrado (${pallet['estado']}).', color: Colors.orange);
+      return;
+    }
+    setState(() {
+      _palletTraslado = pallet;
+      _recibidoTraslado.clear();
+      _loteRecibidoTraslado.clear();
+      _vencRecibidoTraslado.clear();
+      _txtLpnTraslado.clear();
+      _pasoTraslado = 2;
+    });
+  }
+
+  /// Diferencia de una línea revisada (null = conforme o sin revisar).
+  String? _diferenciaLineaTraslado(Map l) {
+    final clave = l['clave'].toString();
+    if (!_recibidoTraslado.containsKey(clave)) return null;
+    final esp = _aEntero(l['unidades']);
+    final rec = _recibidoTraslado[clave]!;
+    if (rec == 0) return '${l['sku']}: no vino (0 de $esp UN)';
+    if (rec != esp) return '${l['sku']}: ${rec < esp ? 'faltan' : 'sobran'} ${(esp - rec).abs()} UN ($rec de $esp)';
+    if (_loteRecibidoTraslado.containsKey(clave) || _vencRecibidoTraslado.containsKey(clave)) {
+      return '${l['sku']}: lote/venc. distinto (${_loteRecibidoTraslado[clave] ?? l['lote']} · ${_vencRecibidoTraslado[clave] ?? l['vencimiento'] ?? 'S/F'})';
+    }
+    return null;
+  }
+
+  Future<void> _editarLineaTraslado(Map l) async {
+    final clave = l['clave'].toString();
+    final mult = _aEntero(l['multiplo']) < 1 ? 1 : _aEntero(l['multiplo']);
+    final esperado = _aEntero(l['unidades']);
+    final actual = _recibidoTraslado[clave] ?? esperado;
+    final txtCajas = TextEditingController(text: '${actual ~/ mult}');
+    final txtSueltas = TextEditingController(text: '${actual % mult}');
+    final txtLote = TextEditingController(text: _loteRecibidoTraslado[clave] ?? (l['lote'] ?? '').toString());
+    final txtVenc = TextEditingController(text: _vencRecibidoTraslado[clave] ?? (l['vencimiento'] ?? '').toString());
+    final guardar = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) {
+        final total = (int.tryParse(txtCajas.text) ?? 0) * mult + (int.tryParse(txtSueltas.text) ?? 0);
+        final cuadra = total == esperado;
+        return AlertDialog(
+          title: Text('${l['sku']}', style: const TextStyle(fontWeight: FontWeight.w900)),
+          content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('${l['descripcion'] ?? ''}', style: const TextStyle(fontSize: 12, color: Color(0xFF475569))),
+            const SizedBox(height: 8),
+            Text('Despachado: ${_textoCajasTraslado(esperado, mult)}', style: const TextStyle(fontWeight: FontWeight.bold)),
+            Text('Lote ${l['lote']} · Venc. ${l['vencimiento'] ?? 'S/F'}${mult > 1 ? ' · caja de $mult' : ''}',
+                style: const TextStyle(fontSize: 12)),
+            const SizedBox(height: 12),
+            Row(children: [
+              if (mult > 1) ...[
+                Expanded(child: TextField(controller: txtCajas, keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Cajas'), onChanged: (_) => setD(() {}))),
+                const SizedBox(width: 8),
+              ],
+              Expanded(child: TextField(controller: txtSueltas, keyboardType: TextInputType.number,
+                  decoration: InputDecoration(labelText: mult > 1 ? 'Unidades sueltas' : 'Unidades'), onChanged: (_) => setD(() {}))),
+            ]),
+            const SizedBox(height: 8),
+            Text('Contado: $total UN${cuadra ? ' ✓' : ' (despachado $esperado)'}',
+                style: TextStyle(fontWeight: FontWeight.w900, color: cuadra ? const Color(0xFF047857) : const Color(0xFFB45309))),
+            const SizedBox(height: 10),
+            TextField(controller: txtLote, textCapitalization: TextCapitalization.characters,
+                inputFormatters: [UpperCaseTextFormatter()], decoration: const InputDecoration(labelText: 'Lote en la caja')),
+            TextField(controller: txtVenc, keyboardType: TextInputType.datetime,
+                decoration: const InputDecoration(labelText: 'Vencimiento en la caja (DD-MM-AAAA)')),
+          ])),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('GUARDAR')),
+          ],
+        );
+      }),
+    );
+    if (guardar != true) return;
+    final total = (int.tryParse(txtCajas.text) ?? 0) * mult + (int.tryParse(txtSueltas.text) ?? 0);
+    final lote = txtLote.text.trim().toUpperCase();
+    final venc = txtVenc.text.trim().toUpperCase();
+    if (venc.isNotEmpty && venc != 'S/F' && !RegExp(r'^\d{2}-\d{2}-\d{4}$').hasMatch(venc)) {
+      _notificar('Vencimiento inválido: use DD-MM-AAAA (ej. 31-12-2027).', color: Colors.red);
+      return;
+    }
+    setState(() {
+      _recibidoTraslado[clave] = total < 0 ? 0 : total;
+      if (lote.isNotEmpty && lote != (l['lote'] ?? '').toString().toUpperCase()) {
+        _loteRecibidoTraslado[clave] = lote;
+      } else {
+        _loteRecibidoTraslado.remove(clave);
+      }
+      final vencOriginal = (l['vencimiento'] ?? '').toString().toUpperCase();
+      if (venc.isNotEmpty && venc != vencOriginal && !(venc == 'S/F' && vencOriginal.isEmpty)) {
+        _vencRecibidoTraslado[clave] = venc;
+      } else {
+        _vencRecibidoTraslado.remove(clave);
+      }
+    });
+  }
+
+  /// Escaneo de un producto dentro del pallet: abre su línea para contarla.
+  Future<void> _procesarScanTraslado() async {
+    var cod = _txtScanTraslado.text.trim().toUpperCase();
+    _txtScanTraslado.clear();
+    if (cod.isEmpty || _palletTraslado == null) return;
+    final digitos = cod.replaceAll(RegExp(r'[^0-9]'), '');
+    if (digitos.length >= 16 && (cod.startsWith('(01)') || digitos.startsWith('01'))) {
+      cod = digitos.substring(2, 16); // GS1-128: (01) GTIN-14
+    }
+    String sinCeros(String s) => s.replaceFirst(RegExp(r'^0+'), '');
+    final buscado = sinCeros(cod);
+    final lineas = _lineasPalletTraslado(_palletTraslado!).where((l) {
+      if ((l['sku'] ?? '').toString().toUpperCase() == cod) return true;
+      final codigos = (l['codigo_barras'] ?? '').toString().toUpperCase().split(RegExp(r'[,;|\s]+'));
+      return codigos.any((c) => c.isNotEmpty && sinCeros(c) == buscado);
+    }).toList();
+    if (lineas.isEmpty) {
+      _notificar('El producto $cod no viene en este pallet.', color: Colors.red);
+      return;
+    }
+    await _editarLineaTraslado(lineas.first);
+  }
+
+  Future<String?> _pedirMotivoTraslado(String titulo, List<String> detalle, List<String> motivos) async {
+    String? motivo;
+    final txtOtro = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        title: Text(titulo, style: const TextStyle(fontWeight: FontWeight.bold)),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          ...detalle.map((d) => Text('• $d', style: const TextStyle(fontSize: 12.5))),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(
+            value: motivo, isExpanded: true,
+            decoration: const InputDecoration(labelText: 'Motivo *'),
+            items: motivos.map((m) => DropdownMenuItem(value: m, child: Text(m))).toList(),
+            onChanged: (v) => setD(() => motivo = v),
+          ),
+          if (motivo == 'Otro') TextField(controller: txtOtro, decoration: const InputDecoration(labelText: 'Detalle del motivo')),
+          const SizedBox(height: 10),
+          const Text('Quedará registrado y el PC lo verá como diferencia del traslado.',
+              style: TextStyle(fontSize: 11.5, color: Color(0xFF92400E))),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCELAR')),
+          ElevatedButton(
+            onPressed: motivo == null ? null : () {
+              final m = motivo == 'Otro' ? txtOtro.text.trim() : motivo!;
+              if (m.isEmpty) return;
+              Navigator.pop(ctx, m);
+            },
+            child: const Text('CONFIRMAR'),
+          ),
+        ],
+      )),
+    );
+  }
+
+  Future<String?> _pedirLpnNuevoTraslado(String lpnOriginal) async {
+    final txt = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        title: const Text('Etiqueta nueva', style: TextStyle(fontWeight: FontWeight.bold)),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('El LPN $lpnOriginal ya existe en Concepción.\n\nPegue una etiqueta LPN nueva sobre el pallet (tape la anterior) y escanéela.'),
+          const SizedBox(height: 10),
+          TextField(controller: txt, autofocus: true, textCapitalization: TextCapitalization.characters,
+            inputFormatters: [UpperCaseTextFormatter()],
+            onSubmitted: (_) => Navigator.pop(ctx, txt.text.trim().toUpperCase()),
+            decoration: InputDecoration(labelText: 'LPN nuevo', prefixIcon: const Icon(Icons.qr_code_2),
+              suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: () async {
+                final cod = await showDialog<String>(context: ctx, builder: (_) => const _DialogoEscanerVivo(titulo: 'Escanear LPN nuevo'));
+                if (cod != null && cod.trim().isNotEmpty) setD(() => txt.text = cod.trim().toUpperCase());
+              }))),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCELAR')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, txt.text.trim().toUpperCase()), child: const Text('RECIBIR CON ESTE LPN')),
+        ],
+      )),
+    );
+  }
+
+  Future<void> _recibirPalletTraslado() async {
+    final p = _palletTraslado;
+    if (p == null || _trasladoActivo == null) return;
+    final lineas = _lineasPalletTraslado(p);
+    final sinRevisar = lineas.where((l) => !_recibidoTraslado.containsKey(l['clave'].toString())).length;
+    if (sinRevisar > 0) {
+      _notificar('Faltan $sinRevisar producto(s) por revisar. Confírmelos uno a uno o use TODO CONFORME.', color: Colors.orange);
+      return;
+    }
+    if (lineas.every((l) => (_recibidoTraslado[l['clave'].toString()] ?? 0) == 0)) {
+      _notificar('No hay unidades contadas. Si el pallet no llegó, vuelva y use "Pallets que no llegaron".', color: Colors.orange);
+      return;
+    }
+    final difs = lineas.map(_diferenciaLineaTraslado).whereType<String>().toList();
+    String? motivo;
+    if (difs.isNotEmpty) {
+      motivo = await _pedirMotivoTraslado('Recibir con diferencias', difs, const [
+        'Faltan cajas o unidades', 'Sobran cajas o unidades', 'Producto dañado en el viaje', 'Lote o vencimiento distinto', 'Otro']);
+      if (motivo == null) return;
+    }
+    await _enviarRecepcionPalletTraslado(motivo: motivo);
+  }
+
+  Future<void> _enviarRecepcionPalletTraslado({String? motivo, String? lpnNuevo}) async {
+    final p = _palletTraslado!;
+    final ot = _trasladoActivo!;
+    final lineas = _lineasPalletTraslado(p);
+    setState(() => _guardandoTraslado = true);
+    late Map<String, dynamic> r;
+    try {
+      final res = await supabase.rpc('wms_recibir_pallet_traslado', params: {
+        'p_orden_id': _aEntero(ot['orden_id']),
+        'p_lpn': p['lpn'],
+        'p_lineas': lineas.map((l) {
+          final c = l['clave'].toString();
+          return {
+            'clave': c,
+            'unidades_recibidas': _recibidoTraslado[c] ?? 0,
+            if (_loteRecibidoTraslado.containsKey(c)) 'lote_recibido': _loteRecibidoTraslado[c],
+            if (_vencRecibidoTraslado.containsKey(c)) 'vencimiento_recibido': _vencRecibidoTraslado[c],
+          };
+        }).toList(),
+        'p_usuario': _usuarioRf(),
+        'p_observacion': motivo,
+        'p_lpn_nuevo': lpnNuevo,
+      });
+      r = Map<String, dynamic>.from(res as Map);
+    } catch (e) {
+      if (mounted) setState(() => _guardandoTraslado = false);
+      final msg = _mensajeError(e);
+      if (msg.contains('LPN_EN_USO_CCP')) {
+        final nuevo = await _pedirLpnNuevoTraslado((p['lpn'] ?? '').toString());
+        if (nuevo != null && nuevo.isNotEmpty) await _enviarRecepcionPalletTraslado(motivo: motivo, lpnNuevo: nuevo);
+        return;
+      }
+      if (mounted) {
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('El pallet NO se recibió', style: TextStyle(fontWeight: FontWeight.bold)),
+            content: Text('$msg\n\nNo se perdió nada: revise y vuelva a presionar RECIBIR PALLET.'),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('ENTENDIDO'))],
+          ),
+        );
+      }
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _guardandoTraslado = false);
+    final destino = (r['lpn_destino'] ?? p['lpn']).toString();
+    final estadoOt = (r['estado_ot'] ?? '').toString();
+    final conDif = (r['resultado'] ?? '') != 'RECIBIDO_CCP';
+    if (estadoOt.startsWith('RECIBIDO')) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(estadoOt == 'RECIBIDO_CCP' ? 'OT recibida completa' : 'OT recibida con diferencias',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+          content: Text('${r['numero_ot']}: se recibieron todos los pallets.\n\n'
+              'Los pallets quedaron en el andén de Concepción. Ubíquelos con ALMACENAMIENTO escaneando su LPN.'),
+          actions: [ElevatedButton(onPressed: () => Navigator.pop(ctx), child: const Text('LISTO'))],
+        ),
+      );
+      _volverBandejaTraslados();
+      return;
+    }
+    _notificar(
+      '${conDif ? 'Pallet recibido CON DIFERENCIAS' : 'Pallet recibido conforme'}: $destino'
+      '${destino != p['lpn'] ? ' (etiqueta nueva)' : ''}. Quedan ${r['pallets_pendientes']} pallet(s).',
+      color: conDif ? const Color(0xFFB45309) : const Color(0xFF047857),
+    );
+    await _abrirTrasladoCcp(_aEntero(ot['orden_id']));
+  }
+
+  Future<void> _cerrarTrasladoConPendientes() async {
+    final ot = _trasladoActivo;
+    if (ot == null) return;
+    final pendientes = _palletsTraslado.where((p) => p['pendiente'] == true).toList();
+    final motivo = await _pedirMotivoTraslado(
+      pendientes.isEmpty ? 'Cerrar recepción' : 'Pallets que no llegaron',
+      pendientes.isEmpty
+          ? ['No quedan pallets pendientes.']
+          : pendientes.map((p) => '${p['lpn']}: ${p['skus']} SKU · ${p['unidades_despachadas']} UN').toList(),
+      const ['El pallet no venía en el camión', 'Llega en otro camión', 'Pallet extraviado', 'Otro'],
+    );
+    if (motivo == null) return;
+    setState(() => _guardandoTraslado = true);
+    try {
+      final res = await supabase.rpc('wms_cerrar_recepcion_traslado', params: {
+        'p_orden_id': _aEntero(ot['orden_id']), 'p_usuario': _usuarioRf(), 'p_motivo': motivo,
+      });
+      final r = Map<String, dynamic>.from(res as Map);
+      _notificar('${r['numero_ov']} cerrada: ${r['pallets_recibidos']} recibido(s), ${r['pallets_no_llegaron']} no llegaron.',
+          color: const Color(0xFFB45309));
+      _volverBandejaTraslados();
+    } catch (e) {
+      _notificar('No se pudo cerrar: ${_mensajeError(e)}', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _guardandoTraslado = false);
+    }
+  }
+
+  Widget _construirVistaTrasladosCcp() {
+    if (!_esBodegaConcepcion) {
+      return ListView(padding: const EdgeInsets.all(16), children: const [
+        _TarjetaMovil(child: Text('Este módulo es solo para Bodega Concepción. Inicie sesión con un usuario de Concepción.',
+            style: TextStyle(fontWeight: FontWeight.bold))),
+      ]);
+    }
+    if (_pasoTraslado == 2 && _palletTraslado != null) return _vistaRevisarPalletTraslado();
+    if (_pasoTraslado == 1 && _trasladoActivo != null) return _vistaPalletsTraslado();
+    return _vistaBandejaTraslados();
+  }
+
+  Widget _vistaBandejaTraslados() {
+    return RefreshIndicator(
+      onRefresh: _cargarTrasladosCcp,
+      child: ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 86), children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(10)),
+          child: Row(children: [
+            const Icon(Icons.local_shipping_rounded, color: Color(0xFF5EEAD4), size: 28),
+            const SizedBox(width: 10),
+            const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('TRASLADOS DESDE SANTIAGO', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 14)),
+              Text('Elija la OT que llegó y escanee cada pallet', style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 11)),
+            ])),
+            IconButton(
+              onPressed: _cargandoTraslados ? null : _cargarTrasladosCcp,
+              icon: _cargandoTraslados
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : const Icon(Icons.sync, color: Colors.white),
+            ),
+          ]),
+        ),
+        const SizedBox(height: 12),
+        if (!_cargandoTraslados && _trasladosCcp.isEmpty)
+          const _TarjetaMovil(child: Text('No hay traslados en camino a Concepción.', style: TextStyle(color: Color(0xFF64748B)))),
+        ..._trasladosCcp.map((t) {
+          final total = _aEntero(t['pallets']);
+          final hechos = _aEntero(t['pallets_recibidos']) + _aEntero(t['pallets_no_llegaron']);
+          final enProceso = (t['estado'] ?? '') == 'RECEPCION_CCP_EN_PROCESO';
+          final faltPk = _aEntero(t['faltante_packing']);
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(10),
+              onTap: () => _abrirTrasladoCcp(_aEntero(t['orden_id'])),
+              child: _TarjetaMovil(
+                borderColor: enProceso ? const Color(0xFF0284C7) : const Color(0xFF14B8A6),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
+                    Expanded(child: Text((t['numero_ot'] ?? '').toString(), style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16))),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: enProceso ? const Color(0xFFE0F2FE) : const Color(0xFFCCFBF1), borderRadius: BorderRadius.circular(20)),
+                      child: Text(enProceso ? 'RECIBIENDO' : 'EN CAMINO',
+                          style: TextStyle(fontSize: 10, fontWeight: FontWeight.w900,
+                              color: enProceso ? const Color(0xFF0369A1) : const Color(0xFF0F766E))),
+                    ),
+                  ]),
+                  const SizedBox(height: 4),
+                  Text('Salió de Santiago ${_fechaCortaTraslado(t['despachado_en'])}'
+                      '${(t['despachado_por'] ?? '').toString().isNotEmpty ? ' · ${t['despachado_por']}' : ''}',
+                      style: const TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    Text('$hechos / $total pallets', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    const Spacer(),
+                    Text('${t['unidades_despachadas']} UN', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF475569))),
+                  ]),
+                  const SizedBox(height: 6),
+                  LinearProgressIndicator(value: total == 0 ? 0 : hechos / total, minHeight: 6,
+                      backgroundColor: const Color(0xFFE2E8F0), color: const Color(0xFF0F766E)),
+                  if (faltPk > 0) ...[
+                    const SizedBox(height: 8),
+                    Text('Santiago la envió con faltante de $faltPk UN (${t['motivo_faltante_packing'] ?? ''})',
+                        style: const TextStyle(fontSize: 11, color: Color(0xFFB45309), fontWeight: FontWeight.bold)),
+                  ],
+                ]),
+              ),
+            ),
+          );
+        }),
+      ]),
+    );
+  }
+
+  Widget _cabeceraTraslado({String? subtitulo, VoidCallback? alVolver}) {
+    final ot = _trasladoActivo ?? {};
+    final pallets = _palletsTraslado;
+    final hechos = pallets.where((p) => p['pendiente'] != true).length;
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(10)),
+      child: Row(children: [
+        IconButton(onPressed: alVolver, icon: const Icon(Icons.arrow_back_rounded, color: Colors.white)),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text((ot['numero_ot'] ?? '').toString(), style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 15)),
+          Text(subtitulo ?? 'SANTIAGO → CONCEPCIÓN · $hechos de ${pallets.length} pallets registrados',
+              style: const TextStyle(color: Color(0xFF5EEAD4), fontSize: 10.5, fontWeight: FontWeight.bold)),
+        ])),
+      ]),
+    );
+  }
+
+  Widget _vistaPalletsTraslado() {
+    final pallets = _palletsTraslado;
+    final pendientes = pallets.where((p) => p['pendiente'] == true).toList();
+    final listos = pallets.where((p) => p['pendiente'] != true).toList();
+    return ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 86), children: [
+      _cabeceraTraslado(alVolver: _volverBandejaTraslados),
+      const SizedBox(height: 10),
+      if (pendientes.isNotEmpty)
+        _TarjetaMovil(borderColor: const Color(0xFF14B8A6), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('ESCANEE EL LPN DEL PALLET', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: Color(0xFF0F766E))),
+          const SizedBox(height: 8),
+          TextField(controller: _txtLpnTraslado, autofocus: true, textCapitalization: TextCapitalization.characters,
+            inputFormatters: [UpperCaseTextFormatter()], onSubmitted: _seleccionarPalletTraslado,
+            decoration: InputDecoration(labelText: 'LPN del pallet', prefixIcon: const Icon(Icons.qr_code_2),
+              suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: () async {
+                await _escanearParaCampo(_txtLpnTraslado, 'Escanear LPN del pallet');
+                if (_txtLpnTraslado.text.isNotEmpty) _seleccionarPalletTraslado(_txtLpnTraslado.text);
+              }))),
+          const SizedBox(height: 8),
+          SizedBox(width: double.infinity, height: 46, child: ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white),
+            onPressed: () => _seleccionarPalletTraslado(_txtLpnTraslado.text),
+            icon: const Icon(Icons.fact_check_rounded), label: const Text('REVISAR PALLET'))),
+        ])),
+      if (pendientes.isNotEmpty) ...[
+        const SizedBox(height: 12),
+        Text('POR RECIBIR (${pendientes.length})', style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFFB45309))),
+        ...pendientes.map((p) => Card(
+          margin: const EdgeInsets.only(top: 6),
+          child: ListTile(
+            dense: true,
+            leading: const Icon(Icons.inventory_2_outlined, color: Color(0xFFB45309)),
+            title: Text((p['lpn'] ?? '').toString(), style: const TextStyle(fontWeight: FontWeight.w900)),
+            subtitle: Text('${p['skus']} SKU · ${p['unidades_despachadas']} UN'),
+            trailing: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
+            onTap: () => _seleccionarPalletTraslado((p['lpn'] ?? '').toString()),
+          ),
+        )),
+      ],
+      if (listos.isNotEmpty) ...[
+        const SizedBox(height: 14),
+        Text('REGISTRADOS (${listos.length})', style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF047857))),
+        ...listos.map((p) {
+          final estado = (p['estado'] ?? '').toString();
+          final noLlego = estado == 'NO_LLEGO';
+          final conDif = estado == 'RECIBIDO_CON_DIFERENCIAS';
+          final destino = (p['lpn_destino'] ?? '').toString();
+          return Card(
+            margin: const EdgeInsets.only(top: 6),
+            child: ListTile(
+              dense: true,
+              leading: Icon(noLlego ? Icons.block : (conDif ? Icons.report_problem_outlined : Icons.check_circle),
+                  color: noLlego ? const Color(0xFF64748B) : (conDif ? const Color(0xFFB45309) : const Color(0xFF047857))),
+              title: Text('${p['lpn']}${destino.isNotEmpty && destino != p['lpn'] ? ' → $destino' : ''}',
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text(noLlego
+                  ? 'NO LLEGÓ · ${p['observacion'] ?? ''}'
+                  : '${p['unidades_recibidas']} de ${p['unidades_despachadas']} UN · ${p['usuario'] ?? ''} ${_fechaCortaTraslado(p['fecha'])}'
+                    '${conDif ? '\n${p['observacion'] ?? ''}' : ''}'),
+            ),
+          );
+        }),
+      ],
+      const SizedBox(height: 16),
+      if (pendientes.isNotEmpty)
+        SizedBox(width: double.infinity, height: 46, child: OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(side: const BorderSide(color: Color(0xFFB45309), width: 1.4)),
+          onPressed: _guardandoTraslado ? null : _cerrarTrasladoConPendientes,
+          icon: const Icon(Icons.report_problem_outlined, color: Color(0xFFB45309)),
+          label: Text('PALLETS QUE NO LLEGARON · CERRAR OT (${pendientes.length})',
+              style: const TextStyle(color: Color(0xFFB45309), fontWeight: FontWeight.bold, fontSize: 12)),
+        )),
+    ]);
+  }
+
+  Widget _vistaRevisarPalletTraslado() {
+    final p = _palletTraslado!;
+    final lineas = _lineasPalletTraslado(p);
+    final revisadas = lineas.where((l) => _recibidoTraslado.containsKey(l['clave'].toString())).length;
+    final hayDif = lineas.any((l) => _diferenciaLineaTraslado(l) != null);
+    final completo = revisadas == lineas.length && lineas.isNotEmpty;
+    return Column(children: [
+      Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 12), children: [
+        _cabeceraTraslado(
+          subtitulo: 'PALLET ${p['lpn']} · ${p['skus']} SKU · ${p['unidades_despachadas']} UN',
+          alVolver: () => setState(() { _pasoTraslado = 1; _palletTraslado = null; }),
+        ),
+        const SizedBox(height: 10),
+        _TarjetaMovil(borderColor: const Color(0xFF14B8A6), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('REVISE CADA PRODUCTO · $revisadas de ${lineas.length}',
+              style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13.5, color: Color(0xFF0F766E))),
+          const SizedBox(height: 4),
+          const Text('✓ si coincide cantidad, lote y vencimiento. Lápiz para anotar lo que realmente llegó.',
+              style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(child: TextField(controller: _txtScanTraslado, textCapitalization: TextCapitalization.characters,
+              inputFormatters: [UpperCaseTextFormatter()], onSubmitted: (_) => _procesarScanTraslado(),
+              decoration: const InputDecoration(labelText: 'Escanear producto (opcional)', prefixIcon: Icon(Icons.barcode_reader)))),
+            const SizedBox(width: 8),
+            ElevatedButton(onPressed: () async {
+              await _escanearParaCampo(_txtScanTraslado, 'Escanear producto');
+              if (_txtScanTraslado.text.isNotEmpty) await _procesarScanTraslado();
+            }, child: const Icon(Icons.qr_code_scanner)),
+          ]),
+          const SizedBox(height: 8),
+          SizedBox(width: double.infinity, child: OutlinedButton.icon(
+            onPressed: () => setState(() {
+              for (final l in lineas) {
+                final c = l['clave'].toString();
+                if (!_recibidoTraslado.containsKey(c)) _recibidoTraslado[c] = _aEntero(l['unidades']);
+              }
+            }),
+            icon: const Icon(Icons.done_all_rounded),
+            label: Text(revisadas == 0 ? 'TODO CONFORME' : 'MARCAR CONFORME EL RESTO'),
+          )),
+        ])),
+        const SizedBox(height: 10),
+        ...lineas.map((l) {
+          final c = l['clave'].toString();
+          final revisada = _recibidoTraslado.containsKey(c);
+          final dif = _diferenciaLineaTraslado(l);
+          final mult = _aEntero(l['multiplo']) < 1 ? 1 : _aEntero(l['multiplo']);
+          final color = !revisada ? const Color(0xFFCBD5E1) : (dif != null ? const Color(0xFFF59E0B) : const Color(0xFF22C55E));
+          return Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+            decoration: BoxDecoration(
+              color: !revisada ? null : (dif != null ? const Color(0xFFFFFBEB) : const Color(0xFFF0FDF4)),
+              borderRadius: BorderRadius.circular(9), border: Border.all(color: color, width: 1.4)),
+            child: Row(children: [
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('${l['sku']}', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13)),
+                Text('${l['descripcion'] ?? ''}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11)),
+                const SizedBox(height: 2),
+                Text('${_textoCajasTraslado(_aEntero(l['unidades']), mult)} · Lote ${l['lote']} · ${l['vencimiento'] ?? 'S/F'}',
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF334155))),
+                if (dif != null)
+                  Text(dif.replaceFirst('${l['sku']}: ', 'Llegó: '),
+                      style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w900, color: Color(0xFFB45309))),
+              ])),
+              IconButton(tooltip: 'Coincide', onPressed: () => setState(() {
+                _recibidoTraslado[c] = _aEntero(l['unidades']);
+                _loteRecibidoTraslado.remove(c);
+                _vencRecibidoTraslado.remove(c);
+              }), icon: Icon(Icons.check_circle, color: revisada && dif == null ? const Color(0xFF16A34A) : const Color(0xFF94A3B8))),
+              IconButton(tooltip: 'Anotar diferencia', onPressed: () => _editarLineaTraslado(l),
+                  icon: Icon(Icons.edit_note_rounded, color: dif != null ? const Color(0xFFB45309) : const Color(0xFF475569))),
+            ]),
+          );
+        }),
+      ])),
+      SafeArea(top: false, child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+        child: SizedBox(width: double.infinity, height: 52, child: ElevatedButton.icon(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: hayDif ? const Color(0xFFB45309) : const Color(0xFF047857), foregroundColor: Colors.white),
+          onPressed: (!completo || _guardandoTraslado) ? null : _recibirPalletTraslado,
+          icon: _guardandoTraslado
+              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+              : Icon(hayDif ? Icons.report_problem_outlined : Icons.verified_rounded),
+          label: Text(!completo
+              ? 'REVISE ${lineas.length - revisadas} PRODUCTO(S) MÁS'
+              : (hayDif ? 'RECIBIR PALLET CON DIFERENCIAS' : 'RECIBIR PALLET CONFORME')),
+        )),
+      )),
+    ]);
+  }
+
   Widget _construirMenuCentral() {
     // Tareas de conteo: se refrescan al volver al menú (como máximo una vez por minuto)
     if (_tareasConteoLeidas == null || DateTime.now().difference(_tareasConteoLeidas!).inSeconds > 60) {
@@ -7396,6 +8072,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       Future.microtask(_cargarMisTareasConteo);
     }
     final botones = [
+      if (_esBodegaConcepcion)
+        {'indice': 10, 'titulo': 'RECIBIR TRASLADOS DE SANTIAGO', 'subtitulo': 'OT-CCP: escanear pallets, revisar y recibir', 'icono': Icons.local_shipping_rounded, 'color': const Color(0xFF0F766E), 'fondo': const Color(0xFFCCFBF1)},
       {'indice': 0, 'titulo': 'RECEPCIÓN EN ANDÉN', 'subtitulo': 'OC, Lectura GS1, Descuento Cajas y LPN', 'icono': Icons.inventory_2_rounded, 'color': const Color(0xFF1D4ED8), 'fondo': const Color(0xFFEFF6FF)},
       {'indice': 1, 'titulo': 'ALMACENAMIENTO', 'subtitulo': 'Paso 1: Escanear LPN -> Paso 2: Escanear Ubicación', 'icono': Icons.warehouse_rounded, 'color': const Color(0xFF047857), 'fondo': const Color(0xFFECFDF5)},
       {'indice': 2, 'titulo': 'MOVIMIENTO A PICKING (FEFO)', 'subtitulo': 'Sugerencia automática por fecha más próxima a vencer', 'icono': Icons.move_down_rounded, 'color': const Color(0xFF0D9488), 'fondo': const Color(0xFFF0FDFA)},
@@ -8899,6 +9577,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             },
           ),
           const Divider(),
+          if (_esBodegaConcepcion)
+            ListTile(
+              leading: const Icon(Icons.local_shipping_rounded, color: Color(0xFF0F766E)),
+              title: const Text('Recibir traslados de Santiago', style: TextStyle(color: Color(0xFF0F766E), fontWeight: FontWeight.bold)),
+              onTap: () => _abrirModulo(10, desdeDrawer: true),
+            ),
           ListTile(
             leading: const Icon(Icons.inventory_2_rounded, color: Color(0xFF1D4ED8)),
             title: const Text('Recepción en Andén'),
@@ -8997,6 +9681,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       case 7: return _construirVistaCiclicoPorSku();
       case 8: return _construirVistaAuditoriaPackingLpn();
       case 9: return _construirVistaPickingNormal(); // Picking Estándar separado de Farmacia
+      case 10: return _construirVistaTrasladosCcp();
       default: return _construirMenuCentral();
     }
   }
@@ -9009,6 +9694,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         // 1. Si está en el Paso 2 de Almacenamiento, regresar al Paso 1
         if (!_mostrarMenuCentral && _tabActual == 1 && _pasoAlmacenamiento == 2) {
           setState(() => _pasoAlmacenamiento = 1);
+          return false;
+        }
+        // Recepción de traslados: volver un paso (pallet -> OT -> bandeja)
+        if (!_mostrarMenuCentral && _tabActual == 10 && _pasoTraslado > 0) {
+          if (_pasoTraslado == 2) {
+            setState(() { _pasoTraslado = 1; _palletTraslado = null; });
+          } else {
+            _volverBandejaTraslados();
+          }
           return false;
         }
         // 2. Si está dentro de cualquier módulo, regresar al Menú Principal sin perder datos
