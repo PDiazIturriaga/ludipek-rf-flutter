@@ -107,7 +107,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.19.6';
+const String kVersionApp = '2026.11.19.7';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1364,10 +1364,29 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final lista = List<Map<String, dynamic>>.from((res as List).map((e) => Map<String, dynamic>.from(e as Map)))
           .where((t) => t['estado'] == 'PENDIENTE' || t['estado'] == 'EN_PROCESO')
           .toList();
+      // Tareas con todo contado se cierran solas
+      final completas = lista.where((t) {
+        final total = (t['total'] as num?)?.toInt() ?? 0;
+        final avance = (t['avance'] as num?)?.toInt() ?? 0;
+        return total > 0 && avance >= total;
+      }).toList();
+      for (final t in completas) {
+        try {
+          await supabase.rpc('wms_actualizar_tarea_conteo', params: {'p_id': t['id'], 'p_estado': 'COMPLETADA', 'p_usuario': _usuarioRf()});
+          lista.remove(t);
+          _notificar('¡${_tituloTareaConteo(t)} completada! (${t['avance']} de ${t['total']})', color: const Color(0xFF047857));
+        } catch (_) {}
+      }
       if (mounted) setState(() => _misTareasConteo = lista);
     } catch (_) {
       // Sin el script 09 en la base no hay tareas: el menú funciona igual
     }
+  }
+
+  /// Después de contar: vuelve a leer el avance de las tareas (sin esperar el minuto del menú)
+  void _refrescarTareasConteo() {
+    _tareasConteoLeidas = DateTime.now();
+    Future.microtask(_cargarMisTareasConteo);
   }
 
   String _tituloTareaConteo(Map t) {
@@ -2006,6 +2025,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       } catch (_) {}
     }
 
+    _refrescarTareasConteo();
     _notificar(
       'Ubicación $ubicacion registrada como ocupada ($notaFinal). No volverá a aparecer en Vacías.',
       color: const Color(0xFFDC2626),
@@ -2211,6 +2231,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     } finally {
       if (mounted) setState(() => _enviandoReporteVacias = false);
     }
+    _refrescarTareasConteo();
 
     final cantVerde = payloadSupabase.where((r) => (r as Map)['resultado_auditoria'] == 'CONFIRMADA_VACIA').length;
     final cantRojo = payloadSupabase.where((r) => (r as Map)['resultado_auditoria'].toString().startsWith('OCUPADA')).length;
@@ -2678,6 +2699,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     } finally {
       if (mounted) setState(() => _enviandoCiclicoSku = false);
     }
+    _refrescarTareasConteo();
 
     final cantOk = payload.where((v) => v['estado_auditoria'] == 'CONFORME').length;
     final cantInc = payload.where((v) => v['estado_auditoria'] == 'INCIDENCIA').length;
@@ -7066,6 +7088,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'p_usuario': _usuarioRf(),
       });
       final r = Map<String, dynamic>.from(res as Map);
+      _refrescarTareasConteo();
 
       if (r['sin_cambios'] == true) {
         _notificar((r['mensaje'] ?? 'No se creó registro porque la cantidad es 0.').toString(), color: Colors.orange);
@@ -8509,8 +8532,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   Widget _construirMenuCentral() {
-    // Tareas de conteo: se refrescan al volver al menú (como máximo una vez por minuto)
-    if (_tareasConteoLeidas == null || DateTime.now().difference(_tareasConteoLeidas!).inSeconds > 60) {
+    // Tareas de conteo: se refrescan al volver al menú (como máximo cada 15 segundos)
+    if (_tareasConteoLeidas == null || DateTime.now().difference(_tareasConteoLeidas!).inSeconds > 15) {
       _tareasConteoLeidas = DateTime.now();
       Future.microtask(_cargarMisTareasConteo);
     }
