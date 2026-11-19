@@ -107,7 +107,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.19.7';
+const String kVersionApp = '2026.11.19.8';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -4088,6 +4088,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   bool _sincronizandoPacking = false;
   // Modo de packing: OV normal/farmacia = BULTOS (cuenta bultos y peso); traslado OT = PALLETS (LPN obligatorio)
   bool _packingEsTraslado = false;
+  bool _cajaPorCajaPack = true;
+  // Consulta de stock del operador (módulo 11)
+  final TextEditingController _txtConsultaStockOp = TextEditingController();
+  List<Map<String, dynamic>> _resConsultaStockOp = [];
+  bool _buscandoStockOp = false;
+  String _ultimaConsultaStockOp = '';   // traslados: cada caja escaneada se agrega de a 1 con su lote/fecha
   // Cierre con faltante (requiere motivo; el PC lo muestra como alerta)
   String? _motivoFaltantePack;
   bool _dialogoLotePackAbierto = false;
@@ -4673,7 +4679,55 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     return opciones;
   }
 
-  Future _abrirModalAuditarLineaPacking(Map linea) async {
+  /// Foto de la fecha impresa en la caja -> lote y vencimiento (misma Visión IA de recepción).
+  Future<Map<String, String>?> _leerLoteVencConFoto() async {
+    try {
+      final foto = await ImagePicker().pickImage(source: ImageSource.camera, imageQuality: 85, maxWidth: 1600);
+      if (foto == null) return null;
+      _notificar('Leyendo la fecha de la foto...', color: const Color(0xFF1D4ED8));
+      final b64 = base64Encode(await foto.readAsBytes());
+      final sesion = await asegurarSesionSupabase();
+      final resp = await supabase.functions.invoke(
+        kGeminiEdgeFunction,
+        headers: {if (sesion != null) 'Authorization': 'Bearer ${sesion.accessToken}'},
+        body: {'image_base64': b64, 'mime_type': 'image/jpeg'},
+      );
+      final Map<String, dynamic> body = resp.data is Map
+          ? Map<String, dynamic>.from(resp.data as Map)
+          : Map<String, dynamic>.from(jsonDecode(resp.data.toString()) as Map);
+      if (body['ok'] != true || body['data'] is! Map) throw Exception(body['error'] ?? 'respuesta inválida');
+      final d = Map<String, dynamic>.from(body['data'] as Map);
+      final lote = (d['lote'] ?? '').toString().trim().toUpperCase();
+      final venc = normalizarFechaSql((d['vencimiento_yyyy_mm_dd'] ?? d['vencimiento'] ?? '').toString().trim()) ?? '';
+      if (lote.isEmpty && venc.isEmpty) {
+        _notificar('No se leyó ninguna fecha. Acerque la cámara a la fecha impresa y vuelva a intentar.', color: Colors.orange);
+        return null;
+      }
+      return {'lote': lote, 'venc': venc};
+    } catch (e) {
+      _notificar('No se pudo leer la foto: ${_mensajeError(e)}', color: Colors.red);
+      return null;
+    }
+  }
+
+  /// Busca entre los lotes ofrecidos el que corresponde a lo leído: primero por lote y si no por fecha.
+  Map? _buscarOpcionLote(List opciones, String lote, String venc, String campoVenc) {
+    final l = lote.trim().toUpperCase();
+    if (l.isNotEmpty) {
+      for (final o in opciones) {
+        if ((o as Map)['lote'].toString().trim().toUpperCase() == l) return o;
+      }
+    }
+    if (venc.isNotEmpty) {
+      for (final o in opciones) {
+        final v = normalizarFechaSql((o as Map)[campoVenc].toString().replaceAll('/', '-'));
+        if (v == venc) return o;
+      }
+    }
+    return null;
+  }
+
+  Future _abrirModalAuditarLineaPacking(Map linea, {int? cajasIni, Map<String, String>? leido}) async {
     if (_txtLpnConsolidadoPack.text.trim().isEmpty) {
       _generarLpnConsolidadoAuto();
     }
@@ -4707,8 +4761,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final int multiploCaja = mult < 1 ? 1 : mult;
     final int cajasSugeridas = saldoPendiente ~/ multiploCaja;
     final int displaysSugeridos = saldoPendiente % multiploCaja;
-    final txtCajas = TextEditingController(text: cajasSugeridas.toString());
-    final txtDisplays = TextEditingController(text: displaysSugeridos.toString());
+    final unaCaja = cajasIni != null;   // caja por caja: 1 caja (o el saldo si es menor a una caja)
+    final txtCajas = TextEditingController(
+        text: unaCaja ? (saldoPendiente >= multiploCaja ? '$cajasIni' : '0') : cajasSugeridas.toString());
+    final txtDisplays = TextEditingController(
+        text: unaCaja ? (saldoPendiente >= multiploCaja ? '0' : '$saldoPendiente') : displaysSugeridos.toString());
     final txtLote = TextEditingController(text: (linea['lote_auditado'] ?? 'S/L').toString());
     final txtVenc = TextEditingController(text: (linea['venc_auditado'] ?? '').toString());
     String loteSeleccionado = 'MANUAL';
@@ -4722,6 +4779,19 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       txtLote.text = inicial['lote'].toString();
       txtVenc.text = inicial['vencimiento'] == 'S/F' ? '' : inicial['vencimiento'].toString();
     }
+    void aplicarLeido(Map<String, String> r) {
+      final o = _buscarOpcionLote(opcionesLote, r['lote'] ?? '', r['venc'] ?? '', 'vencimiento');
+      if (o != null) {
+        loteSeleccionado = o['key'].toString();
+        txtLote.text = o['lote'].toString();
+        txtVenc.text = o['vencimiento'] == 'S/F' ? '' : o['vencimiento'].toString();
+      } else {
+        loteSeleccionado = 'MANUAL';
+        txtLote.text = (r['lote'] ?? '').isEmpty ? '' : r['lote']!;
+        txtVenc.text = (r['venc'] ?? '').replaceAll('-', '/');
+      }
+    }
+    if (leido != null) aplicarLeido(leido);
 
     if (!mounted) return;
     final conf = await showDialog(
@@ -4810,6 +4880,23 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                       ),
                     ),
                   ],
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.photo_camera_outlined),
+                    label: const Text('FOTO A LA FECHA DE LA CAJA'),
+                    onPressed: () async {
+                      final r = await _leerLoteVencConFoto();
+                      if (r == null) return;
+                      setStateDialog(() => aplicarLeido(r));
+                      _notificar(loteSeleccionado != 'MANUAL'
+                          ? 'Fecha ${r['venc']} leída → lote ${txtLote.text}.'
+                          : 'Se leyó ${r['venc']}${(r['lote'] ?? '').isNotEmpty ? ' lote ${r['lote']}' : ''}, pero no coincide con lo pickeado: revise la caja.',
+                          color: loteSeleccionado != 'MANUAL' ? const Color(0xFF047857) : Colors.orange);
+                    },
+                  ),
                 ),
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
@@ -4954,6 +5041,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     );
 
     if (conf == null) return;
+    if (cajasIni != null) _notificar('+${(conf as Map)['unid']} UN de $sku · lote ${conf['lote']}', color: const Color(0xFF047857));
 
     final Map confMap = conf as Map;
     final int unidAudit = (confMap['unid'] as num).toInt();
@@ -4965,6 +5053,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final String lpnActual = _txtLpnConsolidadoPack.text.trim().toUpperCase();
     final String claveConsolidacion = '$lpnActual|$idDetalle|$loteAudit';
     final int nuevoTotalDistribuido = yaDistribuido + unidAudit;
+    // Caja por caja: el mismo lote en el mismo pallet se suma (antes se reemplazaba)
+    final previo = _lpnConsolidadoMapa[claveConsolidacion] as Map?;
+    final int unidLote = ((previo?['unidades_totales'] as num?)?.toInt() ?? 0) + unidAudit;
 
     setState(() {
       linea['auditado_unid'] = nuevoTotalDistribuido;
@@ -4980,10 +5071,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'sku': sku,
         'descripcion': linea['descripcion'],
         'solicitado': solicitado,
-        'pickeado': unidAudit,
-        'unidades_totales': unidAudit,
-        'cajas': cajasAudit,
-        'displays': displaysAudit,
+        'pickeado': unidLote,
+        'unidades_totales': unidLote,
+        'cajas': previo == null ? cajasAudit : unidLote ~/ multiploCaja,
+        'displays': previo == null ? displaysAudit : unidLote % multiploCaja,
         'multiplo_aplicado': multiploCaja,
         'lote': loteAudit,
         'fecha_vencimiento_cl': vencAudit == 'S/F' ? null : vencAudit,
@@ -5001,15 +5092,35 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
 
-    int idx = _lineasAuditoriaPacking.indexWhere((el) {
-      final m = el as Map;
-      if (m['sku'] == scan) return true;
+    // GS1-128 de la caja: trae GTIN + lote + vencimiento
+    String codigo = scan;
+    Map<String, String>? leido;
+    final gs1 = parsearCodigoGs1128(scan);
+    if (gs1.isNotEmpty && gs1['gtin'] != null) {
+      codigo = gs1['gtin'].toString().toUpperCase();
+      final l = (gs1['lote'] ?? '').toString().toUpperCase();
+      final v = gs1['vencimiento'] == null ? '' : (normalizarFechaSql(gs1['vencimiento'].toString()) ?? '');
+      if (l.isNotEmpty || v.isNotEmpty) leido = {'lote': l, 'venc': v};
+    }
+    final sinCeros = codigo.replaceFirst(RegExp(r'^0+'), '');
+    final candidatas = <int>[];
+    for (var i = 0; i < _lineasAuditoriaPacking.length; i++) {
+      final m = _lineasAuditoriaPacking[i] as Map;
       final List bList = m['barcodes'] ?? [];
-      return bList.contains(scan);
-    });
+      if (m['sku'] == codigo || bList.map((c) => c.toString().replaceFirst(RegExp(r'^0+'), '')).contains(sinCeros)) {
+        candidatas.add(i);
+      }
+    }
+    // Si el SKU está en varias líneas, la primera con saldo
+    int idx = candidatas.isEmpty ? -1 : candidatas.firstWhere((i) {
+      final m = _lineasAuditoriaPacking[i] as Map;
+      final id = (m['id_detalle'] as num?)?.toInt() ?? 0;
+      return _cantidadSkuYaDistribuidaEnPallets(id) < _esperadoPacking(m);
+    }, orElse: () => candidatas.first);
 
     if (idx != -1) {
-      await _abrirModalAuditarLineaPacking(_lineasAuditoriaPacking[idx] as Map);
+      await _abrirModalAuditarLineaPacking(_lineasAuditoriaPacking[idx] as Map,
+          cajasIni: _cajaPorCajaPack ? 1 : null, leido: leido);
     } else {
       _notificar('El código $scan no pertenece a esta orden.', color: Colors.red);
     }
@@ -5198,7 +5309,30 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 Text('Se pickeó: ${pickeados.map((o) => '${o['lote']} (${o['venc']}) x${o['pickeado']}').join(', ')}',
                     style: const TextStyle(fontSize: 11.5, color: Color(0xFF475569))),
               ],
-              const SizedBox(height: 12),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  icon: const Icon(Icons.photo_camera_outlined),
+                  label: const Text('FOTO A LA FECHA'),
+                  onPressed: () async {
+                    final r = await _leerLoteVencConFoto();
+                    if (r == null) return;
+                    final o = _buscarOpcionLote(opciones, r['lote'] ?? '', r['venc'] ?? '', 'venc');
+                    setD(() {
+                      if (o != null) {
+                        seleccion = o['clave'] as String;
+                      } else {
+                        seleccion = otro;
+                        txtLote.text = r['lote'] ?? '';
+                        txtVenc.text = r['venc'] ?? '';
+                      }
+                      txtCant.text = '${sugeridaPara(seleccion)}';
+                    });
+                  },
+                ),
+              ),
+              const SizedBox(height: 8),
               DropdownButtonFormField<String>(
                 value: seleccion,
                 isExpanded: true,
@@ -5922,6 +6056,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             await _escanearParaCampo(_txtScanAuditoriaPack, 'Escanear producto');
             if (_txtScanAuditoriaPack.text.isNotEmpty) await _procesarEscaneoAuditoriaPacking();
           }, child: const Icon(Icons.qr_code_scanner))]),
+        SwitchListTile(
+          dense: true, contentPadding: EdgeInsets.zero,
+          value: _cajaPorCajaPack,
+          onChanged: (v) => setState(() => _cajaPorCajaPack = v),
+          title: const Text('Caja por caja', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+          subtitle: Text(_cajaPorCajaPack
+              ? 'Cada caja escaneada suma 1 caja. Confirme su fecha (o sáquele una foto) y el lote se toma solo.'
+              : 'Al escanear se propone todo el saldo del SKU de una vez.', style: const TextStyle(fontSize: 11)),
+        ),
       ])),
       const SizedBox(height: 10),
       _TarjetaMovil(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -7238,6 +7381,231 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     }
   }
 
+  /// Reporte de una incongruencia al supervisor (recepción, almacenamiento y reabastecimiento).
+  Future<void> _dialogoReporteOperador() async {
+    final modulo = _tabActual == 0 ? 'RECEPCION' : (_tabActual == 1 ? 'ALMACENAMIENTO' : 'REABASTECIMIENTO');
+    const tiposPorModulo = {
+      'RECEPCION': ['Cantidad no coincide con la OC', 'Producto no viene en la OC', 'Lote o vencimiento distinto',
+                    'Producto dañado', 'Código no lee / sin etiqueta'],
+      'ALMACENAMIENTO': ['Ubicación ocupada', 'Ubicación no existe o sin etiqueta', 'Pallet no está donde dice el sistema',
+                         'Cantidad no coincide', 'Producto dañado'],
+      'REABASTECIMIENTO': ['Picking lleno', 'No hay stock en reserva', 'Pallet no está en la ubicación', 'Lote distinto al sugerido',
+                           'Cantidad no coincide'],
+    };
+    final tipos = <String>[...tiposPorModulo[modulo]!, 'Otro'];
+    final txtLpn = TextEditingController();
+    final txtUbic = TextEditingController();
+    final txtSku = TextEditingController();
+    final txtDetalle = TextEditingController();
+    String? tipo;
+    Widget campo(TextEditingController c, String label, IconData icono, StateSetter setD, {bool ubic = false}) => TextField(
+          controller: c,
+          textCapitalization: TextCapitalization.characters,
+          inputFormatters: [UpperCaseTextFormatter()],
+          decoration: InputDecoration(
+            labelText: label, prefixIcon: Icon(icono), isDense: true,
+            suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: () async {
+              final cod = await showDialog<String>(context: context, builder: (_) => _DialogoEscanerVivo(titulo: label));
+              if (cod != null && cod.trim().isNotEmpty) {
+                setD(() => c.text = ubic ? _normalizarRackOCodigo(cod) : cod.trim().toUpperCase());
+              }
+            }),
+          ),
+        );
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        title: Row(children: [
+          const Icon(Icons.report_problem_rounded, color: Color(0xFFB45309)),
+          const SizedBox(width: 8),
+          Expanded(child: Text('REPORTAR · $modulo', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15))),
+        ]),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('El supervisor lo verá en el PC (Requiere atención) para ir a revisar.',
+              style: TextStyle(fontSize: 12, color: Color(0xFF475569))),
+          const SizedBox(height: 10),
+          DropdownButtonFormField<String>(
+            value: tipo, isExpanded: true,
+            decoration: const InputDecoration(labelText: 'Qué pasó *'),
+            items: tipos.map((t) => DropdownMenuItem(value: t, child: Text(t))).toList(),
+            onChanged: (v) => setD(() => tipo = v),
+          ),
+          const SizedBox(height: 8),
+          campo(txtLpn, 'LPN', Icons.qr_code_2_rounded, setD),
+          const SizedBox(height: 8),
+          campo(txtUbic, 'Ubicación', Icons.place_outlined, setD, ubic: true),
+          const SizedBox(height: 8),
+          campo(txtSku, 'SKU / EAN', Icons.inventory_2_outlined, setD),
+          const SizedBox(height: 8),
+          TextField(controller: txtDetalle, maxLines: 3,
+              decoration: const InputDecoration(labelText: 'Detalle (qué vio, cuánto hay, OC…)')),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFB45309), foregroundColor: Colors.white),
+            icon: const Icon(Icons.send_rounded),
+            label: const Text('ENVIAR REPORTE'),
+            onPressed: tipo == null ? null : () {
+              if (tipo == 'Otro' && txtDetalle.text.trim().length < 4) {
+                ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(content: Text('Escriba el detalle.'), backgroundColor: Colors.orange));
+                return;
+              }
+              Navigator.pop(ctx, true);
+            },
+          ),
+        ],
+      )),
+    );
+    if (ok != true) return;
+    try {
+      await supabase.rpc('wms_crear_reporte_operacion', params: {
+        'p_bodega': bodegaActiva, 'p_modulo': modulo, 'p_tipo': tipo,
+        'p_lpn': txtLpn.text.trim().isEmpty ? null : txtLpn.text.trim(),
+        'p_ubicacion': txtUbic.text.trim().isEmpty ? null : _normalizarRackOCodigo(txtUbic.text),
+        'p_sku': txtSku.text.trim().isEmpty ? null : txtSku.text.trim(),
+        'p_detalle': txtDetalle.text.trim(),
+        'p_usuario': _usuarioRf(),
+      });
+      _notificar('Reporte enviado. El supervisor lo verá en el PC.', color: const Color(0xFF047857));
+    } catch (e) {
+      _notificar('No se pudo enviar el reporte: ${_mensajeError(e)}', color: Colors.red);
+    }
+  }
+
+  // ---------------- MÓDULO 11 · CONSULTA DE STOCK (solo lectura) ----------------
+  Future<void> _buscarStockOperador([String? texto]) async {
+    final t = (texto ?? _txtConsultaStockOp.text).trim().toUpperCase();
+    if (t.isEmpty) return;
+    String q = t;
+    final gs1 = parsearCodigoGs1128(t);
+    if (gs1.isNotEmpty && gs1['gtin'] != null) q = gs1['gtin'].toString().toUpperCase();
+    setState(() { _buscandoStockOp = true; _ultimaConsultaStockOp = q; });
+    try {
+      final res = await supabase.rpc('wms_consulta_stock_operador', params: {'p_bodega': bodegaActiva, 'p_texto': q});
+      final m = Map<String, dynamic>.from(res as Map);
+      final lista = ((m['skus'] as List?) ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      if (mounted) setState(() => _resConsultaStockOp = lista);
+      if (lista.isEmpty) _notificar('No se encontró ningún producto con "$q".', color: Colors.orange);
+    } catch (e) {
+      _notificar('No se pudo consultar: ${_mensajeError(e)}', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _buscandoStockOp = false);
+    }
+  }
+
+  String _fmtMiles(num n) {
+    final t = n.round().abs().toString();
+    final b = StringBuffer(n < 0 ? '-' : '');
+    for (var i = 0; i < t.length; i++) {
+      if (i > 0 && (t.length - i) % 3 == 0) b.write('.');
+      b.write(t[i]);
+    }
+    return b.toString();
+  }
+
+  Widget _construirVistaConsultaStock() {
+    Widget chipDato(String titulo, String valor, Color color) => Expanded(child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
+          decoration: BoxDecoration(color: color.withOpacity(0.08), borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: color.withOpacity(0.35))),
+          child: Column(children: [
+            Text(valor, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: color)),
+            Text(titulo, style: const TextStyle(fontSize: 10.5, color: Color(0xFF475569)), textAlign: TextAlign.center),
+          ]),
+        ));
+    return ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 90), children: [
+      _TarjetaMovil(borderColor: const Color(0xFF7C3AED), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('CONSULTA DE STOCK', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: Color(0xFF5B21B6))),
+        const Text('Escanee el EAN o escriba el SKU o parte del nombre.', style: TextStyle(fontSize: 12, color: Color(0xFF475569))),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(child: TextField(
+            controller: _txtConsultaStockOp, autofocus: true,
+            textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()],
+            textInputAction: TextInputAction.search,
+            onSubmitted: (_) => _buscarStockOperador(),
+            decoration: const InputDecoration(labelText: 'EAN / SKU / descripción', prefixIcon: Icon(Icons.search_rounded)),
+          )),
+          const SizedBox(width: 8),
+          ElevatedButton(
+            onPressed: () async {
+              await _escanearParaCampo(_txtConsultaStockOp, 'Escanear producto');
+              if (_txtConsultaStockOp.text.isNotEmpty) await _buscarStockOperador();
+            },
+            child: const Icon(Icons.qr_code_scanner),
+          ),
+        ]),
+        if (_buscandoStockOp) const Padding(padding: EdgeInsets.only(top: 10), child: LinearProgressIndicator()),
+      ])),
+      if (!_buscandoStockOp && _resConsultaStockOp.isEmpty && _ultimaConsultaStockOp.isNotEmpty)
+        const Padding(padding: EdgeInsets.all(16),
+            child: Text('Sin resultados.', textAlign: TextAlign.center, style: TextStyle(color: Color(0xFF64748B)))),
+      if (_resConsultaStockOp.length > 1)
+        Padding(padding: const EdgeInsets.fromLTRB(4, 10, 4, 0),
+            child: Text('${_resConsultaStockOp.length} productos coinciden con "$_ultimaConsultaStockOp"',
+                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF475569)))),
+      ..._resConsultaStockOp.map((p) {
+        final total = (p['total'] as num?)?.toInt() ?? 0;
+        final mult = (p['multiplo'] as num?)?.toInt() ?? 1;
+        final ubics = ((p['ubicaciones'] as List?) ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+        final pickFijo = (p['picking_fijo'] ?? '').toString();
+        final sinStock = total <= 0;
+        return Padding(padding: const EdgeInsets.only(top: 10), child: _TarjetaMovil(
+          borderColor: sinStock ? const Color(0xFFDC2626) : const Color(0xFF16A34A),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Expanded(child: Text('${p['sku']}', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16))),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(color: sinStock ? const Color(0xFFFEE2E2) : const Color(0xFFDCFCE7), borderRadius: BorderRadius.circular(6)),
+                child: Text(sinStock ? 'SIN STOCK' : 'HAY STOCK',
+                    style: TextStyle(fontWeight: FontWeight.w900, fontSize: 11, color: sinStock ? const Color(0xFFB91C1C) : const Color(0xFF15803D))),
+              ),
+            ]),
+            Text('${p['descripcion'] ?? ''}', style: const TextStyle(fontSize: 12, color: Color(0xFF334155))),
+            const SizedBox(height: 8),
+            Row(children: [
+              chipDato('TOTAL UN', _fmtMiles(total), const Color(0xFF1D4ED8)),
+              const SizedBox(width: 6),
+              chipDato(mult > 1 ? 'CAJAS (x$mult)' : 'CAJAS', mult > 1 ? _fmtMiles(total ~/ mult) : '—', const Color(0xFF7C3AED)),
+              const SizedBox(width: 6),
+              chipDato('EN PICKING', _fmtMiles((p['en_picking'] as num?) ?? 0), const Color(0xFF047857)),
+              const SizedBox(width: 6),
+              chipDato('EN RESERVA', _fmtMiles((p['en_reserva'] as num?) ?? 0), const Color(0xFF475569)),
+            ]),
+            const SizedBox(height: 8),
+            Text(pickFijo.isNotEmpty ? 'Picking fijo: $pickFijo' : 'Sin ubicación de picking fija',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold,
+                    color: pickFijo.isNotEmpty ? const Color(0xFF047857) : const Color(0xFF64748B))),
+            if ((p['proximo_vencimiento'] ?? '').toString().isNotEmpty)
+              Text('Próximo vencimiento: ${p['proximo_vencimiento']}', style: const TextStyle(fontSize: 12)),
+            if (((p['en_merma'] as num?) ?? 0) > 0)
+              Text('En merma (no disponible): ${_fmtMiles((p['en_merma'] as num?) ?? 0)} UN',
+                  style: const TextStyle(fontSize: 12, color: Color(0xFFB91C1C))),
+            if (ubics.isNotEmpty) ...[
+              const Divider(height: 18),
+              ...ubics.map((u) {
+                final zona = (u['zona'] ?? '').toString();
+                final color = zona == 'PICKING' ? const Color(0xFF047857) : (zona == 'MERMA' ? const Color(0xFFB91C1C) : const Color(0xFF334155));
+                return Padding(padding: const EdgeInsets.only(bottom: 6), child: Row(children: [
+                  Container(width: 4, height: 34, color: color),
+                  const SizedBox(width: 8),
+                  Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('${u['ubicacion']}  ·  $zona', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 13, color: color)),
+                    Text('${(u['lpn'] ?? '').toString().isEmpty ? 'sin LPN' : u['lpn']} · lote ${u['lote']} · vence ${u['vencimiento'] ?? 'S/F'}',
+                        style: const TextStyle(fontSize: 11.5, color: Color(0xFF475569))),
+                  ])),
+                  Text('${_fmtMiles((u['unidades'] as num?) ?? 0)} UN', style: const TextStyle(fontWeight: FontWeight.w900)),
+                ]));
+              }),
+            ],
+          ]),
+        ));
+      }),
+    ]);
+  }
+
   Future<void> _dialogoReporteAlmacenamiento(Map fila) async {
     final lpn = (fila['lpn'] ?? '').toString();
     final actual = (fila['ubicacion_actual'] ?? fila['destino'] ?? '').toString();
@@ -8543,6 +8911,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       {'indice': 0, 'titulo': 'RECEPCIÓN EN ANDÉN', 'subtitulo': 'OC, Lectura GS1, Descuento Cajas y LPN', 'icono': Icons.inventory_2_rounded, 'color': const Color(0xFF1D4ED8), 'fondo': const Color(0xFFEFF6FF)},
       {'indice': 1, 'titulo': 'ALMACENAMIENTO', 'subtitulo': 'Paso 1: Escanear LPN -> Paso 2: Escanear Ubicación', 'icono': Icons.warehouse_rounded, 'color': const Color(0xFF047857), 'fondo': const Color(0xFFECFDF5)},
       {'indice': 2, 'titulo': 'MOVIMIENTO A PICKING (FEFO)', 'subtitulo': 'Sugerencia automática por fecha más próxima a vencer', 'icono': Icons.move_down_rounded, 'color': const Color(0xFF0D9488), 'fondo': const Color(0xFFF0FDFA)},
+      {'indice': 11, 'titulo': 'CONSULTA DE STOCK', 'subtitulo': '¿Queda stock? Escanee el producto y vea dónde está', 'icono': Icons.manage_search_rounded, 'color': const Color(0xFF7C3AED), 'fondo': const Color(0xFFF5F3FF)},
       {'indice': 3, 'titulo': 'STOCK Y CONTEO CÍCLICO', 'subtitulo': 'Consulta Rayos-X y toma de inventario en piso', 'icono': Icons.fact_check_rounded, 'color': const Color(0xFF4338CA), 'fondo': const Color(0xFFEEF2FF)},
       {'indice': 4, 'titulo': 'MAESTRA DE PRODUCTOS', 'subtitulo': 'Enrolamiento de SKU, EAN y múltiplos de caja', 'icono': Icons.list_alt_rounded, 'color': const Color(0xFFB45309), 'fondo': const Color(0xFFFFFBEB)},
       {'indice': 9, 'titulo': 'PICKING ESTÁNDAR (OV NORMAL)', 'subtitulo': 'Escribir OV y preparar por marca (Churu -> Ferall -> Giwi -> Arenas)', 'icono': Icons.shopping_cart_checkout_rounded, 'color': const Color(0xFF0284C7), 'fondo': const Color(0xFFE0F2FE)},
@@ -10232,6 +10601,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       case 8: return _construirVistaAuditoriaPackingLpn();
       case 9: return _construirVistaPickingNormal(); // Picking Estándar separado de Farmacia
       case 10: return _construirVistaTrasladosCcp();
+      case 11: return _construirVistaConsultaStock();
       default: return _construirMenuCentral();
     }
   }
@@ -10305,6 +10675,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             ],
           ),
           actions: [
+            if (!_mostrarMenuCentral && (_tabActual == 0 || _tabActual == 1 || _tabActual == 2))
+              IconButton(
+                tooltip: 'Reportar un problema al supervisor',
+                icon: const Icon(Icons.report_problem_rounded, color: Color(0xFFFBBF24)),
+                onPressed: _dialogoReporteOperador,
+              ),
             if (!_mostrarMenuCentral)
               IconButton(
                 tooltip: 'Volver al Menú Principal',
