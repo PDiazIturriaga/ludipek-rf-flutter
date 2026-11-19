@@ -107,7 +107,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.19.8';
+const String kVersionApp = '2026.11.19.9';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -7746,6 +7746,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   String _claveDuplicado(Map r) => [
         (r['codigo_ubicacion'] ?? '').toString().toUpperCase(),
+        (r['lpn'] ?? '').toString().toUpperCase(),   // otro LPN = otro pallet, no es duplicado
         (r['sku'] ?? '').toString().toUpperCase(),
         (r['lote'] ?? 'S/L').toString().toUpperCase(),
         (r['fecha_vencimiento_cl'] ?? '').toString(),
