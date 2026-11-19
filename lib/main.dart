@@ -107,7 +107,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.19';
+const String kVersionApp = '2026.11.19.3';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1561,7 +1561,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // Variables Módulo 3: Movimiento a Picking (FEFO)
   final TextEditingController _txtSkuPicking = TextEditingController();
   final TextEditingController _txtCajasMoverPicking = TextEditingController(text: '1');
-  final TextEditingController _txtUbiDestinoPicking = TextEditingController(text: 'ZONA-PICKING');
+  final TextEditingController _txtUbiDestinoPicking = TextEditingController();
+  // Picking = nivel 01 de los racks (ej. H-02-01). Merma = ZONA-MERMA y zona de mermas de arena (ME-..).
+  List<Map<String, dynamic>> _stockPickingSku = [];
+  bool _esUbicacionPicking(String u) => RegExp(r'^[A-Z]-\d{2}-01$').hasMatch(u.trim().toUpperCase());
+  bool _esUbicacionMerma(String u) {
+    final x = u.trim().toUpperCase();
+    return x == 'ZONA-MERMA' || RegExp(r'^ME-\d{2}-\d{2}$').hasMatch(x);
+  }
+  /// Destino sugerido: donde el SKU ya está en picking; si no, el nivel 01 de la misma columna del origen.
+  String _destinoPickingPara(Map origen) {
+    if (_stockPickingSku.isNotEmpty) return (_stockPickingSku.first['codigo_ubicacion'] ?? '').toString().toUpperCase();
+    final m = RegExp(r'^([A-Z])-(\d{2})-\d{2}$').firstMatch((origen['codigo_ubicacion'] ?? '').toString().toUpperCase());
+    return m == null ? '' : '${m.group(1)}-${m.group(2)}-01';
+  }
   List< Map<String, dynamic> > _sugerenciasSkuPicking = [];
   List< Map<String, dynamic> > _ubicacionesFefoPicking = [];
   Map<String, dynamic>? _stockFefoSeleccionado;
@@ -3705,7 +3718,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   /// Descuenta del inventario los picks nuevos de la OV y registra SALIDA_PICKING en el kardex.
-  /// Prioridad: misma ubicación del pick -> ZONA-PICKING -> otras ubicaciones del lote (FEFO).
+  /// Prioridad: misma ubicación del pick -> picking nivel 01 -> otras ubicaciones del lote (FEFO).
   Future<List<String>> _descontarStockPicking(String numeroOv) async {
     final List<String> avisos = [];
     for (final rawL in _lineasOvFarmacia) {
@@ -3806,7 +3819,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         for (var r in (resInv as List)) {
           if (!_perteneceABodegaActiva(r as Map)) continue;
           final ubi = (r['codigo_ubicacion'] ?? 'RACK').toString().trim().toUpperCase();
-          if (ubi == 'ZONA-MERMA') continue;
+          if (_esUbicacionMerma(ubi)) continue;
           if (loteBloqueadoPorQa(r['lote'])) continue;
           final l = (r['lote'] ?? 'S/L').toString().split('|QA:').first.trim().toUpperCase();
           final v = (r['fecha_vencimiento_cl'] ?? '').toString().trim();
@@ -3835,7 +3848,19 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
 
         lotesDisponibles = agrupado.entries.map((e) => {'lote_venc': e.key.toString(), 'stock': e.value as int}).toList();
-        lotesDisponibles.sort((a, b) => ((b as Map)['stock'] as int).compareTo((a as Map)['stock'] as int));
+        // Primero lo que está en picking (nivel 01), después reserva; dentro de cada grupo, más stock primero
+        int prioridadUbi(String k) {
+          final u = RegExp(r'\[Rack: ([^\]]+)\]').firstMatch(k)?.group(1) ?? '';
+          if (_esUbicacionPicking(u)) return 0;
+          if (u == 'ZONA-PICKING') return 1;
+          return u.isEmpty ? 3 : 2;
+        }
+        lotesDisponibles.sort((a, b) {
+          final ka = (a as Map)['lote_venc'].toString(), kb = (b as Map)['lote_venc'].toString();
+          final pa = prioridadUbi(ka), pb = prioridadUbi(kb);
+          if (pa != pb) return pa.compareTo(pb);
+          return (b['stock'] as int).compareTo(a['stock'] as int);
+        });
       } catch (_) {}
 
       if (!mounted) return;
@@ -7231,24 +7256,33 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .select()
           .eq('sku', skuBuscar);
 
-      final disponibles = (res as List)
+      final conStock = (res as List)
           .map((e) => Map<String, dynamic>.from(e as Map))
           .where((r) {
         if (!_perteneceABodegaActiva(r)) return false;
-        final ubi = (r['codigo_ubicacion'] ?? '').toString().toUpperCase();
         final unid = (r['cantidad_unidades'] as num?)?.toInt() ?? 0;
         final cajas = (r['cajas'] as num?)?.toInt() ?? 0;
-        // Lotes en CUARENTENA / RECHAZADO (|QA:) no pueden ir a picking
-        return ubi != 'ZONA-MERMA' && ubi != 'ZONA-PICKING' && !loteBloqueadoPorQa(r['lote']) && (unid > 0 || cajas > 0);
+        return unid > 0 || cajas > 0;
+      }).toList();
+      // Lo que ya está en picking (nivel 01) no se vuelve a bajar: solo se informa
+      _stockPickingSku = conStock.where((r) => _esUbicacionPicking((r['codigo_ubicacion'] ?? '').toString())).toList()
+        ..sort((a, b) => ((b['cantidad_unidades'] as num?) ?? 0).compareTo((a['cantidad_unidades'] as num?) ?? 0));
+      final enPickingTxt = _stockPickingSku.isEmpty
+          ? 'Sin stock en picking.'
+          : 'En picking: ${_stockPickingSku.map((r) => '${r['codigo_ubicacion']} (${r['cantidad_unidades'] ?? 0} UN)').join(', ')}.';
+      final disponibles = conStock.where((r) {
+        final ubi = (r['codigo_ubicacion'] ?? '').toString().toUpperCase();
+        // Origen = reserva: nunca picking (nivel 01), merma ni la antigua ZONA-PICKING; lotes QA bloqueados tampoco
+        return !_esUbicacionPicking(ubi) && !_esUbicacionMerma(ubi) && ubi != 'ZONA-PICKING' && !loteBloqueadoPorQa(r['lote']);
       }).toList();
 
       if (disponibles.isEmpty) {
         setState(() {
           _ubicacionesFefoPicking = [];
           _stockFefoSeleccionado = null;
-          _mensajeEstadoFefo = 'No se encontró stock disponible en Racks ($bodegaActiva) para el SKU $skuBuscar.';
+          _mensajeEstadoFefo = 'No hay reserva para bajar del SKU $skuBuscar en $bodegaActiva. $enPickingTxt';
         });
-        _notificar('Sin stock en racks ($bodegaActiva) para SKU $skuBuscar.', color: const Color(0xFFDC2626));
+        _notificar('Sin reserva para bajar ($skuBuscar). $enPickingTxt', color: const Color(0xFFDC2626));
         return;
       }
 
@@ -7271,7 +7305,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         _ubicacionesFefoPicking = disponibles;
         _stockFefoSeleccionado = sugerido;
         _txtCajasMoverPicking.text = cajasDisp > 0 ? cajasDisp.toString() : '1';
-        _mensajeEstadoFefo = 'FEFO calculado ($bodegaActiva): ${disponibles.length} ubicación(es) encontrada(s) para $skuBuscar.';
+        _txtUbiDestinoPicking.text = _destinoPickingPara(sugerido);
+        _mensajeEstadoFefo = 'FEFO ($bodegaActiva): ${disponibles.length} ubicación(es) de reserva para $skuBuscar. $enPickingTxt';
       });
     } catch (ex) {
       _notificar('Error consultando FEFO: $ex', color: const Color(0xFFDC2626));
@@ -7308,7 +7343,25 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         .replaceAll('RACK', '')
         .replaceAll(' ', '-');
     ubiDestino = ubiDestino.replaceAll(RegExp(r'-+'), '-');
-    if (ubiDestino.isEmpty) ubiDestino = 'ZONA-PICKING';
+    if (!_esUbicacionPicking(ubiDestino)) {
+      _notificar(ubiDestino.isEmpty
+          ? 'Escanee la ubicación de picking de destino (nivel 01, ej. H-02-01).'
+          : '$ubiDestino no es picking. El picking es el nivel 01 de los racks (ej. H-02-01).',
+          color: const Color(0xFFD97706));
+      return;
+    }
+
+    // Pallet con varios lotes/vencimientos: si se baja completo, se baja TODO el LPN (no solo un lote)
+    final lotesLpn = _lotesDelLpn(origenItem);
+    final cajasFila = (origenItem['cajas'] as num?)?.toInt() ?? 0;
+    if (lotesLpn.length > 1 && cajasMover >= cajasFila) {
+      final opcion = await _preguntarLpnCompleto(origenItem, lotesLpn);
+      if (opcion == null) return;
+      if (opcion == 'LPN') {
+        await _moverLpnCompletoAPicking(origenItem, ubiDestino);
+        return;
+      }
+    }
 
     try {
       // El servidor relee y bloquea la fila de origen, valida QA/destino/cantidades y escribe el kardex
@@ -7325,6 +7378,59 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       );
     } catch (ex) {
       _notificar('No se movió a picking: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
+    }
+    await _buscarUbicacionesFefoPorSku(skuForzado: (origenItem['sku'] ?? '').toString());
+  }
+
+  /// Filas (lotes/vencimientos) del mismo LPN en la misma ubicación de origen.
+  List<Map<String, dynamic>> _lotesDelLpn(Map item) {
+    final lpn = (item['lpn'] ?? '').toString().trim().toUpperCase();
+    if (lpn.isEmpty || lpn == 'S/LPN') return [Map<String, dynamic>.from(item)];
+    return _ubicacionesFefoPicking
+        .where((r) => (r['lpn'] ?? '').toString().trim().toUpperCase() == lpn && r['codigo_ubicacion'] == item['codigo_ubicacion'])
+        .toList();
+  }
+
+  String _resumenLotesLpn(List<Map<String, dynamic>> lotes) => lotes
+      .map((r) => '${r['lote'] ?? 'S/L'} · ${normalizarFechaSql(r['fecha_vencimiento_cl']?.toString()) ?? 'S/F'} · ${r['cajas'] ?? 0} Cj (${r['cantidad_unidades'] ?? 0} UN)')
+      .join('\n');
+
+  Future<String?> _preguntarLpnCompleto(Map origen, List<Map<String, dynamic>> lotes) {
+    final totalCj = lotes.fold<int>(0, (a, r) => a + ((r['cajas'] as num?)?.toInt() ?? 0));
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('LPN ${origen['lpn']} con ${lotes.length} lotes', style: const TextStyle(fontWeight: FontWeight.bold)),
+        content: Text('Este pallet tiene más de un lote/vencimiento:\n\n${_resumenLotesLpn(lotes)}\n\n'
+            'Si está bajando el pallet completo, se mueve TODO el LPN ($totalCj Cj) a picking.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCELAR')),
+          TextButton(onPressed: () => Navigator.pop(ctx, 'LOTE'), child: Text('SOLO LOTE ${origen['lote'] ?? 'S/L'}')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0D9488), foregroundColor: Colors.white),
+            onPressed: () => Navigator.pop(ctx, 'LPN'),
+            child: const Text('BAJAR LPN COMPLETO'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Baja a picking el LPN completo (todos sus lotes) en una sola transacción del servidor.
+  Future<void> _moverLpnCompletoAPicking(Map origenItem, String ubiDestino) async {
+    try {
+      final dynamic res = await supabase.rpc('wms_mover_lpn_a_picking', params: {
+        'p_inventario_id': origenItem['id'],
+        'p_destino': ubiDestino,
+        'p_usuario': _usuarioRf(),
+      });
+      final r = Map<String, dynamic>.from(res as Map);
+      _notificar(
+        'LPN ${r['lpn']} completo a picking: ${r['lineas']} lote(s), ${r['cajas']} Cj (${r['unidades']} UN) de ${r['origen']} a ${r['destino']}.',
+        color: const Color(0xFF047857),
+      );
+    } catch (ex) {
+      _notificar('No se movió el LPN: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
     }
     await _buscarUbicacionesFefoPorSku(skuForzado: (origenItem['sku'] ?? '').toString());
   }
@@ -8876,6 +8982,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                               'LPN: ${_stockFefoSeleccionado!['lpn'] ?? 'SIN LPN'} | Lote: ${_stockFefoSeleccionado!['lote'] ?? 'S/L'}',
                               style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
                             ),
+                            if (_lotesDelLpn(_stockFefoSeleccionado!).length > 1)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 4),
+                                child: Text(
+                                  'Este LPN tiene ${_lotesDelLpn(_stockFefoSeleccionado!).length} lotes. Si baja el pallet completo se mueve todo.',
+                                  style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: Color(0xFFB45309)),
+                                ),
+                              ),
                           ],
                         ),
                       ),
@@ -8931,8 +9045,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                         textCapitalization: TextCapitalization.characters,
                         inputFormatters: [UpperCaseTextFormatter()],
                         decoration: InputDecoration(
-                          labelText: 'Destino Picking',
-                          hintText: 'ZONA-PICKING o C-01-01',
+                          labelText: 'Destino picking (nivel 01)',
+                          hintText: 'Ej: H-02-01',
                           suffixIcon: IconButton(
                             icon: const Icon(Icons.qr_code_scanner, size: 18),
                             onPressed: () => _escanearUbicacion(_txtUbiDestinoPicking, false),
@@ -8989,6 +9103,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                         _stockFefoSeleccionado = item;
                         final cDisp = (item['cajas'] as num?)?.toInt() ?? 1;
                         _txtCajasMoverPicking.text = cDisp > 0 ? cDisp.toString() : '1';
+                        _txtUbiDestinoPicking.text = _destinoPickingPara(item);
                       });
                     },
                     child: Container(
