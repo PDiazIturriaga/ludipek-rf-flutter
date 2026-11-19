@@ -105,6 +105,22 @@ Future<Session?> asegurarSesionSupabase() async {
 /// bodega_inventario_ubicacion y se registra SALIDA_PICKING en el kardex.
 const bool kDescontarStockAlPickear = true;
 
+/// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
+/// si no, la app pide recargar para que nadie trabaje con una versión antigua.
+const String kVersionApp = '2026.11.19';
+
+/// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
+Future<String?> versionMinimaServidor() async {
+  try {
+    final v = await supabase.rpc('wms_version_minima');
+    return v?.toString();
+  } catch (_) {
+    return null; // sin el script 12 no se bloquea a nadie
+  }
+}
+
+bool versionDesactualizada(String? minima) => minima != null && kVersionApp.compareTo(minima) < 0;
+
 /// Supabase (PostgREST) entrega como máximo 1.000 filas por consulta.
 /// Este helper pide páginas sucesivas hasta traer todas las filas.
 Future<List<Map<String, dynamic>>> leerTodoPaginado(
@@ -1208,6 +1224,22 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
         return;
       }
 
+      final minima = await versionMinimaServidor();
+      if (versionDesactualizada(minima)) {
+        if (!mounted) return;
+        await showDialog<void>(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Actualice la aplicación', style: TextStyle(fontWeight: FontWeight.bold)),
+            content: Text('Esta versión ($kVersionApp) ya no está permitida; se requiere $minima o superior.\n\n'
+                'Cierre esta pestaña y abra de nuevo el enlace de la app (en PC: Ctrl + F5).'),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('ENTENDIDO'))],
+          ),
+        );
+        return;
+      }
+
       usuarioActivo = usr;
       bodegaActiva = tieneAccesoGlobal ? _bodegaSeleccionada : bodegaAsignada;
 
@@ -1238,6 +1270,7 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Icon(Icons.pets_rounded, size: 80, color: isDark ? Colors.white : const Color(0xFF1D4ED8)),
+                Text('Versión $kVersionApp', style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8))),
                 const SizedBox(height: 16),
                 Text(
                   'INICIAR SESIÓN',
@@ -1314,9 +1347,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // ===================================================================
   List<Map<String, dynamic>> _misTareasConteo = [];
   DateTime? _tareasConteoLeidas;
+  bool _hayVersionNueva = false;
 
   Future<void> _cargarMisTareasConteo() async {
     _tareasConteoLeidas = DateTime.now();
+    final minima = await versionMinimaServidor();
+    if (mounted && versionDesactualizada(minima) != _hayVersionNueva) {
+      setState(() => _hayVersionNueva = versionDesactualizada(minima));
+    }
     try {
       final res = await supabase.rpc('wms_tareas_conteo', params: {
         'p_bodega': bodegaActiva,
@@ -7359,6 +7397,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 ),
               ),
               const SizedBox(height: 18),
+              if (_hayVersionNueva)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(bottom: 14),
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(color: const Color(0xFFFEE2E2), borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFFDC2626))),
+                  child: const Text('HAY UNA VERSIÓN NUEVA DE LA APP. Termine lo que está haciendo, cierre esta pestaña y vuelva a abrir el enlace.',
+                      style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF991B1B))),
+                ),
               if (_misTareasConteo.isNotEmpty) _tarjetaMisTareasConteo(),
               ...botones.where((b) => _tienePermisoModulo(b['indice'] as int)).map((b) {
                 final int idx = b['indice'] as int;
