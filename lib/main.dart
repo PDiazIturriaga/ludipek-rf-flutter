@@ -142,7 +142,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.2';
+const String kVersionApp = '2026.11.20.3';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -4803,6 +4803,61 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     return null;
   }
 
+  /// Fecha impresa en la caja en formato EE.UU. (MES/DÍA/AÑO) -> fechas posibles en DD-MM-AAAA.
+  /// Primero la lectura EE.UU.; si el día también puede ser un mes, la invertida queda como segunda opción.
+  List<String> _fechasCajaUS(String texto) {
+    final partes = texto.split(RegExp(r'[^0-9]+')).where((x) => x.isNotEmpty).toList();
+    final d = texto.replaceAll(RegExp(r'[^0-9]'), '');
+    int? mes, dia, anio;
+    if (partes.length == 3) {
+      mes = int.tryParse(partes[0]);
+      dia = int.tryParse(partes[1]);
+      anio = int.tryParse(partes[2]);
+    } else if (d.length == 8) {
+      mes = int.tryParse(d.substring(0, 2));
+      dia = int.tryParse(d.substring(2, 4));
+      anio = int.tryParse(d.substring(4));
+    } else if (d.length == 6) {
+      mes = int.tryParse(d.substring(0, 2));
+      dia = int.tryParse(d.substring(2, 4));
+      anio = int.tryParse(d.substring(4));
+    }
+    if (mes == null || dia == null || anio == null) return [];
+    if (anio < 100) anio += 2000;
+    final salida = <String>[];
+    void agregar(int m, int dd) {
+      if (m < 1 || m > 12 || dd < 1 || dd > 31) return;
+      final f = DateTime(anio!, m, dd);
+      if (f.month != m || f.day != dd) return;
+      final t = DateFormat('dd-MM-yyyy').format(f);
+      if (!salida.contains(t)) salida.add(t);
+    }
+    agregar(mes, dia);   // EE.UU.: mes/día/año
+    agregar(dia, mes);   // por si la foto o el operador la leyó al revés
+    return salida;
+  }
+
+  /// Fecha ya normalizada (DD-MM-AAAA, ej. leída por la foto) + su versión con día y mes invertidos.
+  List<String> _fechasConAlternativa(String ddmmaaaa) {
+    final p = ddmmaaaa.split('-');
+    if (p.length != 3) return ddmmaaaa.isEmpty ? [] : [ddmmaaaa];
+    // DD-MM-AAAA leída -> probar también como si fuera MM-DD
+    final alt = _fechasCajaUS('${p[1]}/${p[0]}/${p[2]}');
+    return [ddmmaaaa, ...alt.where((x) => x != ddmmaaaa)];
+  }
+
+  /// Lotes ofrecidos cuyo vencimiento coincide con la primera fecha posible que tenga coincidencias.
+  List<Map> _opcionesPorFechas(List opciones, List<String> fechas, String campoVenc) {
+    for (final f in fechas) {
+      final m = opciones
+          .where((o) => normalizarFechaSql((o as Map)[campoVenc].toString().replaceAll('/', '-')) == f)
+          .map((o) => o as Map)
+          .toList();
+      if (m.isNotEmpty) return m;
+    }
+    return [];
+  }
+
   Future _abrirModalAuditarLineaPacking(Map linea, {int? cajasIni, Map<String, String>? leido}) async {
     if (_txtLpnConsolidadoPack.text.trim().isEmpty) {
       _generarLpnConsolidadoAuto();
@@ -4868,6 +4923,47 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
     }
     if (leido != null) aplicarLeido(leido);
+
+    // Cajas sin etiqueta: solo traen la fecha (MES/DÍA/AÑO). Con la fecha se busca el lote:
+    // primero entre lo pickeado; si no está, en el stock del SKU (avisando que no fue lo pickeado).
+    final txtFechaCaja = TextEditingController();
+    String avisoFecha = '';
+    Color colorAviso = const Color(0xFF047857);
+    Future<void> resolverFechas(List<String> fechas, {String lote = ''}) async {
+      if (fechas.isEmpty) {
+        avisoFecha = 'Fecha no válida. Escríbala como aparece en la caja: MES/DÍA/AÑO.';
+        colorAviso = Colors.red;
+        return;
+      }
+      final porLote = lote.isNotEmpty ? _buscarOpcionLote(opcionesLote, lote, '', 'vencimiento') : null;
+      final m = porLote != null ? [porLote] : _opcionesPorFechas(opcionesLote, fechas, 'vencimiento');
+      if (m.isNotEmpty) {
+        final o = m.first;
+        loteSeleccionado = o['key'].toString();
+        txtLote.text = o['lote'].toString();
+        txtVenc.text = o['vencimiento'] == 'S/F' ? '' : o['vencimiento'].toString();
+        avisoFecha = 'Vence ${o['vencimiento']} → lote ${o['lote']}'
+            '${m.length > 1 ? ' (hay ${m.length} lotes con esa fecha: confirme cuál es)' : ''}';
+        colorAviso = m.length > 1 ? Colors.orange : const Color(0xFF047857);
+        return;
+      }
+      List<Map<String, dynamic>> stock = [];
+      try {
+        stock = await _cargarLotesDisponiblesPacking(sku);
+      } catch (_) {}
+      final s = _opcionesPorFechas(stock, fechas, 'vencimiento');
+      loteSeleccionado = 'MANUAL';
+      if (s.isNotEmpty) {
+        txtLote.text = s.first['lote'].toString();
+        txtVenc.text = s.first['vencimiento'].toString();
+        avisoFecha = 'ATENCIÓN: esa fecha es del lote ${s.first['lote']} del stock, pero NO es el que se pickeó. Revise la caja.';
+      } else {
+        txtLote.clear();
+        txtVenc.text = fechas.first.replaceAll('-', '/');
+        avisoFecha = 'No hay ningún lote de $sku que venza el ${fechas.first}. Revise la fecha o escriba el lote.';
+      }
+      colorAviso = Colors.red;
+    }
 
     if (!mounted) return;
     final conf = await showDialog(
@@ -4966,14 +5062,32 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                     onPressed: () async {
                       final r = await _leerLoteVencConFoto();
                       if (r == null) return;
-                      setStateDialog(() => aplicarLeido(r));
-                      _notificar(loteSeleccionado != 'MANUAL'
-                          ? 'Fecha ${r['venc']} leída → lote ${txtLote.text}.'
-                          : 'Se leyó ${r['venc']}${(r['lote'] ?? '').isNotEmpty ? ' lote ${r['lote']}' : ''}, pero no coincide con lo pickeado: revise la caja.',
-                          color: loteSeleccionado != 'MANUAL' ? const Color(0xFF047857) : Colors.orange);
+                      await resolverFechas(_fechasConAlternativa(r['venc'] ?? ''), lote: r['lote'] ?? '');
+                      setStateDialog(() {});
                     },
                   ),
                 ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: txtFechaCaja,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [FechaInputFormatter()],
+                  decoration: const InputDecoration(
+                    labelText: 'O escriba la fecha de la caja (MES/DÍA/AÑO)',
+                    helperText: 'Como viene impresa: 05/27/2028 = 27 de mayo de 2028',
+                    prefixIcon: Icon(Icons.edit_calendar_outlined),
+                  ),
+                  onChanged: (v) async {
+                    if (v.replaceAll(RegExp(r'[^0-9]'), '').length < 8) return;
+                    await resolverFechas(_fechasCajaUS(v));
+                    setStateDialog(() {});
+                  },
+                ),
+                if (avisoFecha.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(avisoFecha, style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: colorAviso)),
+                  ),
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
                   value: loteSeleccionado,
@@ -5367,6 +5481,35 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return sugerido == 1 ? 1 : (maxLote < pendiente ? maxLote : pendiente);
     }
     final txtCant = TextEditingController(text: '${sugeridaPara(seleccion)}');
+    // Cajas sin etiqueta: con la fecha impresa (MES/DÍA/AÑO) se elige el lote
+    final txtFechaCaja = TextEditingController();
+    String avisoFecha = '';
+    Color colorAviso = const Color(0xFF047857);
+    void aplicarFechas(List<String> fechas, {String lote = ''}) {
+      if (fechas.isEmpty) {
+        avisoFecha = 'Fecha no válida. Escríbala como aparece en la caja: MES/DÍA/AÑO.';
+        colorAviso = Colors.red;
+        return;
+      }
+      final porLote = lote.isNotEmpty ? _buscarOpcionLote(opciones, lote, '', 'venc') : null;
+      final m = porLote != null ? [porLote] : _opcionesPorFechas(opciones, fechas, 'venc');
+      if (m.isNotEmpty) {
+        final pick = m.where((o) => o['origen'] == 'PICKING').toList();
+        final o = pick.isNotEmpty ? pick.first : m.first;
+        seleccion = o['clave'] as String;
+        avisoFecha = 'Vence ${o['venc']} → lote ${o['lote']}'
+            '${o['origen'] != 'PICKING' ? ' (ATENCIÓN: no es el lote pickeado)' : ''}'
+            '${m.length > 1 ? ' · hay ${m.length} lotes con esa fecha: confirme' : ''}';
+        colorAviso = (o['origen'] != 'PICKING' || m.length > 1) ? Colors.orange : const Color(0xFF047857);
+      } else {
+        seleccion = otro;
+        txtLote.clear();
+        txtVenc.text = fechas.first;
+        avisoFecha = 'Ningún lote de $sku vence el ${fechas.first}. Revise la fecha o escriba el lote.';
+        colorAviso = Colors.red;
+      }
+      txtCant.text = '${sugeridaPara(seleccion)}';
+    }
 
     final resultado = await showDialog<Map<String, dynamic>>(
       context: context,
@@ -5394,20 +5537,30 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   onPressed: () async {
                     final r = await _leerLoteVencConFoto();
                     if (r == null) return;
-                    final o = _buscarOpcionLote(opciones, r['lote'] ?? '', r['venc'] ?? '', 'venc');
-                    setD(() {
-                      if (o != null) {
-                        seleccion = o['clave'] as String;
-                      } else {
-                        seleccion = otro;
-                        txtLote.text = r['lote'] ?? '';
-                        txtVenc.text = r['venc'] ?? '';
-                      }
-                      txtCant.text = '${sugeridaPara(seleccion)}';
-                    });
+                    setD(() => aplicarFechas(_fechasConAlternativa(r['venc'] ?? ''), lote: r['lote'] ?? ''));
                   },
                 ),
               ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: txtFechaCaja,
+                keyboardType: TextInputType.number,
+                inputFormatters: [FechaInputFormatter()],
+                decoration: const InputDecoration(
+                  labelText: 'O escriba la fecha de la caja (MES/DÍA/AÑO)',
+                  helperText: 'Como viene impresa: 05/27/2028 = 27 de mayo de 2028',
+                  prefixIcon: Icon(Icons.edit_calendar_outlined),
+                ),
+                onChanged: (v) {
+                  if (v.replaceAll(RegExp(r'[^0-9]'), '').length < 8) return;
+                  setD(() => aplicarFechas(_fechasCajaUS(v)));
+                },
+              ),
+              if (avisoFecha.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(avisoFecha, style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: colorAviso)),
+                ),
               const SizedBox(height: 8),
               DropdownButtonFormField<String>(
                 value: seleccion,
