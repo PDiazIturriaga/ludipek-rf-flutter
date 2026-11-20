@@ -20,6 +20,11 @@ const String kGeminiEdgeFunction = 'analizar-etiqueta';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Errores de pantalla (Flutter) también quedan registrados para el supervisor
+  FlutterError.onError = (FlutterErrorDetails details) {
+    FlutterError.presentError(details);
+    registrarErrorApp('PANTALLA', details.exception, details.stack);
+  };
 
   ErrorWidget.builder = (FlutterErrorDetails details) {
     return MaterialApp(
@@ -88,6 +93,36 @@ bool _perteneceABodegaActiva(Map<dynamic, dynamic> fila) {
   return rawBod.toUpperCase() == bodegaActiva.toUpperCase();
 }
 
+/// Guarda en Supabase (wms_log_errores, script 26) un error INESPERADO de la app para que el
+/// supervisor lo vea en el PC. Nunca lanza excepción ni bloquea al operador.
+String _ultimoErrorRegistrado = '';
+DateTime _ultimoErrorEn = DateTime.fromMillisecondsSinceEpoch(0);
+
+void registrarErrorApp(String modulo, Object error, [StackTrace? pila]) {
+  try {
+    final msg = error.toString();
+    if (msg.isEmpty || msg.startsWith('WMS:')) return;   // validaciones normales: no son fallas
+    final ahora = DateTime.now();
+    if (msg == _ultimoErrorRegistrado && ahora.difference(_ultimoErrorEn).inSeconds < 60) return;
+    _ultimoErrorRegistrado = msg;
+    _ultimoErrorEn = ahora;
+    final detalle = pila?.toString() ?? '';
+    () async {
+      try {
+        await supabase.rpc('wms_registrar_error', params: {
+          'p_origen': 'RF',
+          'p_modulo': modulo,
+          'p_mensaje': msg.length > 500 ? msg.substring(0, 500) : msg,
+          'p_detalle': detalle.length > 3000 ? detalle.substring(0, 3000) : detalle,
+          'p_version': kVersionApp,
+          'p_usuario': (usuarioActivo?['usuario'] ?? '').toString(),
+          'p_bodega': bodegaActiva,
+        });
+      } catch (_) {}
+    }();
+  } catch (_) {}
+}
+
 Future<Session?> asegurarSesionSupabase() async {
   var sesion = supabase.auth.currentSession;
   if (sesion == null) {
@@ -107,7 +142,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.1';
+const String kVersionApp = '2026.11.20.2';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1816,6 +1851,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
       });
       return 'Su sesión venció. Vuelva a ingresar su usuario y contraseña.';
+    }
+    if (!m.startsWith('WMS:')) {
+      const nombres = {0: 'RECEPCION', 1: 'ALMACENAMIENTO', 2: 'REABASTECIMIENTO', 3: 'STOCK_CONTEO', 4: 'MAESTRA',
+                       5: 'PICKING_FARMACIA', 6: 'VACIAS', 7: 'CICLICO_SKU', 8: 'PACKING', 9: 'PICKING', 10: 'TRASLADOS_CCP',
+                       11: 'CONSULTA_STOCK'};
+      registrarErrorApp(_mostrarMenuCentral ? 'MENU' : (nombres[_tabActual] ?? 'MODULO_$_tabActual'), m);
     }
     return m.replaceFirst(RegExp(r'^WMS:\s*'), '');
   }
