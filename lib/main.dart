@@ -100,29 +100,66 @@ bool _perteneceABodegaActiva(Map<dynamic, dynamic> fila) {
 String _ultimoErrorRegistrado = '';
 DateTime _ultimoErrorEn = DateTime.fromMillisecondsSinceEpoch(0);
 
+/// Errores que no se pudieron enviar (sin señal): se reintentan con el siguiente envío.
+final List<Map<String, dynamic>> _erroresPendientesEnvio = [];
+
+/// true si el error es de conexión (sin WiFi / señal, servidor inalcanzable o tiempo agotado),
+/// no una falla del programa.
+bool esErrorDeConexion(Object e) {
+  final m = e.toString().toLowerCase();
+  return m.contains('failed to fetch') || m.contains('clientexception') || m.contains('socketexception') ||
+      m.contains('xmlhttprequest error') || m.contains('timeoutexception') || m.contains('connection closed') ||
+      m.contains('connection refused') || m.contains('network is unreachable') || m.contains('failed host lookup');
+}
+
 void registrarErrorApp(String modulo, Object error, [StackTrace? pila]) {
   try {
-    final msg = error.toString();
+    var msg = error.toString();
     if (msg.isEmpty || msg.startsWith('WMS:')) return;   // validaciones normales: no son fallas
+    if (esErrorDeConexion(error) && !msg.startsWith('SIN CONEXIÓN')) msg = 'SIN CONEXIÓN · $msg';
     final ahora = DateTime.now();
     if (msg == _ultimoErrorRegistrado && ahora.difference(_ultimoErrorEn).inSeconds < 60) return;
     _ultimoErrorRegistrado = msg;
     _ultimoErrorEn = ahora;
     final detalle = pila?.toString() ?? '';
+    final hora = ahora.toUtc().toIso8601String();
+    _erroresPendientesEnvio.add({
+      'p_origen': 'RF',
+      'p_modulo': modulo,
+      'p_mensaje': msg.length > 500 ? msg.substring(0, 500) : msg,
+      'p_detalle': '${detalle.length > 3000 ? detalle.substring(0, 3000) : detalle}\nOcurrió (UTC): $hora',
+      'p_version': kVersionApp,
+      'p_usuario': (usuarioActivo?['usuario'] ?? '').toString(),
+      'p_bodega': bodegaActiva,
+    });
+    while (_erroresPendientesEnvio.length > 20) {
+      _erroresPendientesEnvio.removeAt(0);
+    }
     () async {
-      try {
-        await supabase.rpc('wms_registrar_error', params: {
-          'p_origen': 'RF',
-          'p_modulo': modulo,
-          'p_mensaje': msg.length > 500 ? msg.substring(0, 500) : msg,
-          'p_detalle': detalle.length > 3000 ? detalle.substring(0, 3000) : detalle,
-          'p_version': kVersionApp,
-          'p_usuario': (usuarioActivo?['usuario'] ?? '').toString(),
-          'p_bodega': bodegaActiva,
-        });
-      } catch (_) {}
+      // Envía la cola en orden; si no hay señal, queda guardada para el próximo intento
+      while (_erroresPendientesEnvio.isNotEmpty) {
+        final p = _erroresPendientesEnvio.first;
+        try {
+          await supabase.rpc('wms_registrar_error', params: p);
+          _erroresPendientesEnvio.remove(p);
+        } catch (_) {
+          break;
+        }
+      }
     }();
   } catch (_) {}
+}
+
+/// Llamada de SOLO LECTURA con un reintento si falla la conexión (la señal WiFi se corta un instante).
+/// No usar para guardar: un reintento podría duplicar un movimiento.
+Future<dynamic> rpcLectura(String funcion, Map<String, dynamic> params) async {
+  try {
+    return await (() async => await supabase.rpc(funcion, params: params))().timeout(const Duration(seconds: 20));
+  } catch (e) {
+    if (!esErrorDeConexion(e)) rethrow;
+    await Future.delayed(const Duration(milliseconds: 1500));
+    return await (() async => await supabase.rpc(funcion, params: params))().timeout(const Duration(seconds: 25));
+  }
 }
 
 Future<Session?> asegurarSesionSupabase() async {
@@ -144,7 +181,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.8';
+const String kVersionApp = '2026.11.20.9';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1415,7 +1452,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       setState(() => _hayVersionNueva = versionDesactualizada(minima));
     }
     try {
-      final res = await supabase.rpc('wms_tareas_conteo', params: {
+      final res = await rpcLectura('wms_tareas_conteo', {
         'p_bodega': bodegaActiva,
         'p_usuario': _usuarioRf(),
         'p_solo_abiertas': true,
@@ -2076,6 +2113,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
       });
       return 'Su sesión venció. Vuelva a ingresar su usuario y contraseña.';
+    }
+    if (esErrorDeConexion(e)) {
+      registrarErrorApp(_nombreModuloActual(), m);
+      return 'Sin conexión con el servidor (se cortó la señal WiFi o internet). '
+          'Revise la señal y vuelva a intentar.';
     }
     if (!m.startsWith('WMS:')) {
       registrarErrorApp(_nombreModuloActual(), m);
@@ -3681,7 +3723,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
         // Ubicación de picking asignada a cada SKU (la lista dirige al operador ahí)
         try {
-          final fijas = await supabase.rpc('wms_picking_fijo_skus', params: {
+          final fijas = await rpcLectura('wms_picking_fijo_skus', {
             'p_bodega': bodegaActiva,
             'p_skus': lineasCargadas.map((l) => (l as Map)['sku'].toString()).toSet().toList(),
           });
@@ -4467,7 +4509,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _ordenesEnMesa = [];
     });
     try {
-      final res = await supabase.rpc('wms_ordenes_en_mesa', params: {'p_bodega': bodegaActiva, 'p_mesa': mesa});
+      final res = await rpcLectura('wms_ordenes_en_mesa', {'p_bodega': bodegaActiva, 'p_mesa': mesa});
       final lista = List<Map<String, dynamic>>.from((res as List).map((e) => Map<String, dynamic>.from(e as Map)));
       if (!mounted) return;
       setState(() => _ordenesEnMesa = lista);
@@ -7796,7 +7838,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     try {
       // El servidor decide si el LPN está en andén, en rack, repartido o ya consumido
-      final dynamic res = await supabase.rpc('wms_consultar_lpn', params: {'p_bodega': bodegaActiva, 'p_lpn': lpn});
+      final dynamic res = await rpcLectura('wms_consultar_lpn', {'p_bodega': bodegaActiva, 'p_lpn': lpn});
       final info = Map<String, dynamic>.from(res as Map);
       final estado = (info['estado'] ?? '').toString();
       if (estado != 'EN_RACK' && estado != 'EN_ANDEN') {
@@ -7837,7 +7879,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   /// Almacenamiento dirigido: dónde dejar el pallet según la ubicación de picking de su SKU.
   Future<void> _cargarSugerenciasPutaway(String lpn) async {
     try {
-      final res = await supabase.rpc('wms_sugerir_ubicacion_lpn', params: {'p_bodega': bodegaActiva, 'p_lpn': lpn});
+      final res = await rpcLectura('wms_sugerir_ubicacion_lpn', {'p_bodega': bodegaActiva, 'p_lpn': lpn});
       final lista = List<Map<String, dynamic>>.from((res as List).map((e) => Map<String, dynamic>.from(e as Map)));
       if (!mounted) return;
       setState(() => _sugerenciasPutaway = lista);
@@ -7854,8 +7896,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   Future<void> _cargarMisAlmacenamientos() async {
     setState(() => _cargandoMisAlm = true);
     try {
-      final res = await supabase.rpc('wms_mis_almacenamientos',
-          params: {'p_bodega': bodegaActiva, 'p_usuario': _usuarioRf(), 'p_horas': 24});
+      final res = await rpcLectura('wms_mis_almacenamientos', {'p_bodega': bodegaActiva, 'p_usuario': _usuarioRf(), 'p_horas': 24});
       final lista = List<Map<String, dynamic>>.from((res as List).map((e) => Map<String, dynamic>.from(e as Map)));
       if (mounted) setState(() => _misAlmacenamientos = lista);
     } catch (e) {
@@ -8040,7 +8081,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   Future<void> _verMisReportes() async {
     List lista = [];
     try {
-      final r = await supabase.rpc('wms_mis_tickets', params: {'p_usuario': _usuarioRf()});
+      final r = await rpcLectura('wms_mis_tickets', {'p_usuario': _usuarioRf()});
       if (r is List) lista = r;
     } catch (e) {
       _notificar('No se pudieron leer sus reportes: ${_mensajeError(e)}', color: Colors.red);
@@ -8126,7 +8167,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     if (gs1.isNotEmpty && gs1['gtin'] != null) q = gs1['gtin'].toString().toUpperCase();
     setState(() { _buscandoStockOp = true; _ultimaConsultaStockOp = q; });
     try {
-      final res = await supabase.rpc('wms_consulta_stock_operador', params: {'p_bodega': bodegaActiva, 'p_texto': q});
+      final res = await rpcLectura('wms_consulta_stock_operador', {'p_bodega': bodegaActiva, 'p_texto': q});
       final m = Map<String, dynamic>.from(res as Map);
       final lista = ((m['skus'] as List?) ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
       if (mounted) setState(() => _resConsultaStockOp = lista);
@@ -8381,7 +8422,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   Future<void> _verificarPermisoDepurar() async {
     try {
-      final res = await supabase.rpc('wms_puede_depurar_stock', params: {'p_usuario': _usuarioRf()});
+      final res = await rpcLectura('wms_puede_depurar_stock', {'p_usuario': _usuarioRf()});
       if (mounted) setState(() => _puedeDepurarStock = res == true);
     } catch (_) {
       if (mounted) setState(() => _puedeDepurarStock = false);
@@ -8607,7 +8648,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .eq('sku', skuBuscar);
 
       try {
-        final fija = await supabase.rpc('wms_picking_fijo_sku', params: {'p_bodega': bodegaActiva, 'p_sku': skuBuscar});
+        final fija = await rpcLectura('wms_picking_fijo_sku', {'p_bodega': bodegaActiva, 'p_sku': skuBuscar});
         _pickingFijoSku = (fija == null || fija.toString().trim().isEmpty) ? null : fija.toString().trim().toUpperCase();
       } catch (_) {
         _pickingFijoSku = null;
@@ -8913,7 +8954,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     if (!_esBodegaConcepcion) return;
     setState(() => _cargandoTraslados = true);
     try {
-      final res = await supabase.rpc('wms_traslados_ccp', params: {'p_solo_abiertos': true});
+      final res = await rpcLectura('wms_traslados_ccp', {'p_solo_abiertos': true});
       final lista = List<Map<String, dynamic>>.from((res as List).map((e) => Map<String, dynamic>.from(e as Map)));
       if (mounted) setState(() => _trasladosCcp = lista);
     } catch (e) {
@@ -8926,7 +8967,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   Future<void> _abrirTrasladoCcp(int ordenId) async {
     setState(() => _cargandoTraslados = true);
     try {
-      final res = await supabase.rpc('wms_traslado_ccp_detalle', params: {'p_orden_id': ordenId});
+      final res = await rpcLectura('wms_traslado_ccp_detalle', {'p_orden_id': ordenId});
       if (!mounted) return;
       setState(() {
         _trasladoActivo = Map<String, dynamic>.from(res as Map);
