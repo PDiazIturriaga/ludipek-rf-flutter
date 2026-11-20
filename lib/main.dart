@@ -144,7 +144,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.6';
+const String kVersionApp = '2026.11.20.8';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1239,7 +1239,7 @@ class _LoginScreenLudipekState extends State<LoginScreenLudipek> {
       try {
         await asegurarSesionSupabase();
         res = await supabase.rpc('wms_iniciar_sesion',
-            params: {'p_usuario': user, 'p_password': pass, 'p_dispositivo': 'RF $_bodegaSeleccionada'});
+            params: {'p_usuario': user, 'p_password': pass, 'p_dispositivo': 'RF $_bodegaSeleccionada · v$kVersionApp'});
       } catch (e) {
         debugPrint('Sesión verificada no disponible, login clásico: $e');
         res = await supabase.rpc('wms_login', params: {'p_usuario': user, 'p_password': pass});
@@ -1928,9 +1928,31 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         .toSet();
     // Sin permisos configurados se mantiene el acceso completo (mismo criterio que el PC).
     if (permisos.isEmpty) return true;
+    // Permisos nuevos (uno por módulo, script 31): si el usuario ya los tiene, mandan ellos
+    if (permisos.any((p) => p.startsWith('APP_'))) {
+      final codigo = _permisoAppPorModulo[idx];
+      return codigo == null || permisos.contains(codigo);
+    }
     final requeridos = _permisosRfPorModulo[idx] ?? const <String>[];
     return requeridos.isEmpty || requeridos.any(permisos.contains);
   }
+
+  /// Un permiso por módulo de la app. Al crear un módulo nuevo: agregarlo aquí y en
+  /// la tabla wms_modulos_app (script 31) para que aparezca en los permisos del PC.
+  static const Map<int, String> _permisoAppPorModulo = {
+    0: 'APP_RECEPCION',
+    1: 'APP_ALMACENAMIENTO',
+    2: 'APP_REABASTECIMIENTO',
+    3: 'APP_STOCK_CONTEO',
+    4: 'APP_MAESTRA',
+    5: 'APP_PICKING_FARMACIA',
+    6: 'APP_VACIAS',
+    7: 'APP_CICLICO_SKU',
+    8: 'APP_PACKING',
+    9: 'APP_PICKING',
+    10: 'APP_TRASLADOS',
+    11: 'APP_CONSULTA_STOCK',
+  };
 
   bool _ovActivaEsFarmacia() {
     final ov = _ovCabeceraActiva;
@@ -2035,6 +2057,13 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   /// Mensaje legible de un error de Supabase (las funciones wms_* responden "WMS: ...").
   bool _saliendoPorSesion = false;
 
+  String _nombreModuloActual() {
+    const nombres = {0: 'RECEPCION', 1: 'ALMACENAMIENTO', 2: 'REABASTECIMIENTO', 3: 'STOCK_CONTEO', 4: 'MAESTRA',
+                     5: 'PICKING_FARMACIA', 6: 'VACIAS', 7: 'CICLICO_SKU', 8: 'PACKING', 9: 'PICKING', 10: 'TRASLADOS_CCP',
+                     11: 'CONSULTA_STOCK'};
+    return _mostrarMenuCentral ? 'MENU' : (nombres[_tabActual] ?? 'MODULO_$_tabActual');
+  }
+
   String _mensajeError(Object e) {
     final m = e is PostgrestException ? e.message : e.toString();
     // La sesión del turno venció (o el supervisor la cerró): volver a pedir la contraseña
@@ -2049,10 +2078,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return 'Su sesión venció. Vuelva a ingresar su usuario y contraseña.';
     }
     if (!m.startsWith('WMS:')) {
-      const nombres = {0: 'RECEPCION', 1: 'ALMACENAMIENTO', 2: 'REABASTECIMIENTO', 3: 'STOCK_CONTEO', 4: 'MAESTRA',
-                       5: 'PICKING_FARMACIA', 6: 'VACIAS', 7: 'CICLICO_SKU', 8: 'PACKING', 9: 'PICKING', 10: 'TRASLADOS_CCP',
-                       11: 'CONSULTA_STOCK'};
-      registrarErrorApp(_mostrarMenuCentral ? 'MENU' : (nombres[_tabActual] ?? 'MODULO_$_tabActual'), m);
+      registrarErrorApp(_nombreModuloActual(), m);
     }
     return m.replaceFirst(RegExp(r'^WMS:\s*'), '');
   }
@@ -2857,7 +2883,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         _notificar('El SKU $skuBuscar no registra ubicaciones con stock en $bodegaActiva.', color: Colors.orange);
       }
     } catch (e) {
-      _notificar('Error buscando ubicaciones del SKU: $e', color: Colors.red);
+      _notificar('Error buscando ubicaciones del SKU: ${_mensajeError(e)}', color: Colors.red);
     } finally {
       if (mounted) setState(() => _buscandoSkuDirigido = false);
     }
@@ -3541,7 +3567,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _ovCabeceraActiva = elegida;
       await _seleccionarOvFarmacia(elegida['id'].toString());
     } catch (e) {
-      _notificar('Error buscando OV: $e', color: Colors.red);
+      _notificar('Error buscando OV: ${_mensajeError(e)}', color: Colors.red);
       if (mounted) setState(() => _cargandoOv = false);
     }
   }
@@ -3672,7 +3698,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         });
       }
     } catch (e) {
-      _notificar('Error cargando detalle OV: $e', color: Colors.red);
+      _notificar('Error cargando detalle OV: ${_mensajeError(e)}', color: Colors.red);
     } finally {
       if (mounted) setState(() => _cargandoOv = false);
     }
@@ -4039,7 +4065,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       // Cargar la siguiente OV asignada al operador (o avisar que la cola terminó)
       await _cargarOvAsignadaAutomaticamente(modoFarmacia: esModoFarmacia, mostrarAlertaFin: true);
     } catch (e) {
-      _notificar('Error cerrando picking: $e', color: Colors.red);
+      _notificar('Error cerrando picking: ${_mensajeError(e)}', color: Colors.red);
     } finally {
       if (mounted) setState(() => _finalizandoPicking = false);
     }
@@ -4576,7 +4602,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         setState(() { _pasoPackingLpn = _packingEsTraslado ? 1 : 3; _txtLpnConsolidadoPack.clear(); });
       }
     } catch (e) {
-      _notificar('Error buscando orden: $e', color: Colors.red);
+      _notificar('Error buscando orden: ${_mensajeError(e)}', color: Colors.red);
       setState(() => _cargandoAuditoriaPack = false);
     }
   }
@@ -4631,7 +4657,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       if (id != null) _packingDraftId = id;
       return _packingDraftId != null;
     } catch (e) {
-      _notificar('No se pudo guardar el pallet en Supabase: $e', color: Colors.red);
+      _notificar('No se pudo guardar el pallet en Supabase: ${_mensajeError(e)}', color: Colors.red);
       return false;
     } finally {
       if (mounted) setState(() => _sincronizandoPacking = false);
@@ -4689,7 +4715,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       });
       _notificar('Packing recuperado: ${porLpn.length} LPN cargados desde Supabase.', color: const Color(0xFF047857));
     } catch (e) {
-      _notificar('No se pudieron recuperar los LPN guardados: $e', color: Colors.orange);
+      _notificar('No se pudieron recuperar los LPN guardados: ${_mensajeError(e)}', color: Colors.orange);
     }
   }
 
@@ -4810,7 +4836,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final numeroOvCarga = (_ovPackingCabeceraActiva?['numero_ov'] ?? _txtBuscarOvPacking.text).toString().toUpperCase();
       await _restaurarPalletsPackingDesdeSupabase(idNum, numeroOvCarga);
     } catch (e) {
-      _notificar('Error cargando orden para Packing: $e', color: Colors.red);
+      _notificar('Error cargando orden para Packing: ${_mensajeError(e)}', color: Colors.red);
     } finally {
       if (mounted) setState(() => _cargandoAuditoriaPack = false);
     }
@@ -6081,7 +6107,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         totalBultos: bultos,
       );
     } catch (e) {
-      _notificar('Packing cerrado, pero no se pudieron imprimir las etiquetas: $e', color: Colors.orange);
+      _notificar('Packing cerrado, pero no se pudieron imprimir las etiquetas: ${_mensajeError(e)}', color: Colors.orange);
     }
 
     _notificar(
@@ -7276,7 +7302,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _recalcularUnidadesEnVivo();
       _notificar('Etiqueta procesada con Visión IA.', color: const Color(0xFF047857));
     } catch (ex) {
-      _notificar('Error en Visión IA: $ex', color: const Color(0xFFDC2626));
+      _notificar('Error en Visión IA: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
     }
   }
 
@@ -7353,7 +7379,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         }
       });
     } catch (ex) {
-      _notificar('Error cargando ASNs: $ex', color: const Color(0xFFDC2626));
+      _notificar('Error cargando ASNs: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
     }
   }
 
@@ -7398,7 +7424,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         _resumenAsn = 'Embarque activo: ${_lineasAsnActual.length} SKUs registrados.';
       });
     } catch (ex) {
-      _notificar('Error leyendo ASN: $ex', color: const Color(0xFFDC2626));
+      _notificar('Error leyendo ASN: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
     }
   }
 
@@ -7929,6 +7955,166 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     } catch (e) {
       _notificar('No se pudo enviar el reporte: ${_mensajeError(e)}', color: Colors.red);
     }
+  }
+
+  // ---------------- REPORTAR UN PROBLEMA DE LA APP (llega al módulo Desarrollador del PC) ----------------
+  Future<void> _dialogoReportarProblemaApp() async {
+    const tipos = {
+      'PROBLEMA': 'Algo no funciona',
+      'ERROR': 'Apareció un mensaje de error',
+      'MEJORA': 'Sugerencia de mejora',
+      'CONSULTA': 'Consulta / duda',
+    };
+    final modulo = _nombreModuloActual();
+    final txtTitulo = TextEditingController();
+    final txtDetalle = TextEditingController();
+    String tipo = 'PROBLEMA';
+    bool bloquea = false;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        title: const Row(children: [
+          Icon(Icons.bug_report_outlined, color: Color(0xFFB91C1C)),
+          SizedBox(width: 8),
+          Expanded(child: Text('Reportar un problema', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16))),
+        ]),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Pantalla: $modulo · versión $kVersionApp', style: const TextStyle(fontSize: 11.5, color: Color(0xFF64748B))),
+          const SizedBox(height: 10),
+          DropdownButtonFormField<String>(
+            value: tipo, isExpanded: true,
+            decoration: const InputDecoration(labelText: '¿Qué quiere reportar?'),
+            items: tipos.entries.map((t) => DropdownMenuItem(value: t.key, child: Text(t.value))).toList(),
+            onChanged: (v) => setD(() => tipo = v ?? 'PROBLEMA'),
+          ),
+          const SizedBox(height: 8),
+          TextField(controller: txtTitulo, maxLength: 120,
+              decoration: const InputDecoration(labelText: 'En pocas palabras, ¿qué pasó? *', isDense: true)),
+          TextField(controller: txtDetalle, maxLines: 4,
+              decoration: const InputDecoration(labelText: 'Detalle: qué hacía, qué esperaba, LPN / OV / OC',
+                  isDense: true)),
+          const SizedBox(height: 4),
+          CheckboxListTile(
+            value: bloquea, contentPadding: EdgeInsets.zero, dense: true,
+            controlAffinity: ListTileControlAffinity.leading,
+            title: const Text('Me impide seguir trabajando', style: TextStyle(fontSize: 13)),
+            onChanged: (v) => setD(() => bloquea = v ?? false),
+          ),
+          const Text('Si apareció un mensaje de error, ya quedó registrado solo; cuente lo que estaba haciendo.',
+              style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFB91C1C), foregroundColor: Colors.white),
+            icon: const Icon(Icons.send_rounded),
+            label: const Text('ENVIAR'),
+            onPressed: () {
+              if (txtTitulo.text.trim().length < 4) {
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                    const SnackBar(content: Text('Escriba en pocas palabras qué pasó.'), backgroundColor: Colors.orange));
+                return;
+              }
+              Navigator.pop(ctx, true);
+            },
+          ),
+        ],
+      )),
+    );
+    if (ok != true) return;
+    try {
+      final r = await supabase.rpc('wms_reportar_problema', params: {
+        'p_origen': 'RF', 'p_modulo': modulo, 'p_tipo': tipo,
+        'p_titulo': txtTitulo.text.trim(), 'p_descripcion': txtDetalle.text.trim(),
+        'p_usuario': _usuarioRf(), 'p_bodega': bodegaActiva, 'p_version': kVersionApp,
+        'p_dispositivo': 'RF $bodegaActiva', 'p_prioridad': bloquea ? 'ALTA' : 'MEDIA',
+      });
+      final id = (r is Map) ? r['id'] : null;
+      _notificar('Reporte${id != null ? ' #$id' : ''} enviado. Vea su estado en Menú › Mis reportes.',
+          color: const Color(0xFF047857));
+    } catch (e) {
+      _notificar('No se pudo enviar el reporte: ${_mensajeError(e)}', color: Colors.red);
+    }
+  }
+
+  Future<void> _verMisReportes() async {
+    List lista = [];
+    try {
+      final r = await supabase.rpc('wms_mis_tickets', params: {'p_usuario': _usuarioRf()});
+      if (r is List) lista = r;
+    } catch (e) {
+      _notificar('No se pudieron leer sus reportes: ${_mensajeError(e)}', color: Colors.red);
+      return;
+    }
+    if (!mounted) return;
+    const estados = {
+      'NUEVO': ['Recibido', Color(0xFFB45309)],
+      'EN_REVISION': ['En revisión', Color(0xFFB45309)],
+      'EN_DESARROLLO': ['En desarrollo', Color(0xFF1D4ED8)],
+      'RESUELTO': ['Resuelto', Color(0xFF047857)],
+      'DESCARTADO': ['Cerrado', Color(0xFF64748B)],
+    };
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(child: SizedBox(
+        height: MediaQuery.of(ctx).size.height * 0.75,
+        child: Column(children: [
+          ListTile(
+            leading: const Icon(Icons.list_alt_rounded),
+            title: const Text('Mis reportes', style: TextStyle(fontWeight: FontWeight.w900)),
+            trailing: TextButton.icon(
+              icon: const Icon(Icons.add_rounded), label: const Text('NUEVO'),
+              onPressed: () {
+                Navigator.pop(ctx);
+                _dialogoReportarProblemaApp();
+              },
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(child: lista.isEmpty
+              ? const Center(child: Text('Aún no ha enviado reportes.', style: TextStyle(color: Colors.grey)))
+              : ListView.separated(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: lista.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 8),
+                  itemBuilder: (_, i) {
+                    final t = Map<String, dynamic>.from(lista[i] as Map);
+                    final est = estados[t['estado']] ?? [t['estado'].toString(), Colors.grey];
+                    final coms = (t['comentarios'] is List) ? t['comentarios'] as List : const [];
+                    return Card(child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Row(children: [
+                          Expanded(child: Text('#${t['id']} · ${t['titulo']}',
+                              style: const TextStyle(fontWeight: FontWeight.bold))),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                            decoration: BoxDecoration(
+                                color: (est[1] as Color).withOpacity(0.12), borderRadius: BorderRadius.circular(6)),
+                            child: Text(est[0] as String,
+                                style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: est[1] as Color)),
+                          ),
+                        ]),
+                        const SizedBox(height: 4),
+                        Text('${t['modulo'] ?? '-'} · ${t['creado'] ?? ''}',
+                            style: const TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+                        if ((t['respuesta'] ?? '').toString().isNotEmpty) ...[
+                          const SizedBox(height: 6),
+                          Text('Respuesta: ${t['respuesta']}', style: const TextStyle(fontSize: 13)),
+                        ],
+                        ...coms.map((c) => Padding(
+                              padding: const EdgeInsets.only(top: 4),
+                              child: Text('${(c as Map)['fecha'] ?? ''} · ${c['usuario'] ?? ''}: ${c['texto'] ?? ''}',
+                                  style: const TextStyle(fontSize: 12, color: Color(0xFF475569))),
+                            )),
+                      ]),
+                    ));
+                  },
+                )),
+        ]),
+      )),
+    );
   }
 
   // ---------------- MÓDULO 11 · CONSULTA DE STOCK (solo lectura) ----------------
@@ -8481,7 +8667,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         _mensajeEstadoFefo = 'FEFO ($bodegaActiva): ${disponibles.length} ubicación(es) de reserva para $skuBuscar. $enPickingTxt';
       });
     } catch (ex) {
-      _notificar('Error consultando FEFO: $ex', color: const Color(0xFFDC2626));
+      _notificar('Error consultando FEFO: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
     } finally {
       if (mounted) setState(() => _buscandoFefo = false);
     }
@@ -10438,7 +10624,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .toList();
       setState(() => _resultadosConsulta = filtrados);
     } catch (ex) {
-      _notificar('Error en consulta: $ex', color: const Color(0xFFDC2626));
+      _notificar('Error en consulta: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
     }
   }
   Widget _construirVistaConsulta() {
@@ -10845,7 +11031,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                       });
                       final mantener = await _preguntarMantenerDatos(tituloMovimiento: 'SKU $sku Guardado en Maestra', detalleMovimiento: 'Marca: ${_txtMMarca.text} | Múltiplo: x${_txtMMult.text}', camposQueSeMantienen: 'Marca, Múltiplo y base de Descripción');
                       setState(() { _txtMSku.clear(); _txtMEan.clear(); if (!mantener) { _txtMDesc.clear(); _txtMMarca.text = 'ESTANDAR'; _txtMMult.text = '1'; } });
-                    } catch (ex) { _notificar('Error guardando en Maestra: $ex', color: const Color(0xFFDC2626)); }
+                    } catch (ex) { _notificar('Error guardando en Maestra: ${_mensajeError(ex)}', color: const Color(0xFFDC2626)); }
                   }, icon: const Icon(Icons.save_outlined), label: const Text('GUARDAR EN MAESTRA SKU'))),
             ],
           ),
@@ -11019,6 +11205,24 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             leading: const Icon(Icons.check_box_outline_blank_rounded, color: Color(0xFF334155)),
             title: const Text('Ubicaciones Vacías', style: TextStyle(fontWeight: FontWeight.bold)),
             onTap: () => _abrirModulo(6, desdeDrawer: true),
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.bug_report_outlined, color: Color(0xFFB91C1C)),
+            title: const Text('Reportar un problema de la app', style: TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: const Text('Algo no funciona, un error o una idea', style: TextStyle(fontSize: 11)),
+            onTap: () {
+              Navigator.pop(context);
+              _dialogoReportarProblemaApp();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.list_alt_rounded, color: Color(0xFF475569)),
+            title: const Text('Mis reportes'),
+            onTap: () {
+              Navigator.pop(context);
+              _verMisReportes();
+            },
           ),
           const Divider(),
           SwitchListTile(
