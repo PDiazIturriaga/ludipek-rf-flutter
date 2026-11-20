@@ -144,7 +144,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.5';
+const String kVersionApp = '2026.11.20.6';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -2115,12 +2115,13 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       // 3. Revisar las ubicaciones marcadas como ocupadas sin inventario aún (ALERTA_VACIA_OCUPADA)
       final Map ocupadasPendientesMap = {};
       try {
-        final resAlertas = await supabase
+        // Todas las alertas (antes solo las últimas 400: las más antiguas volvían a aparecer como vacías)
+        final resAlertas = await leerTodoPaginado((d, h) => supabase
             .from('historial_movimientos')
             .select('id, ubicacion_destino, sku, lote, bodega')
             .eq('tipo_movimiento', 'ALERTA_VACIA_OCUPADA')
             .order('id', ascending: false)
-            .limit(400);
+            .range(d, h));
 
         for (final rawA in (resAlertas as List)) {
           final a = rawA as Map;
