@@ -10,6 +10,8 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:intl/intl.dart';
 import 'package:excel/excel.dart' as excel_lib;
+// Viene incluido con supabase_flutter: guarda el trabajo en curso en el teléfono
+import 'package:shared_preferences/shared_preferences.dart';
 
 // =====================================================================
 // 1. CONFIGURACIÓN DE SUPABASE Y SERVICIO DE VISIÓN IA
@@ -142,7 +144,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.4';
+const String kVersionApp = '2026.11.20.5';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1692,11 +1694,205 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     _cargarAsnsActivos();
     _cargarMaestraUbicaciones();
     _cargarOVsPendientes();
-    _cargarUbicacionesVacias();
+    // Primero se recupera el trabajo en curso guardado en el teléfono y después se cargan las vacías
+    _restaurarBorradores().whenComplete(_cargarUbicacionesVacias);
+  }
+
+  // ===================================================================
+  // TRABAJO EN CURSO GUARDADO EN EL TELÉFONO
+  // Nada se pierde al salir de una pantalla, al bloquear el teléfono, si el navegador recarga la
+  // página o se vuelve a iniciar sesión. Se borra solo al terminar (enviar el reporte) o si el
+  // operador presiona "Descartar".
+  // ===================================================================
+  Timer? _timerBorradores;
+  bool _borradoresListos = false;   // no guardar nada antes de haber restaurado
+
+  String _claveBorrador(String modulo) =>
+      'wms_borrador|${(usuarioActivo?['usuario'] ?? '').toString().toUpperCase()}|$bodegaActiva|$modulo';
+
+  @override
+  void setState(VoidCallback fn) {
+    super.setState(fn);
+    if (_borradoresListos) {
+      _timerBorradores?.cancel();
+      _timerBorradores = Timer(const Duration(milliseconds: 700), _guardarBorradores);
+    }
+  }
+
+  Map<String, dynamic>? _borradorVacias() {
+    if (_vaciasVerificadas.isEmpty && _vaciasConHallazgoRojo.isEmpty) return null;
+    return {
+      'verificadas': _vaciasVerificadas.map((e) => e.toString()).toList(),
+      'rojas': _vaciasConHallazgoRojo.map((e) => e.toString()).toList(),
+      'detalle_rojas': _vaciasOcupadasDetalle.map((k, v) => MapEntry(k.toString(), v.toString())),
+      'pasillo': _pasilloFiltro,
+      'guardado': DateTime.now().toIso8601String(),
+    };
+  }
+
+  Map<String, dynamic>? _borradorCiclicoSku() {
+    if (_skuDirigidoActivo.isEmpty && _estadoAuditoriaPorId.isEmpty && _itemsAuditadosSkuMemoria.isEmpty) return null;
+    return {
+      'sku': _skuDirigidoActivo,
+      'texto': _txtSkuCiclicoDirigido.text,
+      'estados': _estadoAuditoriaPorId.map((k, v) => MapEntry('$k', v)),
+      'items': _itemsAuditadosSkuMemoria.map((k, v) => MapEntry('$k', v)),
+      'filas': _ubicacionesSkuDirigido,
+      'guardado': DateTime.now().toIso8601String(),
+    };
+  }
+
+  Future<void> _guardarBorradores() async {
+    if (!_borradoresListos || usuarioActivo == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final borradores = {'VACIAS': _borradorVacias, 'CICLICO_SKU': _borradorCiclicoSku};
+      for (final e in borradores.entries) {
+        try {   // cada módulo por separado: si uno falla, el otro igual se guarda
+          final datos = e.value();
+          if (datos == null) {
+            await prefs.remove(_claveBorrador(e.key));
+          } else {
+            await prefs.setString(_claveBorrador(e.key), jsonEncode(datos, toEncodable: (o) => o.toString()));
+          }
+        } catch (ex) {
+          debugPrint('Trabajo en curso ${e.key}: $ex');
+        }
+      }
+    } catch (e) {
+      debugPrint('No se pudo guardar el trabajo en curso: $e');
+    }
+  }
+
+  Future<void> _restaurarBorradores() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final rawV = prefs.getString(_claveBorrador('VACIAS'));
+      if (rawV != null) {
+        final v = Map<String, dynamic>.from(jsonDecode(rawV) as Map);
+        _vaciasVerificadas = {...((v['verificadas'] as List?) ?? [])};
+        _vaciasConHallazgoRojo = {...((v['rojas'] as List?) ?? [])};
+        final det = Map<String, dynamic>.from((v['detalle_rojas'] as Map?) ?? {});
+        det.forEach((k, val) => _vaciasOcupadasDetalle[k] = val);
+        _pasilloFiltro = (v['pasillo'] ?? 'TODOS').toString();
+      }
+      final rawS = prefs.getString(_claveBorrador('CICLICO_SKU'));
+      if (rawS != null) {
+        final c = Map<String, dynamic>.from(jsonDecode(rawS) as Map);
+        _skuDirigidoActivo = (c['sku'] ?? '').toString();
+        _txtSkuCiclicoDirigido.text = (c['texto'] ?? _skuDirigidoActivo).toString();
+        _estadoAuditoriaPorId
+          ..clear()
+          ..addAll(Map<String, dynamic>.from((c['estados'] as Map?) ?? {})
+              .map((k, val) => MapEntry(int.tryParse(k) ?? -1, val.toString()))
+            ..remove(-1));
+        _itemsAuditadosSkuMemoria
+          ..clear()
+          ..addAll(Map<String, dynamic>.from((c['items'] as Map?) ?? {})
+              .map((k, val) => MapEntry(int.tryParse(k) ?? -1, Map<String, dynamic>.from(val as Map)))
+            ..remove(-1));
+        _ubicacionesSkuDirigido = List<dynamic>.from((c['filas'] as List?) ?? []);
+      }
+      if (mounted && (rawV != null || rawS != null)) {
+        super.setState(() {});
+        final partes = [
+          if (rawV != null) 'Ubicaciones vacías (${_vaciasVerificadas.length + _vaciasConHallazgoRojo.length} revisadas)',
+          if (rawS != null) 'Conteo por SKU $_skuDirigidoActivo (${_estadoAuditoriaPorId.length} marcadas)',
+        ];
+        _notificar('Se recuperó su trabajo en curso: ${partes.join(' · ')}', color: const Color(0xFF1D4ED8));
+      }
+    } catch (e) {
+      debugPrint('No se pudo recuperar el trabajo en curso: $e');
+    } finally {
+      _borradoresListos = true;
+    }
+  }
+
+  Future<void> _descartarBorrador(String modulo) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_claveBorrador(modulo));
+    } catch (_) {}
+  }
+
+  Future<void> _confirmarDescartar(String nombre, VoidCallback limpiar) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('¿Descartar el trabajo en curso?'),
+        content: Text('Se borrará lo marcado en $nombre. Lo que ya envió no se ve afectado.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('NO')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFB91C1C), foregroundColor: Colors.white),
+            onPressed: () => Navigator.pop(ctx, true), child: const Text('DESCARTAR')),
+        ],
+      ),
+    );
+    if (ok == true && mounted) setState(limpiar);
+  }
+
+  /// Tarjeta en el menú: trabajo sin terminar, con acceso directo
+  Widget? _tarjetaTrabajoEnCurso() {
+    final items = <Widget>[];
+    if (_vaciasVerificadas.isNotEmpty || _vaciasConHallazgoRojo.isNotEmpty) {
+      items.add(ListTile(
+        dense: true, contentPadding: EdgeInsets.zero,
+        leading: const Icon(Icons.grid_off_rounded, color: Color(0xFF0F766E)),
+        title: const Text('Ubicaciones vacías', style: TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Text('${_vaciasVerificadas.length} confirmadas · ${_vaciasConHallazgoRojo.length} ocupadas'
+            '${_pasilloFiltro != 'TODOS' ? ' · pasillo $_pasilloFiltro' : ''}'),
+        trailing: IconButton(
+          tooltip: 'Descartar', icon: const Icon(Icons.delete_outline_rounded, color: Color(0xFF94A3B8)),
+          onPressed: () => _confirmarDescartar('Ubicaciones vacías', () {
+            _vaciasVerificadas.clear();
+            _vaciasConHallazgoRojo.clear();
+            _descartarBorrador('VACIAS');
+          }),
+        ),
+        onTap: () => _abrirModulo(6),
+      ));
+    }
+    if (_skuDirigidoActivo.isNotEmpty || _estadoAuditoriaPorId.isNotEmpty) {
+      items.add(ListTile(
+        dense: true, contentPadding: EdgeInsets.zero,
+        leading: const Icon(Icons.qr_code_scanner_rounded, color: Color(0xFF6D28D9)),
+        title: Text('Conteo por SKU ${_skuDirigidoActivo.isEmpty ? '' : _skuDirigidoActivo}',
+            style: const TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Text('${_estadoAuditoriaPorId.length} de ${_ubicacionesSkuDirigido.length} ubicaciones marcadas'),
+        trailing: IconButton(
+          tooltip: 'Descartar', icon: const Icon(Icons.delete_outline_rounded, color: Color(0xFF94A3B8)),
+          onPressed: () => _confirmarDescartar('el conteo por SKU', () {
+            _estadoAuditoriaPorId.clear();
+            _itemsAuditadosSkuMemoria.clear();
+            _ubicacionesSkuDirigido.clear();
+            _txtSkuCiclicoDirigido.clear();
+            _skuDirigidoActivo = '';
+            _descartarBorrador('CICLICO_SKU');
+          }),
+        ),
+        onTap: () => _abrirModulo(7),
+      ));
+    }
+    if (items.isEmpty) return null;
+    return _TarjetaMovil(
+      borderColor: const Color(0xFF1D4ED8),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Row(children: [
+          Icon(Icons.restore_rounded, color: Color(0xFF1D4ED8)),
+          SizedBox(width: 8),
+          Expanded(child: Text('TRABAJO EN CURSO', style: TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF1E3A8A)))),
+        ]),
+        const Text('Quedó guardado en este teléfono. Toque para continuar.', style: TextStyle(fontSize: 11.5, color: Color(0xFF475569))),
+        ...items,
+      ]),
+    );
   }
 
   @override
   void dispose() {
+    _timerBorradores?.cancel();
+    _guardarBorradores();   // último guardado al cerrar sesión
     _debounceSku?.cancel();
     super.dispose();
   }
@@ -1882,11 +2078,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   String _pasilloFiltro = 'TODOS';
 
   Future _cargarUbicacionesVacias() async {
-    setState(() {
-      _cargandoVacias = true;
-      _vaciasVerificadas.clear();
-      _vaciasConHallazgoRojo.clear();
-    });
+    // Lo ya marcado NO se borra al recargar (solo se quita lo que dejó de estar vacío)
+    setState(() => _cargandoVacias = true);
     try {
       // 1. Traer las ubicaciones maestras de la bodega activa
       final resMaestra = await leerTodoPaginado((d, h) => supabase
@@ -1968,7 +2161,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         setState(() {
           _ubicacionesVacias = vacias;
           _vaciasOcupadasDetalle = ocupadasPendientesMap;
-          _pasilloFiltro = 'TODOS';
+          final setVacias = vacias.map((e) => e.toString()).toSet();
+          _vaciasVerificadas.removeWhere((u) => !setVacias.contains(u.toString()));
+          // las marcadas "ocupada" quedan registradas como alerta: siguen en su lista
+          _vaciasConHallazgoRojo.removeWhere((u) => !ocupadasPendientesMap.containsKey(u));
+          final pasillos = vacias.map((u) => u.toString().split('-').first).toSet();
+          if (_pasilloFiltro != 'TODOS' && !pasillos.contains(_pasilloFiltro)) _pasilloFiltro = 'TODOS';
         });
       }
     } catch (e) {
@@ -2306,6 +2504,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     } catch (_) {
     } finally {
       if (mounted) setState(() => _enviandoReporteVacias = false);
+    }
+    // Lo reportado ya quedó en Supabase: se saca del trabajo en curso
+    if (mounted) {
+      setState(() {
+        final reportadas = listaAuditar.map((e) => e.toString()).toSet();
+        _vaciasVerificadas.removeWhere((u) => reportadas.contains(u.toString()));
+        _vaciasConHallazgoRojo.removeWhere((u) => _pasilloFiltro == 'TODOS' || u.toString().startsWith('$_pasilloFiltro-'));
+      });
     }
     _refrescarTareasConteo();
 
@@ -9210,6 +9416,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   child: const Text('HAY UNA VERSIÓN NUEVA DE LA APP. Termine lo que está haciendo, cierre esta pestaña y vuelva a abrir el enlace.',
                       style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF991B1B))),
                 ),
+              if (_tarjetaTrabajoEnCurso() != null) _tarjetaTrabajoEnCurso()!,
               if (_misTareasConteo.isNotEmpty) _tarjetaMisTareasConteo(),
               ...botones.where((b) => _tienePermisoModulo(b['indice'] as int)).map((b) {
                 final int idx = b['indice'] as int;
