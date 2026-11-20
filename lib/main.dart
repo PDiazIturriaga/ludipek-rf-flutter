@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.10';
+const String kVersionApp = '2026.11.20.11';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1693,7 +1693,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // Picking = nivel 01 de los racks (ej. H-02-01). Merma = ZONA-MERMA y zona de mermas de arena (ME-..).
   List<Map<String, dynamic>> _stockPickingSku = [];
   String? _pickingFijoSku;   // ubicación de picking asignada al SKU buscado (wms_picking_fijo_sku)
-  bool _esUbicacionPicking(String u) => RegExp(r'^[A-Z]-\d{2}-01$').hasMatch(u.trim().toUpperCase());
+  // FARMACIA: zona única de farmacia (script 37), también es ubicación de picking
+  bool _esUbicacionPicking(String u) {
+    final x = u.trim().toUpperCase();
+    return x == 'FARMACIA' || RegExp(r'^[A-Z]-\d{2}-01$').hasMatch(x);
+  }
   bool _esUbicacionMerma(String u) {
     final x = u.trim().toUpperCase();
     return x == 'ZONA-MERMA' || RegExp(r'^ME-\d{2}-\d{2}$').hasMatch(x);
@@ -2050,6 +2054,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   /// "Mesa 3", "MESA-3", "3" -> "MESA 3" (null si no es una mesa válida)
   String? _normalizarMesa(String raw) {
+    if (raw.toUpperCase().contains('FARMA')) return 'MESA FARMACIA';
     final m = RegExp(r'(\d{1,2})').firstMatch(raw.toUpperCase());
     if (m == null) return null;
     final n = int.parse(m.group(1)!);
@@ -4015,11 +4020,19 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       if (seguir != true) return;
     }
 
+    // Pedido de farmacia (-FA, no OT): no pasa por packing. Queda en la MESA FARMACIA y va
+    // directo a facturación (script 37). Las OT de traslado y los pedidos normales sí van a packing.
+    final String numeroOvCierre = ((_ovCabeceraActiva ?? const {})['numero_ov'] ?? _txtBuscarOvPicking.text)
+        .toString().trim().toUpperCase();
+    final bool directoAFacturacion = numeroOvCierre.endsWith('-FA') && !numeroOvCierre.startsWith('OT-');
+
     // El pedido queda físicamente en una mesa de packing: se registra cuál
-    final String? mesaPacking = await _pedirMesaPacking(
-      titulo: '¿En qué mesa deja el pedido?',
-      subtitulo: 'Escanee el QR pegado en la mesa de packing donde dejó la OV.',
-    );
+    final String? mesaPacking = directoAFacturacion
+        ? 'MESA FARMACIA'
+        : await _pedirMesaPacking(
+            titulo: '¿En qué mesa deja el pedido?',
+            subtitulo: 'Escanee el QR pegado en la mesa de packing donde dejó la OV.',
+          );
     if (mesaPacking == null) {
       _notificar('Indique la mesa de packing para cerrar el picking.', color: Colors.orange);
       return;
@@ -4076,19 +4089,36 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           'lotes_pickeados': lotesMap.entries.map((e) => '${e.key} (${e.value} UN)').join(' | '),
         };
       }).toList();
+      bool pasoAFacturacion = false;
       try {
-        await supabase.rpc('wms_cerrar_picking', params: {
-          'p_orden_id': ordenId,
-          'p_lineas': lineasPayload,
-          'p_usuario': _usuarioRf(),
-          'p_mesa': mesaPacking,
-        });
+        if (directoAFacturacion) {
+          try {
+            await supabase.rpc('wms_cerrar_picking_farmacia', params: {
+              'p_orden_id': ordenId,
+              'p_lineas': lineasPayload,
+              'p_usuario': _usuarioRf(),
+            });
+            pasoAFacturacion = true;
+          } on PostgrestException catch (e) {
+            if (e.message.contains('wms_cerrar_picking_farmacia') || e.code == 'PGRST202') {
+              throw 'WMS: falta ejecutar 37_farmacia.sql en Supabase (cierre de farmacia sin packing).';
+            }
+            rethrow;
+          }
+        } else {
+          await supabase.rpc('wms_cerrar_picking', params: {
+            'p_orden_id': ordenId,
+            'p_lineas': lineasPayload,
+            'p_usuario': _usuarioRf(),
+            'p_mesa': mesaPacking,
+          });
+        }
       } catch (e) {
         if (mounted) {
           await showDialog<void>(
             context: context,
             builder: (ctx) => AlertDialog(
-              title: const Text('La OV NO pasó a packing', style: TextStyle(fontWeight: FontWeight.bold)),
+              title: Text(directoAFacturacion ? 'La OV NO se cerró' : 'La OV NO pasó a packing', style: const TextStyle(fontWeight: FontWeight.bold)),
               content: Text('${_mensajeError(e)}\n\nEl stock ya descontado no se vuelve a descontar. '
                   'Revise la conexión y presione FINALIZAR otra vez.'),
               actions: [TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('ENTENDIDO'))],
@@ -4098,7 +4128,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         return;
       }
 
-      _notificar('¡Picking completado! La OV $numeroOv quedó en $mesaPacking para packing.', color: const Color(0xFF047857));
+      _notificar(
+          pasoAFacturacion
+              ? '¡Picking completado! La OV $numeroOv quedó en la MESA FARMACIA y pasó directo a facturación.'
+              : '¡Picking completado! La OV $numeroOv quedó en $mesaPacking para packing.',
+          color: const Color(0xFF047857));
       setState(() {
         _lineasOvFarmacia = [];
         _ovCabeceraActiva = null;
