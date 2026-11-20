@@ -16,8 +16,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 // =====================================================================
 // 1. CONFIGURACIÓN DE SUPABASE Y SERVICIO DE VISIÓN IA
 // =====================================================================
-const String kSupabaseUrl = 'https://kylgmgmwrtncmzcsbxtc.supabase.co';
-const String kSupabaseKey = 'sb_publishable_6gfO-vXxw2aaz3185uQWTg_zOz5rkjV';
+// Producción por defecto. Para publicar la app de PRUEBAS (otro sitio en Render) se compila con:
+//   flutter build web --dart-define=WMS_AMBIENTE=PRUEBAS --dart-define=SUPABASE_URL=https://<pruebas>.supabase.co
+//                     --dart-define=SUPABASE_KEY=<llave pública de pruebas>
+const String kAmbiente = String.fromEnvironment('WMS_AMBIENTE', defaultValue: 'PRODUCCION');
+const bool kEsPruebas = kAmbiente == 'PRUEBAS';
+const String kSupabaseUrl = String.fromEnvironment('SUPABASE_URL', defaultValue: 'https://kylgmgmwrtncmzcsbxtc.supabase.co');
+const String kSupabaseKey = String.fromEnvironment('SUPABASE_KEY', defaultValue: 'sb_publishable_6gfO-vXxw2aaz3185uQWTg_zOz5rkjV');
 const String kGeminiEdgeFunction = 'analizar-etiqueta';
 
 Future<void> main() async {
@@ -181,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.9';
+const String kVersionApp = '2026.11.20.10';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1049,6 +1054,14 @@ class LudipekWmsApp extends StatelessWidget {
               bodyMedium: TextStyle(color: Color(0xFFE2E8F0)),
             ),
           ),
+          builder: (context, child) => kEsPruebas
+              ? Banner(
+                  message: 'PRUEBAS',
+                  location: BannerLocation.topEnd,
+                  color: const Color(0xFFC2410C),
+                  child: child ?? const SizedBox.shrink(),
+                )
+              : (child ?? const SizedBox.shrink()),
           home: const SplashScreenLudipek(),
         );
       },
