@@ -142,7 +142,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.3';
+const String kVersionApp = '2026.11.20.4';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -4837,6 +4837,20 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     return salida;
   }
 
+  /// Solo INABA (Churu) imprime la fecha en formato EE.UU. (MES/DÍA/AÑO); el resto viene DÍA/MES/AÑO.
+  bool _fechaCajaEnFormatoUS(Map linea) => _obtenerPrioridadMarcaPicking(linea) == 1;
+
+  /// Fechas posibles (DD-MM-AAAA) de lo escrito por el operador, según el formato de la marca.
+  /// La lectura de la marca va primero; la invertida queda solo como respaldo.
+  List<String> _fechasCaja(String texto, {required bool formatoUS}) {
+    if (formatoUS) return _fechasCajaUS(texto);
+    final p = texto.split(RegExp(r'[^0-9]+')).where((x) => x.isNotEmpty).toList();
+    final d = texto.replaceAll(RegExp(r'[^0-9]'), '');
+    if (p.length == 3) return _fechasCajaUS('${p[1]}/${p[0]}/${p[2]}');
+    if (d.length == 8 || d.length == 6) return _fechasCajaUS('${d.substring(2, 4)}/${d.substring(0, 2)}/${d.substring(4)}');
+    return [];
+  }
+
   /// Fecha ya normalizada (DD-MM-AAAA, ej. leída por la foto) + su versión con día y mes invertidos.
   List<String> _fechasConAlternativa(String ddmmaaaa) {
     final p = ddmmaaaa.split('-');
@@ -5072,14 +5086,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                   controller: txtFechaCaja,
                   keyboardType: TextInputType.number,
                   inputFormatters: [FechaInputFormatter()],
-                  decoration: const InputDecoration(
-                    labelText: 'O escriba la fecha de la caja (MES/DÍA/AÑO)',
-                    helperText: 'Como viene impresa: 05/27/2028 = 27 de mayo de 2028',
-                    prefixIcon: Icon(Icons.edit_calendar_outlined),
+                  decoration: InputDecoration(
+                    labelText: _fechaCajaEnFormatoUS(linea)
+                        ? 'O escriba la fecha de la caja (MES/DÍA/AÑO · INABA)'
+                        : 'O escriba la fecha de la caja (DÍA/MES/AÑO)',
+                    helperText: _fechaCajaEnFormatoUS(linea)
+                        ? 'INABA/Churu viene en formato EE.UU.: 06.10.2028 = 10 de junio de 2028'
+                        : 'Como viene impresa: 27/05/2028 = 27 de mayo de 2028',
+                    prefixIcon: const Icon(Icons.edit_calendar_outlined),
                   ),
                   onChanged: (v) async {
                     if (v.replaceAll(RegExp(r'[^0-9]'), '').length < 8) return;
-                    await resolverFechas(_fechasCajaUS(v));
+                    await resolverFechas(_fechasCaja(v, formatoUS: _fechaCajaEnFormatoUS(linea)));
                     setStateDialog(() {});
                   },
                 ),
@@ -5546,14 +5564,18 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 controller: txtFechaCaja,
                 keyboardType: TextInputType.number,
                 inputFormatters: [FechaInputFormatter()],
-                decoration: const InputDecoration(
-                  labelText: 'O escriba la fecha de la caja (MES/DÍA/AÑO)',
-                  helperText: 'Como viene impresa: 05/27/2028 = 27 de mayo de 2028',
-                  prefixIcon: Icon(Icons.edit_calendar_outlined),
+                decoration: InputDecoration(
+                  labelText: _fechaCajaEnFormatoUS(linea)
+                      ? 'O escriba la fecha de la caja (MES/DÍA/AÑO · INABA)'
+                      : 'O escriba la fecha de la caja (DÍA/MES/AÑO)',
+                  helperText: _fechaCajaEnFormatoUS(linea)
+                      ? 'INABA/Churu viene en formato EE.UU.: 06.10.2028 = 10 de junio de 2028'
+                      : 'Como viene impresa: 27/05/2028 = 27 de mayo de 2028',
+                  prefixIcon: const Icon(Icons.edit_calendar_outlined),
                 ),
                 onChanged: (v) {
                   if (v.replaceAll(RegExp(r'[^0-9]'), '').length < 8) return;
-                  setD(() => aplicarFechas(_fechasCajaUS(v)));
+                  setD(() => aplicarFechas(_fechasCaja(v, formatoUS: _fechaCajaEnFormatoUS(linea))));
                 },
               ),
               if (avisoFecha.isNotEmpty)
