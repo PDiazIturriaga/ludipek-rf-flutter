@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.20.11';
+const String kVersionApp = '2026.11.21.2';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -2157,6 +2157,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // MÓDULO: UBICACIONES VACÍAS (1 TOQUE = VERDE | DOBLE TOQUE = MENÚ OCUPADA CON DETALLE OPCIONAL)
   // ===================================================================
   List _ubicacionesVacias = [];
+  int _vaciasPickingSinStock = 0;   // ubicaciones de picking sin stock (dato, no se auditan)
   Set _vaciasVerificadas = {}; // 1 Toque: Verde (Realmente vacía)
   Set _vaciasConHallazgoRojo = {}; // Doble Toque: Reportada ocupada
   Map _vaciasOcupadasDetalle = {}; // Ubicación -> Detalle opcional (se limpia sola al ingresar a inventario)
@@ -2241,7 +2242,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         ...ocupadasPendientesMap.keys,
       };
 
-      final List vacias = todas.difference(todasExcluidas).toList();
+      // Las ubicaciones de picking (nivel 01 y FARMACIA) no son espacio para pallets: no se auditan
+      // como vacías; quedan solo como dato.
+      final sinStock = todas.difference(todasExcluidas);
+      final List vacias = sinStock.where((u) => !_esUbicacionPicking(u.toString())).toList();
+      _vaciasPickingSinStock = sinStock.length - vacias.length;
       vacias.sort();
 
       if (mounted) {
@@ -2697,8 +2702,13 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Expanded(
-                    child: Text('AUDITORÍA DE ESPACIOS VACÍOS', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF334155))),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('AUDITORÍA DE ESPACIOS VACÍOS', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF334155))),
+                      if (_vaciasPickingSinStock > 0)
+                        Text('No incluye $_vaciasPickingSinStock ubicaciones de picking sin stock',
+                            style: const TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+                    ]),
                   ),
                   IconButton(
                     tooltip: 'Exportar Excel / PDF',
@@ -3756,6 +3766,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         setState(() {
           _lineasOvFarmacia = lineasCargadas;
         });
+        await _cargarEstadoOt();
       }
     } catch (e) {
       _notificar('Error cargando detalle OV: ${_mensajeError(e)}', color: Colors.red);
@@ -3846,6 +3857,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                     style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
                   ),
                 ),
+                if (esModoFarmacia && _ovActivaEsOt && _otEstado != null) _tarjetaPalletOt(),
               ],
             ],
           ),
@@ -4025,10 +4037,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final String numeroOvCierre = ((_ovCabeceraActiva ?? const {})['numero_ov'] ?? _txtBuscarOvPicking.text)
         .toString().trim().toUpperCase();
     final bool directoAFacturacion = numeroOvCierre.endsWith('-FA') && !numeroOvCierre.startsWith('OT-');
+    // OT a Concepción armada por pallets en el picking (script 38): queda consolidada y en tránsito, sin packing
+    final bool otSinPacking = esModoFarmacia && numeroOvCierre.startsWith('OT-') && _otEstado != null;
+    final String lpnAbiertoAlCerrar = (_otEstado?['lpn_abierto'] ?? '').toString();
 
     // El pedido queda físicamente en una mesa de packing: se registra cuál
     final String? mesaPacking = directoAFacturacion
         ? 'MESA FARMACIA'
+        : otSinPacking
+        ? 'PALLETS'
         : await _pedirMesaPacking(
             titulo: '¿En qué mesa deja el pedido?',
             subtitulo: 'Escanee el QR pegado en la mesa de packing donde dejó la OV.',
@@ -4090,8 +4107,22 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         };
       }).toList();
       bool pasoAFacturacion = false;
+      Map? cierreOt;
       try {
-        if (directoAFacturacion) {
+        if (otSinPacking) {
+          try {
+            cierreOt = await supabase.rpc('wms_cerrar_picking_ot', params: {
+              'p_orden_id': ordenId,
+              'p_lineas': lineasPayload,
+              'p_usuario': _usuarioRf(),
+            }) as Map?;
+          } on PostgrestException catch (e) {
+            if (e.message.contains('wms_cerrar_picking_ot') || e.code == 'PGRST202') {
+              throw 'WMS: falta ejecutar 38_ot_picking_pallets_fotos.sql en Supabase.';
+            }
+            rethrow;
+          }
+        } else if (directoAFacturacion) {
           try {
             await supabase.rpc('wms_cerrar_picking_farmacia', params: {
               'p_orden_id': ordenId,
@@ -4118,7 +4149,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           await showDialog<void>(
             context: context,
             builder: (ctx) => AlertDialog(
-              title: Text(directoAFacturacion ? 'La OV NO se cerró' : 'La OV NO pasó a packing', style: const TextStyle(fontWeight: FontWeight.bold)),
+              title: Text(directoAFacturacion || otSinPacking ? 'La OV NO se cerró' : 'La OV NO pasó a packing', style: const TextStyle(fontWeight: FontWeight.bold)),
               content: Text('${_mensajeError(e)}\n\nEl stock ya descontado no se vuelve a descontar. '
                   'Revise la conexión y presione FINALIZAR otra vez.'),
               actions: [TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('ENTENDIDO'))],
@@ -4128,11 +4159,23 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         return;
       }
 
+      if (cierreOt != null) {
+        final pallets = ((cierreOt['pallets'] as List?) ?? const []).map((p) => p as Map).toList();
+        // Etiqueta del último pallet (los anteriores se imprimieron al cerrarlos)
+        for (final p in pallets.where((p) => p['lpn'] == lpnAbiertoAlCerrar)) {
+          await _imprimirPalletOt(p);
+        }
+        if (mounted) setState(() => _otEstado = null);
+        final lpnsOt = pallets.map((p) => p['lpn']).join(', ');
+        _notificar('¡Picking completado! La $numeroOv quedó consolidada en ${pallets.length} pallet(s) '
+            '($lpnsOt) y en tránsito a Concepción.', color: const Color(0xFF047857));
+      } else {
       _notificar(
           pasoAFacturacion
               ? '¡Picking completado! La OV $numeroOv quedó en la MESA FARMACIA y pasó directo a facturación.'
               : '¡Picking completado! La OV $numeroOv quedó en $mesaPacking para packing.',
           color: const Color(0xFF047857));
+      }
       setState(() {
         _lineasOvFarmacia = [];
         _ovCabeceraActiva = null;
@@ -4214,6 +4257,180 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   void _avisarSoloEscaneo(String sku) {
     _notificar('Escanee el código de barras de $sku para confirmarlo. No se puede confirmar tocando la tarjeta.',
         color: const Color(0xFFB45309));
+  }
+
+  // ---------------- OT A CONCEPCIÓN: PALLET LPN Y FOTO DE LA FECHA EN EL PICKING (script 38) ----------------
+  Map<String, dynamic>? _otEstado;          // {lpn_abierto, pallets:[{lpn, estado, cajas, unidades, lineas}]}
+  bool _otOcupado = false;
+
+  // Solo en el módulo Picking farmacia / OT (índice 5); en otros módulos la OT sigue el flujo anterior
+  bool get _ovActivaEsOt =>
+      _tabActual == 5 &&
+      ((_ovCabeceraActiva ?? const {})['numero_ov'] ?? '').toString().trim().toUpperCase().startsWith('OT-');
+
+  int? get _ordenActivaId => int.tryParse((_ovCabeceraActiva ?? const {})['id']?.toString() ?? _ovSeleccionadaKey ?? '');
+
+  Future<void> _cargarEstadoOt() async {
+    if (!_ovActivaEsOt) {
+      if (_otEstado != null && mounted) setState(() => _otEstado = null);
+      return;
+    }
+    final id = _ordenActivaId;
+    if (id == null) return;
+    try {
+      final r = await supabase.rpc('wms_ot_estado', params: {'p_orden_id': id, 'p_usuario': _usuarioRf()});
+      if (mounted) setState(() => _otEstado = Map<String, dynamic>.from(r as Map));
+    } catch (e) {
+      if (mounted) setState(() => _otEstado = null);
+      final m = e.toString();
+      _notificar(m.contains('wms_ot_estado') && (m.contains('PGRST202') || m.contains('Could not find'))
+          ? 'Falta ejecutar 38_ot_picking_pallets_fotos.sql en Supabase.'
+          : 'No se pudo abrir el pallet de la OT: ${_mensajeError(e)}', color: Colors.red);
+    }
+  }
+
+  Map<String, dynamic>? _palletOt(String? lpn) {
+    for (final p in ((_otEstado?['pallets'] as List?) ?? const [])) {
+      if ((p as Map)['lpn'] == lpn) return Map<String, dynamic>.from(p);
+    }
+    return null;
+  }
+
+  Future<void> _imprimirPalletOt(Map pallet) async {
+    try {
+      await generarPdfContenidoPalletLpn(
+        lpn: pallet['lpn'].toString(),
+        numeroOv: ((_ovCabeceraActiva ?? const {})['numero_ov'] ?? '').toString(),
+        cliente: ((_ovCabeceraActiva ?? const {})['cliente_nombre'] ?? 'BODEGA CONCEPCIÓN').toString(),
+        comuna: 'CONCEPCIÓN',
+        lineas: ((pallet['lineas'] as List?) ?? const []).map((x) => Map<String, dynamic>.from(x as Map)).toList(),
+      );
+    } catch (e) {
+      _notificar('No se pudo imprimir la etiqueta del pallet: ${_mensajeError(e)}', color: Colors.orange);
+    }
+  }
+
+  Future<void> _cerrarPalletOt() async {
+    final id = _ordenActivaId;
+    if (id == null || _otOcupado) return;
+    final lpn = (_otEstado?['lpn_abierto'] ?? '').toString();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('¿Cerrar el pallet $lpn?', style: const TextStyle(fontWeight: FontWeight.bold)),
+        content: const Text('Se imprime su etiqueta de contenido y se abre un pallet nuevo con otro LPN.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('CERRAR PALLET')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _otOcupado = true);
+    try {
+      final r = Map<String, dynamic>.from(await supabase.rpc('wms_ot_cerrar_pallet',
+          params: {'p_orden_id': id, 'p_usuario': _usuarioRf()}) as Map);
+      await _cargarEstadoOt();
+      if (r['pallet'] is Map) await _imprimirPalletOt(r['pallet'] as Map);
+      _notificar('Pallet ${r['lpn_cerrado']} cerrado. Nuevo pallet: ${r['lpn_nuevo']}', color: const Color(0xFF047857));
+    } catch (e) {
+      _notificar('No se cerró el pallet: ${_mensajeError(e)}', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _otOcupado = false);
+    }
+  }
+
+  /// Sube la foto (si hay) y registra la caja en el pallet abierto. Si no se registra, el pick no se suma.
+  Future<bool> _registrarCajaOt(Map linea, String loteVenc, int unidades, Map<String, String>? foto, String? ubicacion) async {
+    final id = _ordenActivaId;
+    if (id == null) return false;
+    final numero = ((_ovCabeceraActiva ?? const {})['numero_ov'] ?? 'OT').toString().toUpperCase().replaceAll(RegExp(r'[^A-Z0-9-]'), '');
+    final partes = loteVenc.split(' / ');
+    final lote = partes.first.trim().isEmpty ? 'S/L' : partes.first.trim().toUpperCase();
+    final venc = partes.length > 1 ? partes.sublist(1).join(' / ').trim() : '';
+    String? ruta;
+    if (foto != null && (foto['b64'] ?? '').isNotEmpty) {
+      try {
+        ruta = '$numero/${linea['id_detalle']}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+        await supabase.storage.from('fotos-picking').uploadBinary(
+              ruta,
+              base64Decode(foto['b64']!),
+              fileOptions: const FileOptions(contentType: 'image/jpeg'),
+            );
+      } catch (e) {
+        ruta = null;
+        _notificar('La foto no se pudo guardar (se registra la caja igual): ${_mensajeError(e)}', color: Colors.orange);
+      }
+    }
+    try {
+      await supabase.rpc('wms_ot_registrar_caja', params: {
+        'p_orden_id': id,
+        'p_id_detalle': (linea['id_detalle'] as num).toInt(),
+        'p_lote': lote,
+        'p_vencimiento': venc.isEmpty ? null : venc,
+        'p_unidades': unidades,
+        'p_fecha_leida': foto?['venc'],
+        'p_foto_path': ruta,
+        'p_ubicacion': ubicacion,
+        'p_usuario': _usuarioRf(),
+      });
+      await _cargarEstadoOt();
+      return true;
+    } catch (e) {
+      _notificar('La caja NO se registró en el pallet: ${_mensajeError(e)}', color: Colors.red);
+      return false;
+    }
+  }
+
+  Widget _tarjetaPalletOt() {
+    final lpn = (_otEstado?['lpn_abierto'] ?? '').toString();
+    final actual = _palletOt(lpn);
+    final cerrados = ((_otEstado?['pallets'] as List?) ?? const [])
+        .where((p) => (p as Map)['estado'] != 'ABIERTO').map((p) => p as Map).toList();
+    return Container(
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF7ED),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFEA580C), width: 1.5),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.pallet, color: Color(0xFFEA580C)),
+          const SizedBox(width: 8),
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('PALLET EN ARMADO (OT A CONCEPCIÓN)', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF9A3412))),
+            Text(lpn.isEmpty ? 'Sin pallet' : lpn, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
+            Text('${actual?['cajas'] ?? 0} cajas · ${actual?['unidades'] ?? 0} UN · cada caja pide FOTO DE LA FECHA',
+                style: const TextStyle(fontSize: 11.5, color: Color(0xFF7C2D12))),
+          ])),
+        ]),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(child: ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFEA580C), foregroundColor: Colors.white),
+            onPressed: _otOcupado || ((actual?['cajas'] as num?) ?? 0) == 0 ? null : _cerrarPalletOt,
+            icon: const Icon(Icons.inventory_2_outlined),
+            label: const Text('CERRAR PALLET Y ABRIR OTRO', style: TextStyle(fontSize: 12)),
+          )),
+          const SizedBox(width: 6),
+          IconButton(
+            tooltip: 'Imprimir contenido del pallet actual',
+            onPressed: actual == null ? null : () => _imprimirPalletOt(actual),
+            icon: const Icon(Icons.print_outlined),
+          ),
+        ]),
+        if (cerrados.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Wrap(spacing: 6, runSpacing: 4, children: cerrados.map((p) => ActionChip(
+                avatar: const Icon(Icons.check_circle, size: 16, color: Color(0xFF047857)),
+                label: Text('${p['lpn']} · ${p['cajas']} cj', style: const TextStyle(fontSize: 11)),
+                onPressed: () => _imprimirPalletOt(p),
+              )).toList()),
+        ],
+      ]),
+    );
   }
 
   Future _procesarEscaneoFarmacia() async {
@@ -4314,6 +4531,13 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         });
       } catch (_) {}
 
+      // OT a Concepción: cada caja va al pallet LPN abierto y pide la foto de la fecha
+      final bool esOt = _ovActivaEsOt;
+      if (esOt && _otEstado == null) {
+        await _cargarEstadoOt();
+        if (_otEstado == null) return;
+      }
+
       if (!mounted) return;
       final resultado = await showDialog(
         context: context,
@@ -4329,6 +4553,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           int faltante = cantSolicitada - cantPickeada;
           if (faltante < cantSugerida) cantSugerida = faltante;
           final txtCant = TextEditingController(text: cantSugerida.toString());
+          Map<String, String>? fotoOt;
+          bool sinFotoOt = false;
+          String avisoOt = '';
+          Color colorAvisoOt = const Color(0xFF047857);
 
           return StatefulBuilder(
             builder: (context, setStateSB) {
@@ -4350,6 +4578,91 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                         decoration: BoxDecoration(color: const Color(0xFFEFF6FF), borderRadius: BorderRadius.circular(6)),
                         child: Text('Faltan $faltante UN para completar.', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A), fontSize: 13)),
                       ),
+                      if (esOt) ...[
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(8),
+                          margin: const EdgeInsets.only(bottom: 8),
+                          decoration: BoxDecoration(color: const Color(0xFFFFF7ED), borderRadius: BorderRadius.circular(6),
+                              border: Border.all(color: const Color(0xFFEA580C))),
+                          child: Text('Va al pallet ${_otEstado?['lpn_abierto'] ?? '-'}',
+                              style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF9A3412), fontSize: 13)),
+                        ),
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                                backgroundColor: fotoOt != null ? const Color(0xFF047857) : const Color(0xFFEA580C),
+                                foregroundColor: Colors.white),
+                            icon: Icon(fotoOt != null ? Icons.check_circle : Icons.photo_camera),
+                            label: Text(fotoOt != null ? 'FOTO TOMADA · REPETIR' : 'FOTO DE LA FECHA (OBLIGATORIA)'),
+                            onPressed: () async {
+                              final r = await _leerLoteVencConFoto();
+                              if (r == null) return;
+                              fotoOt = r;
+                              sinFotoOt = false;
+                              // Con lo leído se busca el lote: primero por lote, después por fecha (con su alternativa)
+                              final fechas = _fechasConAlternativa(r['venc'] ?? '');
+                              final loteLeido = (r['lote'] ?? '').trim().toUpperCase();
+                              String? encontrado;
+                              String vencDe(String k) {
+                                final cab = k.split(' [Rack:').first;
+                                final partes = cab.split(' / ');
+                                return partes.length > 1
+                                    ? (normalizarFechaSql(partes.sublist(1).join(' / ').trim().replaceAll('/', '-')) ?? '')
+                                    : '';
+                              }
+                              if (loteLeido.isNotEmpty) {
+                                for (final e in lotesDisponibles) {
+                                  final k = (e as Map)['lote_venc'].toString();
+                                  if (k.split(' [Rack:').first.split(' / ').first.trim().toUpperCase() == loteLeido) {
+                                    encontrado = k;
+                                    break;
+                                  }
+                                }
+                              }
+                              if (encontrado == null) {
+                                buscar:
+                                for (final f in fechas) {
+                                  for (final e in lotesDisponibles) {
+                                    final k = (e as Map)['lote_venc'].toString();
+                                    if (vencDe(k) == f) {
+                                      encontrado = k;
+                                      break buscar;
+                                    }
+                                  }
+                                }
+                              }
+                              if (encontrado != null) {
+                                loteSeleccionado = encontrado;
+                                final loteTxt = encontrado.split(' [Rack:').first;
+                                final fechaTxt = fechas.isEmpty ? '-' : fechas.first;
+                                avisoOt = 'Fecha leída $fechaTxt → $loteTxt';
+                                colorAvisoOt = const Color(0xFF047857);
+                              } else {
+                                final fechaTxt = fechas.isEmpty ? '(sin fecha)' : fechas.first;
+                                avisoOt = 'No hay stock con vencimiento $fechaTxt. Revise la caja o elija el lote a mano.';
+                                colorAvisoOt = Colors.red;
+                              }
+                              setStateSB(() {});
+                            },
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () => setStateSB(() {
+                            sinFotoOt = true;
+                            fotoOt = null;
+                            avisoOt = 'Sin foto: la caja no trae fecha visible (queda registrado).';
+                            colorAvisoOt = Colors.orange;
+                          }),
+                          child: const Text('LA CAJA NO TIENE FECHA VISIBLE', style: TextStyle(fontSize: 11)),
+                        ),
+                        if (avisoOt.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Text(avisoOt, style: TextStyle(color: colorAvisoOt, fontWeight: FontWeight.bold, fontSize: 12)),
+                          ),
+                      ],
                       if (lotesDisponibles.isNotEmpty)
                         DropdownButtonFormField(
                           value: loteSeleccionado,
@@ -4414,6 +4727,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                       }
                       int cant = int.tryParse(txtCant.text.trim()) ?? 0;
                       if (cant <= 0) return;
+                      if (esOt && fotoOt == null && !sinFotoOt) {
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                            content: Text('Tome la foto de la fecha de la caja.'), backgroundColor: Colors.orange));
+                        return;
+                      }
                       if (loteSeleccionado != 'NUEVO_MANUAL') {
                         final elegido = lotesDisponibles.firstWhere(
                           (e) => (e as Map)['lote_venc'].toString() == loteSeleccionado,
@@ -4427,7 +4745,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                           return;
                         }
                       }
-                      Navigator.of(ctx).pop({'lote_venc': loteFinal, 'cantidad': cant, 'ubicacion': ubiPick});
+                      Navigator.of(ctx).pop({'lote_venc': loteFinal, 'cantidad': cant, 'ubicacion': ubiPick,
+                          if (esOt) 'foto': fotoOt});
                     },
                   ),
                 ],
@@ -4442,6 +4761,14 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final Map resMap = resultado as Map;
       final String loteEscaneado = resMap['lote_venc'].toString();
       int cantidadASumar = (resMap['cantidad'] as num).toInt();
+
+      if (esOt) {
+        if ((cantPickeada + cantidadASumar) > cantSolicitada) cantidadASumar = cantSolicitada - cantPickeada;
+        if (cantidadASumar <= 0) return;
+        final okOt = await _registrarCajaOt(linea, loteEscaneado, cantidadASumar,
+            resMap['foto'] as Map<String, String>?, resMap['ubicacion']?.toString());
+        if (!okOt) return;
+      }
 
       setState(() {
         if ((cantPickeada + cantidadASumar) > cantSolicitada) {
@@ -5101,7 +5428,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         _notificar('No se leyó ninguna fecha. Acerque la cámara a la fecha impresa y vuelva a intentar.', color: Colors.orange);
         return null;
       }
-      return {'lote': lote, 'venc': venc};
+      return {'lote': lote, 'venc': venc, 'b64': b64};
     } catch (e) {
       _notificar('No se pudo leer la foto: ${_mensajeError(e)}', color: Colors.red);
       return null;
@@ -8974,6 +9301,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   final Map<String, int> _recibidoTraslado = {}; // clave -> UN contadas (línea revisada)
   final Map<String, String> _loteRecibidoTraslado = {};
   final Map<String, String> _vencRecibidoTraslado = {};
+  // Lotes adicionales de una línea (Santiago mandó cajas de otro lote/fecha): clave -> [{lote, venc, unidades}]
+  final Map<String, List<Map<String, dynamic>>> _partesExtraTraslado = {};
   final TextEditingController _txtLpnTraslado = TextEditingController();
   final TextEditingController _txtScanTraslado = TextEditingController();
 
@@ -9059,6 +9388,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _recibidoTraslado.clear();
       _loteRecibidoTraslado.clear();
       _vencRecibidoTraslado.clear();
+      _partesExtraTraslado.clear();
       _txtLpnTraslado.clear();
       _pasoTraslado = 2;
     });
@@ -9072,6 +9402,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final rec = _recibidoTraslado[clave]!;
     if (rec == 0) return '${l['sku']}: no vino (0 de $esp UN)';
     if (rec != esp) return '${l['sku']}: ${rec < esp ? 'faltan' : 'sobran'} ${(esp - rec).abs()} UN ($rec de $esp)';
+    final extras = _partesExtraTraslado[clave] ?? const [];
+    if (extras.isNotEmpty) {
+      return '${l['sku']}: ${extras.length + 1} lotes (${_loteRecibidoTraslado[clave] ?? l['lote']}'
+          '${extras.map((p) => ' + ${p['lote']} ${p['venc']}').join()})';
+    }
     if (_loteRecibidoTraslado.containsKey(clave) || _vencRecibidoTraslado.containsKey(clave)) {
       return '${l['sku']}: lote/venc. distinto (${_loteRecibidoTraslado[clave] ?? l['lote']} · ${_vencRecibidoTraslado[clave] ?? l['vencimiento'] ?? 'S/F'})';
     }
@@ -9087,10 +9422,26 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final txtSueltas = TextEditingController(text: '${actual % mult}');
     final txtLote = TextEditingController(text: _loteRecibidoTraslado[clave] ?? (l['lote'] ?? '').toString());
     final txtVenc = TextEditingController(text: _vencRecibidoTraslado[clave] ?? (l['vencimiento'] ?? '').toString());
+    // Otros lotes en la misma línea: cada uno con lote, vencimiento, cajas y unidades sueltas
+    final extras = <Map<String, TextEditingController>>[];
+    void agregarExtra({String lote = '', String venc = '', int unidades = 0}) {
+      extras.add({
+        'lote': TextEditingController(text: lote),
+        'venc': TextEditingController(text: venc),
+        'cajas': TextEditingController(text: unidades > 0 ? '${unidades ~/ mult}' : ''),
+        'sueltas': TextEditingController(text: unidades > 0 ? '${unidades % mult}' : ''),
+      });
+    }
+    for (final p in (_partesExtraTraslado[clave] ?? const [])) {
+      agregarExtra(lote: '${p['lote'] ?? ''}', venc: '${p['venc'] ?? ''}', unidades: _aEntero(p['unidades']));
+    }
+    int unidadesDe(TextEditingController c, TextEditingController su) =>
+        (int.tryParse(c.text) ?? 0) * mult + (int.tryParse(su.text) ?? 0);
     final guardar = await showDialog<bool>(
       context: context,
       builder: (ctx) => StatefulBuilder(builder: (ctx, setD) {
-        final total = (int.tryParse(txtCajas.text) ?? 0) * mult + (int.tryParse(txtSueltas.text) ?? 0);
+        final total = (int.tryParse(txtCajas.text) ?? 0) * mult + (int.tryParse(txtSueltas.text) ?? 0) +
+            extras.fold<int>(0, (a, e) => a + unidadesDe(e['cajas']!, e['sueltas']!));
         final cuadra = total == esperado;
         return AlertDialog(
           title: Text('${l['sku']}', style: const TextStyle(fontWeight: FontWeight.w900)),
@@ -9118,6 +9469,44 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                 inputFormatters: [UpperCaseTextFormatter()], decoration: const InputDecoration(labelText: 'Lote en la caja')),
             TextField(controller: txtVenc, keyboardType: TextInputType.datetime,
                 decoration: const InputDecoration(labelText: 'Vencimiento en la caja (DD-MM-AAAA)')),
+            for (int i = 0; i < extras.length; i++) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: const Color(0xFFFFF7ED), borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFFFDBA74))),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
+                    Expanded(child: Text('Otro lote ${i + 2}', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF9A3412)))),
+                    IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red), tooltip: 'Quitar',
+                        onPressed: () => setD(() => extras.removeAt(i))),
+                  ]),
+                  TextField(controller: extras[i]['lote'], textCapitalization: TextCapitalization.characters,
+                      inputFormatters: [UpperCaseTextFormatter()], decoration: const InputDecoration(labelText: 'Lote')),
+                  TextField(controller: extras[i]['venc'], keyboardType: TextInputType.datetime,
+                      decoration: const InputDecoration(labelText: 'Vencimiento (DD-MM-AAAA)')),
+                  Row(children: [
+                    if (mult > 1) ...[
+                      Expanded(child: TextField(controller: extras[i]['cajas'], keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(labelText: 'Cajas'), onChanged: (_) => setD(() {}))),
+                      const SizedBox(width: 8),
+                    ],
+                    Expanded(child: TextField(controller: extras[i]['sueltas'], keyboardType: TextInputType.number,
+                        decoration: InputDecoration(labelText: mult > 1 ? 'Unidades sueltas' : 'Unidades'),
+                        onChanged: (_) => setD(() {}))),
+                  ]),
+                ]),
+              ),
+            ],
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.add),
+              label: const Text('OTRO LOTE / FECHA EN ESTE PRODUCTO'),
+              onPressed: () => setD(() => agregarExtra()),
+            ),
+            if (extras.isNotEmpty)
+              const Text('Arriba: el primer lote y sus cajas. Cada lote queda como stock aparte en Concepción.',
+                  style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
           ])),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
@@ -9127,14 +9516,37 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }),
     );
     if (guardar != true) return;
-    final total = (int.tryParse(txtCajas.text) ?? 0) * mult + (int.tryParse(txtSueltas.text) ?? 0);
+    final principal = (int.tryParse(txtCajas.text) ?? 0) * mult + (int.tryParse(txtSueltas.text) ?? 0);
     final lote = txtLote.text.trim().toUpperCase();
-    final venc = txtVenc.text.trim().toUpperCase();
-    if (venc.isNotEmpty && venc != 'S/F' && !RegExp(r'^\d{2}-\d{2}-\d{4}$').hasMatch(venc)) {
+    final venc = txtVenc.text.trim().toUpperCase().replaceAll('/', '-');
+    final fechaOk = RegExp(r'^\d{2}-\d{2}-\d{4}$');
+    if (venc.isNotEmpty && venc != 'S/F' && !fechaOk.hasMatch(venc)) {
       _notificar('Vencimiento inválido: use DD-MM-AAAA (ej. 31-12-2027).', color: Colors.red);
       return;
     }
+    final partesExtra = <Map<String, dynamic>>[];
+    for (final e in extras) {
+      final u = unidadesDe(e['cajas']!, e['sueltas']!);
+      if (u <= 0) continue;
+      final le = e['lote']!.text.trim().toUpperCase();
+      final ve = e['venc']!.text.trim().toUpperCase().replaceAll('/', '-');
+      if (le.isEmpty && ve.isEmpty) {
+        _notificar('Indique el lote o el vencimiento del otro lote.', color: Colors.red);
+        return;
+      }
+      if (ve.isNotEmpty && ve != 'S/F' && !fechaOk.hasMatch(ve)) {
+        _notificar('Vencimiento inválido del otro lote: use DD-MM-AAAA.', color: Colors.red);
+        return;
+      }
+      partesExtra.add({'lote': le.isEmpty ? lote : le, 'venc': ve, 'unidades': u});
+    }
+    final total = principal + partesExtra.fold<int>(0, (a, p) => a + (p['unidades'] as int));
     setState(() {
+      if (partesExtra.isEmpty) {
+        _partesExtraTraslado.remove(clave);
+      } else {
+        _partesExtraTraslado[clave] = partesExtra;
+      }
       _recibidoTraslado[clave] = total < 0 ? 0 : total;
       if (lote.isNotEmpty && lote != (l['lote'] ?? '').toString().toUpperCase()) {
         _loteRecibidoTraslado[clave] = lote;
@@ -9160,11 +9572,21 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       cod = digitos.substring(2, 16); // GS1-128: (01) GTIN-14
     }
     String sinCeros(String s) => s.replaceFirst(RegExp(r'^0+'), '');
+    // Caja (GTIN-14) y display (EAN-13) del mismo producto comparten el centro del código:
+    // GTIN-14 = indicador + 12 dígitos + verificador; EAN-13 = 12 dígitos + verificador.
+    String? nucleoGtin(String c) {
+      final d = c.replaceAll(RegExp(r'[^0-9]'), '');
+      if (d.length < 12 || d.length > 14) return null;
+      final g = d.padLeft(14, '0');
+      return g.substring(1, 13);
+    }
     final buscado = sinCeros(cod);
+    final nucleoBuscado = nucleoGtin(cod);
     final lineas = _lineasPalletTraslado(_palletTraslado!).where((l) {
       if ((l['sku'] ?? '').toString().toUpperCase() == cod) return true;
       final codigos = (l['codigo_barras'] ?? '').toString().toUpperCase().split(RegExp(r'[,;|\s]+'));
-      return codigos.any((c) => c.isNotEmpty && sinCeros(c) == buscado);
+      return codigos.any((c) => c.isNotEmpty &&
+          (sinCeros(c) == buscado || (nucleoBuscado != null && nucleoGtin(c) == nucleoBuscado)));
     }).toList();
     if (lineas.isEmpty) {
       _notificar('El producto $cod no viene en este pallet.', color: Colors.red);
@@ -9270,11 +9692,23 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         'p_lpn': p['lpn'],
         'p_lineas': lineas.map((l) {
           final c = l['clave'].toString();
+          final extras = _partesExtraTraslado[c] ?? const [];
+          final total = _recibidoTraslado[c] ?? 0;
+          final principal = total - extras.fold<int>(0, (a, p) => a + _aEntero(p['unidades']));
           return {
             'clave': c,
-            'unidades_recibidas': _recibidoTraslado[c] ?? 0,
+            'unidades_recibidas': total,
             if (_loteRecibidoTraslado.containsKey(c)) 'lote_recibido': _loteRecibidoTraslado[c],
             if (_vencRecibidoTraslado.containsKey(c)) 'vencimiento_recibido': _vencRecibidoTraslado[c],
+            if (extras.isNotEmpty)
+              'partes': [
+                {
+                  'lote': _loteRecibidoTraslado[c] ?? l['lote'],
+                  'vencimiento': _vencRecibidoTraslado[c] ?? l['vencimiento'],
+                  'unidades': principal,
+                },
+                ...extras.map((p) => {'lote': p['lote'], 'vencimiento': p['venc'], 'unidades': p['unidades']}),
+              ],
           };
         }).toList(),
         'p_usuario': _usuarioRf(),
