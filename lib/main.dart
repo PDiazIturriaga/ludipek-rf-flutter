@@ -1851,10 +1851,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   // Picking = nivel 01 de los racks (ej. H-02-01). Merma = ZONA-MERMA y zona de mermas de arena (ME-..).
   List<Map<String, dynamic>> _stockPickingSku = [];
   String? _pickingFijoSku;   // ubicación de picking asignada al SKU buscado (wms_picking_fijo_sku)
-  // FARMACIA: zona única de farmacia (script 37), también es ubicación de picking
+  // FARMACIA (script 37) y ESTANTE-GIWI (script 41, provisorio): zonas únicas que también son picking
   bool _esUbicacionPicking(String u) {
     final x = u.trim().toUpperCase();
-    return x == 'FARMACIA' || RegExp(r'^[A-Z]-\d{2}-01$').hasMatch(x);
+    return x == 'FARMACIA' || x == 'ESTANTE-GIWI' || RegExp(r'^[A-Z]-\d{2}-01$').hasMatch(x);
   }
   bool _esUbicacionMerma(String u) {
     final x = u.trim().toUpperCase();
@@ -7318,6 +7318,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   String _normalizarRackOCodigo(String raw) {
     String s = raw.trim().toUpperCase();
     if (s.isEmpty) return '';
+    // Estante provisorio de Giwi (script 41): "ESTANTE GIWI", "estante_giwi" -> "ESTANTE-GIWI"
+    if (s.replaceAll(RegExp(r'[\s\-_\.]'), '') == 'ESTANTEGIWI') return 'ESTANTE-GIWI';
 
     if (!s.startsWith('LPN') && !s.startsWith('SSCC')) {
       s = s.replaceFirst(RegExp(r'^(RACK|UBICACION|UBI|POSICION|POS)[\s:\-_]*'), '').trim();
