@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.21.2';
+const String kVersionApp = '2026.11.21.4';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -898,6 +898,164 @@ Future<void> generarPdfPackingListFA(Map<String, dynamic> ovCabecera, List< Map<
 // =====================================================================
 // PDF DE CONTENIDO POR PALLET / LPN (A4)
 // =====================================================================
+/// Acta de recepción de un traslado Santiago -> Concepción: enviado vs recibido por pallet y SKU,
+/// con lotes, diferencias, motivos y pallets que no llegaron. Se genera al cerrar la OT.
+Future<void> generarPdfActaRecepcionTraslado(Map<String, dynamic> det, {String usuario = ''}) async {
+  int n(dynamic v) => v is num ? v.toInt() : (int.tryParse('${v ?? ''}') ?? 0);
+  String t(dynamic v) => (v ?? '').toString();
+  final pdf = pw.Document();
+  pw.ImageProvider? logo;
+  try {
+    final ByteData data = await rootBundle.load('assets/logo.png');
+    logo = pw.MemoryImage(data.buffer.asUint8List());
+  } catch (_) {}
+  final pallets = ((det['pallets'] as List?) ?? const []).map((p) => Map<String, dynamic>.from(p as Map)).toList();
+  final estado = t(det['estado']);
+  const nombresEstado = {
+    'RECIBIDO_CCP': 'RECIBIDA CONFORME',
+    'RECIBIDO_CCP_CON_DIFERENCIAS': 'RECIBIDA CON DIFERENCIAS',
+    'RECEPCION_CCP_EN_PROCESO': 'EN RECEPCION',
+    'EN_TRANSITO_CCP': 'EN TRANSITO',
+  };
+  int envUn = 0, recUn = 0, envCj = 0, palletsDif = 0, palletsNoLlego = 0, lineasDif = 0;
+  final filas = <List<String>>[];
+  final filaConDif = <int>{};
+  for (final p in pallets) {
+    final est = t(p['estado']);
+    if (est == 'NO_LLEGO') palletsNoLlego++;
+    if (est == 'RECIBIDO_CON_DIFERENCIAS') palletsDif++;
+    for (final raw in ((p['lineas'] as List?) ?? const [])) {
+      final l = Map<String, dynamic>.from(raw as Map);
+      final env = n(l['unidades']);
+      final rec = est == 'NO_LLEGO' ? 0 : n(l['unidades_recibidas']);
+      envUn += env;
+      recUn += rec;
+      envCj += n(l['cajas']);
+      final res = est == 'NO_LLEGO' ? 'NO LLEGO' : t(l['resultado']).replaceAll('_', ' ');
+      final partes = (l['partes'] as List?) ?? const [];
+      final loteRec = partes.isNotEmpty
+          ? partes.map((x) => '${(x as Map)['lote']} / ${x['vencimiento'] ?? 'S/F'} (${x['unidades']})').join(' + ')
+          : (l['lote_recibido'] == null ? '-' : '${l['lote_recibido']} / ${l['vencimiento_recibido'] ?? 'S/F'}');
+      final dif = rec - env;
+      if (res != 'CONFORME') {
+        lineasDif++;
+        filaConDif.add(filas.length);
+      }
+      filas.add([
+        t(p['lpn']) + (t(p['lpn_destino']).isNotEmpty && p['lpn_destino'] != p['lpn'] ? '\n-> ${p['lpn_destino']}' : ''),
+        t(l['sku']),
+        t(l['descripcion']).length > 34 ? t(l['descripcion']).substring(0, 34) : t(l['descripcion']),
+        '${t(l['lote'])} / ${t(l['vencimiento']).isEmpty ? 'S/F' : t(l['vencimiento'])}',
+        '$env',
+        loteRec,
+        '$rec',
+        dif == 0 ? '0' : (dif > 0 ? '+$dif' : '$dif'),
+        res,
+      ]);
+    }
+  }
+  final motivos = pallets
+      .where((p) => t(p['observacion']).isNotEmpty)
+      .map((p) => '${p['lpn']}: ${p['observacion']} (${t(p['usuario'])})')
+      .toList();
+  final fechas = pallets.map((p) => DateTime.tryParse(t(p['fecha']))).whereType<DateTime>().toList()..sort();
+  final fechaRec = fechas.isEmpty ? '-' : DateFormat('dd-MM-yyyy HH:mm').format(fechas.last.toLocal());
+  final receptores = pallets.map((p) => t(p['usuario'])).where((u) => u.isNotEmpty).toSet().join(', ');
+  final conDif = estado.contains('DIFERENCIAS') || lineasDif > 0 || palletsNoLlego > 0;
+  final colorEstado = conDif ? PdfColor.fromHex('#B45309') : PdfColor.fromHex('#047857');
+
+  pw.Widget dato(String titulo, String valor, {PdfColor? color}) => pw.Expanded(
+        child: pw.Container(
+          padding: const pw.EdgeInsets.all(8),
+          margin: const pw.EdgeInsets.only(right: 6),
+          decoration: pw.BoxDecoration(color: PdfColor.fromHex('#F1F5F9'), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(4))),
+          child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+            pw.Text(titulo, style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey700)),
+            pw.Text(valor, style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold, color: color ?? PdfColors.black)),
+          ]),
+        ),
+      );
+
+  pdf.addPage(pw.MultiPage(
+    pageFormat: PdfPageFormat.a4.landscape,
+    margin: const pw.EdgeInsets.all(26),
+    footer: (ctx) => pw.Align(
+      alignment: pw.Alignment.centerRight,
+      child: pw.Text('Ludipek WMS · Acta de recepción ${t(det['numero_ot'])} · página ${ctx.pageNumber} de ${ctx.pagesCount}',
+          style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
+    ),
+    build: (ctx) => [
+      pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+        logo != null
+            ? pw.Image(logo, width: 110)
+            : pw.Text('LUDIPEK WMS', style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold, color: PdfColor.fromHex('#1E3A8A'))),
+        pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.end, children: [
+          pw.Text('ACTA DE RECEPCIÓN DE TRASLADO', style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold)),
+          pw.Text('Bodega Santiago -> Bodega Concepción', style: const pw.TextStyle(fontSize: 10, color: PdfColors.grey700)),
+          pw.Text('Emitida: ${DateFormat('dd-MM-yyyy HH:mm').format(DateTime.now())}${usuario.isNotEmpty ? ' por $usuario' : ''}',
+              style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
+        ]),
+      ]),
+      pw.SizedBox(height: 12),
+      pw.Container(
+        padding: const pw.EdgeInsets.all(10),
+        decoration: pw.BoxDecoration(border: pw.Border.all(color: colorEstado, width: 1.5), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
+        child: pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+          pw.Text(t(det['numero_ot']), style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+          pw.Text(nombresEstado[estado] ?? estado, style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold, color: colorEstado)),
+          pw.Text('Recibido: $fechaRec${receptores.isNotEmpty ? ' · $receptores' : ''}', style: const pw.TextStyle(fontSize: 10)),
+        ]),
+      ),
+      pw.SizedBox(height: 10),
+      pw.Row(children: [
+        dato('Pallets', '${pallets.length}'),
+        dato('Con diferencias', '$palletsDif', color: palletsDif > 0 ? PdfColor.fromHex('#B45309') : null),
+        dato('No llegaron', '$palletsNoLlego', color: palletsNoLlego > 0 ? PdfColor.fromHex('#B91C1C') : null),
+        dato('Cajas enviadas', '$envCj'),
+        dato('Unidades enviadas', '$envUn'),
+        dato('Unidades recibidas', '$recUn', color: recUn != envUn ? PdfColor.fromHex('#B45309') : PdfColor.fromHex('#047857')),
+        dato('Diferencia (UN)', recUn - envUn > 0 ? '+${recUn - envUn}' : '${recUn - envUn}',
+            color: recUn != envUn ? PdfColor.fromHex('#B91C1C') : PdfColor.fromHex('#047857')),
+      ]),
+      pw.SizedBox(height: 12),
+      pw.TableHelper.fromTextArray(
+        headers: ['Pallet', 'SKU', 'Descripción', 'Lote / venc. enviado', 'Enviado', 'Lote / venc. recibido', 'Recibido', 'Dif.', 'Resultado'],
+        data: filas,
+        headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white, fontSize: 8),
+        headerDecoration: pw.BoxDecoration(color: PdfColor.fromHex('#1E3A8A')),
+        cellStyle: const pw.TextStyle(fontSize: 7.5),
+        cellAlignments: {4: pw.Alignment.centerRight, 6: pw.Alignment.centerRight, 7: pw.Alignment.centerRight},
+        columnWidths: {
+          0: const pw.FlexColumnWidth(1.3), 1: const pw.FlexColumnWidth(0.9), 2: const pw.FlexColumnWidth(2.2),
+          3: const pw.FlexColumnWidth(1.6), 4: const pw.FlexColumnWidth(0.7), 5: const pw.FlexColumnWidth(2.2),
+          6: const pw.FlexColumnWidth(0.7), 7: const pw.FlexColumnWidth(0.6), 8: const pw.FlexColumnWidth(1.2),
+        },
+        cellDecoration: (index, data, rowNum) => filaConDif.contains(rowNum - 1)
+            ? pw.BoxDecoration(color: PdfColor.fromHex('#FEF3C7'))
+            : const pw.BoxDecoration(),
+      ),
+      if (motivos.isNotEmpty) ...[
+        pw.SizedBox(height: 12),
+        pw.Text('Motivos informados', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10)),
+        ...motivos.map((m) => pw.Text('- $m', style: const pw.TextStyle(fontSize: 9))),
+      ],
+      pw.SizedBox(height: 30),
+      pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceAround, children: [
+        for (final f in ['Recibe (Concepción)', 'Revisa (Supervisor)', 'Despacha (Santiago)'])
+          pw.Column(children: [
+            pw.Container(width: 180, height: 1, color: PdfColors.grey600),
+            pw.SizedBox(height: 4),
+            pw.Text(f, style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700)),
+          ]),
+      ]),
+    ],
+  ));
+  await Printing.layoutPdf(
+    onLayout: (PdfPageFormat format) async => pdf.save(),
+    name: 'Acta_Recepcion_${t(det['numero_ot'])}.pdf',
+  );
+}
+
 Future<void> generarPdfContenidoPalletLpn({
   required String lpn,
   required String numeroOv,
@@ -1966,6 +2124,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     8: ['RF_PICKING'],
     9: ['RF_PICKING'],
     10: ['RF_RECEPCION', 'RF_TRASLADOS'],
+    12: ['RF_PICKING'],
+    13: ['RF_PICKING'],
   };
 
   bool _tienePermisoModulo(int idx) {
@@ -2006,15 +2166,22 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     9: 'APP_PICKING',
     10: 'APP_TRASLADOS',
     11: 'APP_CONSULTA_STOCK',
+    12: 'APP_PICKING_OT',
+    13: 'APP_CARGA_CAMION',
   };
 
-  bool _ovActivaEsFarmacia() {
-    final ov = _ovCabeceraActiva;
-    if (ov == null) return false;
-    final n = (ov['numero_ov'] ?? '').toString().toUpperCase();
+  /// Cada orden se pickea en su módulo: OT (traslado) en Picking OT (12), -FA en Picking farmacia (5)
+  /// y las OV normales en Picking normal (9).
+  int _moduloPickingDeOrden(Map ov) {
+    final n = (ov['numero_ov'] ?? '').toString().trim().toUpperCase();
     final c = (ov['canal_venta'] ?? '').toString().toUpperCase();
-    return n.endsWith('-FA') || c.contains('FARM') || n.startsWith('OT-');
+    if (n.startsWith('OT-')) return 12;
+    if (n.endsWith('-FA') || c.contains('FARM')) return 5;
+    return 9;
   }
+
+  String _nombreModuloPicking(int idx) =>
+      idx == 12 ? 'Picking OT (traslados)' : (idx == 5 ? 'Picking farmacia (-FA)' : 'Picking normal');
 
   /// Punto único de entrada a los módulos (menú central y menú lateral).
   void _abrirModulo(int idx, {bool desdeDrawer = false}) {
@@ -2027,12 +2194,22 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _tabActual = idx;
       _mostrarMenuCentral = false;
     });
-    if (idx == 5 || idx == 9) {
-      final modoFarmacia = idx == 5;
+    if (idx == 5 || idx == 9 || idx == 12) {
+      final modoFarmacia = idx != 9;
       _cargarOVsPendientes();
-      // No se recarga si el operador ya tiene una OV del mismo tipo en curso (no perder lo pickeado)
-      if (_lineasOvFarmacia.isEmpty || _ovActivaEsFarmacia() != modoFarmacia) {
+      // No se recarga si el operador ya tiene una orden de este módulo en curso (no perder lo pickeado)
+      if (_lineasOvFarmacia.isEmpty || _moduloPickingDeOrden(_ovCabeceraActiva ?? const {}) != idx) {
+        if (_lineasOvFarmacia.isNotEmpty) {
+          setState(() {
+            _lineasOvFarmacia = [];
+            _ovCabeceraActiva = null;
+            _otEstado = null;
+            _txtBuscarOvPicking.clear();
+          });
+        }
         _cargarOvAsignadaAutomaticamente(modoFarmacia: modoFarmacia);
+      } else {
+        _cargarEstadoOt();
       }
     } else if (idx == 8) {
       _cargarOVsPendientes();
@@ -2040,6 +2217,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _cargarUbicacionesVacias();
     } else if (idx == 10) {
       _cargarTrasladosCcp();
+    } else if (idx == 13) {
+      _cargarCargasCamion();
     } else if (idx == 1) {
       _cargarMisAlmacenamientos();
     } else if (idx == 3) {
@@ -2115,7 +2294,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   String _nombreModuloActual() {
     const nombres = {0: 'RECEPCION', 1: 'ALMACENAMIENTO', 2: 'REABASTECIMIENTO', 3: 'STOCK_CONTEO', 4: 'MAESTRA',
                      5: 'PICKING_FARMACIA', 6: 'VACIAS', 7: 'CICLICO_SKU', 8: 'PACKING', 9: 'PICKING', 10: 'TRASLADOS_CCP',
-                     11: 'CONSULTA_STOCK'};
+                     11: 'CONSULTA_STOCK', 12: 'PICKING_OT', 13: 'CARGA_CAMION'};
     return _mostrarMenuCentral ? 'MENU' : (nombres[_tabActual] ?? 'MODULO_$_tabActual');
   }
 
@@ -3500,11 +3679,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             (nomUsuario.isNotEmpty && opAsig == nomUsuario);
         if (!perteneceAUsuario) return false;
 
-        final numOv = (ov['numero_ov'] ?? '').toString().toUpperCase();
-        final canal = (ov['canal_venta'] ?? '').toString().toUpperCase();
-        final esFa = numOv.endsWith('-FA') || canal.contains('FARM') || numOv.startsWith('OT-');
-
-        return modoFarmacia ? esFa : !esFa;
+        // Solo las órdenes de este módulo (OT, farmacia o normal)
+        return _moduloPickingDeOrden(ov) == (modoFarmacia ? (_tabActual == 12 ? 12 : 5) : 9);
       }).toList();
 
       if (candidatas.isNotEmpty) {
@@ -3590,16 +3766,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           .where((r) => _perteneceABodegaActiva(r))
           .toList();
 
+      // Cada tipo de orden en su módulo: OT -> Picking OT, -FA -> Picking farmacia, resto -> Picking normal
+      final int moduloActual = modoFarmacia ? (_tabActual == 12 ? 12 : 5) : 9;
       Map? elegida;
       for (final rawC in candidatas) {
         final c = rawC as Map;
-        final numOv = (c['numero_ov'] ?? '').toString().toUpperCase();
-        final canal = (c['canal_venta'] ?? '').toString().toUpperCase();
-        final esFaOrden = numOv.endsWith('-FA') || canal.contains('FARM') || numOv.startsWith('OT-');
-        if (modoFarmacia && esFaOrden) {
-          elegida = c;
-          break;
-        } else if (!modoFarmacia && !esFaOrden) {
+        if (_moduloPickingDeOrden(c) == moduloActual) {
           elegida = c;
           break;
         }
@@ -3608,17 +3780,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       if (elegida == null && candidatas.isNotEmpty) {
         final primera = candidatas.first as Map;
         final numOvP = (primera['numero_ov'] ?? '').toString().toUpperCase();
-        final esFaP = numOvP.endsWith('-FA') || numOvP.startsWith('OT-');
-        if (modoFarmacia && !esFaP) {
-          _notificar('La OV $numOvP es ESTÁNDAR. Ábrala en Picking Normal.', color: Colors.orange);
-          setState(() => _cargandoOv = false);
-          return;
-        } else if (!modoFarmacia && esFaP) {
-          _notificar('La orden $numOvP es de FARMACIA (-FA) / OT. Ábrala en Picking Farmacia.', color: Colors.orange);
-          setState(() => _cargandoOv = false);
-          return;
-        }
-        elegida = primera;
+        _notificar('La orden $numOvP se pickea en ${_nombreModuloPicking(_moduloPickingDeOrden(primera))}. Ábrala en ese módulo.',
+            color: Colors.orange);
+        setState(() => _cargandoOv = false);
+        return;
       }
 
       if (elegida == null) {
@@ -3628,6 +3793,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
 
       final estadoActual = (elegida['estado_ns'] ?? elegida['estado'] ?? 'PENDIENTE_PICKING').toString().toUpperCase();
+      if ((elegida['numero_ov'] ?? '').toString().toUpperCase().startsWith('OT-') &&
+          const ['LISTA_PARA_CARGA', 'EN_TRANSITO_CCP', 'RECEPCION_CCP_EN_PROCESO', 'RECIBIDO_CCP', 'RECIBIDO_CCP_CON_DIFERENCIAS']
+              .contains(estadoActual)) {
+        _notificar(estadoActual == 'LISTA_PARA_CARGA'
+            ? 'La ${elegida['numero_ov']} ya está pickeada y LISTA PARA CARGA. Si hay que cambiarla, pida en el PC: Cargas › Reabrir a picking.'
+            : 'La ${elegida['numero_ov']} ya salió de Santiago ($estadoActual).', color: Colors.orange);
+        setState(() => _cargandoOv = false);
+        return;
+      }
       if (estadoActual == 'PENDIENTE_FACTURACION' || estadoActual == 'FACTURADO') {
         _notificar('La OV ${elegida['numero_ov']} ya fue empacada y enviada a Facturación.', color: Colors.orange);
         setState(() => _cargandoOv = false);
@@ -3776,11 +3950,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   Widget _construirPantallaPickingUnificada({required bool esModoFarmacia}) {
-    final Color colorTema = esModoFarmacia ? const Color(0xFFE11D48) : const Color(0xFF1D4ED8);
-    final Color colorBorde = esModoFarmacia ? const Color(0xFFFDA4AF) : const Color(0xFF93C5FD);
-    final String tituloMod = esModoFarmacia
-        ? '1. PICKING FARMACIA (-FA / OT)'
-        : '1. PICKING ESTÁNDAR (OV NORMAL)';
+    final bool moduloOt = esModoFarmacia && _tabActual == 12;
+    final Color colorTema = moduloOt
+        ? const Color(0xFF6D28D9)
+        : (esModoFarmacia ? const Color(0xFFE11D48) : const Color(0xFF1D4ED8));
+    final Color colorBorde = moduloOt
+        ? const Color(0xFFC4B5FD)
+        : (esModoFarmacia ? const Color(0xFFFDA4AF) : const Color(0xFF93C5FD));
+    final String tituloMod = moduloOt
+        ? '1. PICKING OT (TRASLADO A CONCEPCIÓN)'
+        : (esModoFarmacia ? '1. PICKING FARMACIA (-FA)' : '1. PICKING ESTÁNDAR (OV NORMAL)');
 
     int totalSolicitado = 0;
     int totalPickeado = 0;
@@ -3815,7 +3994,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                       inputFormatters: [UpperCaseTextFormatter()],
                       onSubmitted: (_) => _buscarYCargarOvPorNumero(modoFarmacia: esModoFarmacia),
                       decoration: InputDecoration(
-                        labelText: esModoFarmacia ? 'Escribir N° OV Farmacia (Ej: 132945)' : 'Escribir N° OV Normal (Ej: 132719)',
+                        labelText: moduloOt
+                            ? 'Escribir N° OT (Ej: OT-CCP-0102)'
+                            : (esModoFarmacia ? 'Escribir N° OV Farmacia (Ej: 132945)' : 'Escribir N° OV Normal (Ej: 132719)'),
                         prefixIcon: Icon(Icons.receipt_long_rounded, color: colorTema),
                         suffixIcon: IconButton(
                           icon: Icon(Icons.qr_code_scanner, color: colorTema),
@@ -4168,7 +4349,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         if (mounted) setState(() => _otEstado = null);
         final lpnsOt = pallets.map((p) => p['lpn']).join(', ');
         _notificar('¡Picking completado! La $numeroOv quedó consolidada en ${pallets.length} pallet(s) '
-            '($lpnsOt) y en tránsito a Concepción.', color: const Color(0xFF047857));
+            '($lpnsOt) y LISTA PARA CARGA. Súbala al camión en el módulo Carga de camión.', color: const Color(0xFF047857));
       } else {
       _notificar(
           pasoAFacturacion
@@ -4253,6 +4434,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     return _construirPantallaPickingUnificada(esModoFarmacia: true);
   }
 
+  /// Picking OT (traslados a Concepción): misma pantalla, con foto de la fecha y pallets LPN
+  Widget _construirVistaPickingOt() {
+    return _construirPantallaPickingUnificada(esModoFarmacia: true);
+  }
+
   /// Picking y packing: el producto se confirma escaneando su código, nunca tocando la tarjeta.
   void _avisarSoloEscaneo(String sku) {
     _notificar('Escanee el código de barras de $sku para confirmarlo. No se puede confirmar tocando la tarjeta.',
@@ -4263,9 +4449,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   Map<String, dynamic>? _otEstado;          // {lpn_abierto, pallets:[{lpn, estado, cajas, unidades, lineas}]}
   bool _otOcupado = false;
 
-  // Solo en el módulo Picking farmacia / OT (índice 5); en otros módulos la OT sigue el flujo anterior
+  // Solo en el módulo Picking OT (índice 12)
   bool get _ovActivaEsOt =>
-      _tabActual == 5 &&
+      _tabActual == 12 &&
       ((_ovCabeceraActiva ?? const {})['numero_ov'] ?? '').toString().trim().toUpperCase().startsWith('OT-');
 
   int? get _ordenActivaId => int.tryParse((_ovCabeceraActiva ?? const {})['id']?.toString() ?? _ovSeleccionadaKey ?? '');
@@ -6529,8 +6715,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     _notificar(
       _packingEsTraslado
           ? (_motivoFaltantePack != null
-              ? 'Packing cerrado CON FALTANTE. $numOvStr quedó EN TRÁNSITO A CONCEPCIÓN ($bultos pallets); el PC verá la alerta.'
-              : '¡Packing cerrado! $numOvStr quedó EN TRÁNSITO A CONCEPCIÓN ($bultos pallets).')
+              ? 'Packing cerrado CON FALTANTE. $numOvStr quedó LISTA PARA CARGA ($bultos pallets); el PC verá la alerta.'
+              : '¡Packing cerrado! $numOvStr quedó LISTA PARA CARGA ($bultos pallets). Súbala en Carga de camión.')
           : (_motivoFaltantePack != null
               ? 'Packing cerrado CON FALTANTE. OV $numOvStr: $bultos bultos a facturación; el PC verá la alerta.'
               : '¡Packing cerrado! OV $numOvStr: $bultos bultos enviados a FACTURACIÓN.'),
@@ -9286,6 +9472,533 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     );
   }
 
+
+  // ===================================================================
+  // MÓDULO 13: CARGA DE CAMIÓN (script 40)
+  // Patente/contenedor -> se anclan OT u OV -> se escanea cada pallet o bulto al subirlo.
+  // Al cerrar la carga la OT sale de Santiago (EN_TRANSITO_CCP). Las OV solo quedan registradas.
+  // ===================================================================
+  List<Map<String, dynamic>> _cargasCamion = [];
+  Map<String, dynamic>? _cargaActiva;
+  bool _cargandoCargas = false;
+  bool _ocupadoCarga = false;
+  final TextEditingController _txtOrdenCarga = TextEditingController();
+  final TextEditingController _txtScanCarga = TextEditingController();
+  final FocusNode _focoScanCarga = FocusNode();
+
+  String _errorCarga(Object e) {
+    final m = _mensajeError(e);
+    if (m.contains('PGRST202') || (m.contains('wms_carga') && (m.contains('Could not find') || m.contains('does not exist')))) {
+      return 'Falta ejecutar 40_cargas_camion.sql en Supabase.';
+    }
+    return m;
+  }
+
+  Future<void> _cargarCargasCamion() async {
+    if (!mounted) return;
+    setState(() => _cargandoCargas = true);
+    try {
+      final res = await rpcLectura('wms_cargas_lista', {'p_bodega': bodegaActiva, 'p_solo_abiertas': false, 'p_dias': 3});
+      final lista = List<Map<String, dynamic>>.from(((res as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)));
+      if (mounted) setState(() => _cargasCamion = lista);
+    } catch (e) {
+      _notificar('No se pudieron leer las cargas: ${_errorCarga(e)}', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _cargandoCargas = false);
+    }
+  }
+
+  Future<void> _abrirCargaCamion(int id) async {
+    setState(() => _cargandoCargas = true);
+    try {
+      final res = await rpcLectura('wms_carga_detalle', {'p_carga_id': id});
+      if (mounted) setState(() => _cargaActiva = Map<String, dynamic>.from(res as Map));
+      _enfocarScanCarga();
+    } catch (e) {
+      _notificar('No se pudo abrir la carga: ${_errorCarga(e)}', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _cargandoCargas = false);
+    }
+  }
+
+  void _volverListaCargas() {
+    setState(() {
+      _cargaActiva = null;
+      _txtOrdenCarga.clear();
+      _txtScanCarga.clear();
+    });
+    _cargarCargasCamion();
+  }
+
+  void _enfocarScanCarga() {
+    Future.delayed(const Duration(milliseconds: 150), () {
+      if (mounted && _cargaActiva != null && (_cargaActiva!['estado'] ?? '') == 'ABIERTA') {
+        _focoScanCarga.requestFocus();
+      }
+    });
+  }
+
+  /// Ejecuta una acción de la carga (escritura: sin reintento automático) y refresca la pantalla
+  Future<Map<String, dynamic>?> _accionCarga(String funcion, Map<String, dynamic> params) async {
+    if (_ocupadoCarga) return null;
+    setState(() => _ocupadoCarga = true);
+    try {
+      final res = await supabase.rpc(funcion, params: {...params, 'p_usuario': _usuarioRf()});
+      return Map<String, dynamic>.from(res as Map);
+    } catch (e) {
+      if (mounted) {
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('No se pudo', style: TextStyle(fontWeight: FontWeight.bold)),
+            content: Text(_errorCarga(e)),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('ENTENDIDO'))],
+          ),
+        );
+      }
+      return null;
+    } finally {
+      if (mounted) setState(() => _ocupadoCarga = false);
+    }
+  }
+
+  Future<void> _nuevaCargaCamion() async {
+    final txtPatente = TextEditingController();
+    final txtContenedor = TextEditingController();
+    final txtChofer = TextEditingController();
+    String destino = _esBodegaConcepcion ? 'Clientes (ruta)' : 'Bodega Concepción';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setD) => AlertDialog(
+        title: const Text('Nueva carga de camión', style: TextStyle(fontWeight: FontWeight.w900)),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: txtPatente, autofocus: true, textCapitalization: TextCapitalization.characters,
+              inputFormatters: [UpperCaseTextFormatter()],
+              decoration: const InputDecoration(labelText: 'Patente del camión *', hintText: 'Ej: KSWY43', prefixIcon: Icon(Icons.local_shipping_outlined))),
+          TextField(controller: txtContenedor, textCapitalization: TextCapitalization.characters,
+              inputFormatters: [UpperCaseTextFormatter()],
+              decoration: const InputDecoration(labelText: 'N° de contenedor (opcional)', prefixIcon: Icon(Icons.inventory_2_outlined))),
+          TextField(controller: txtChofer, textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(labelText: 'Chofer (opcional)', prefixIcon: Icon(Icons.person_outline))),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<String>(
+            value: destino,
+            decoration: const InputDecoration(labelText: 'Destino'),
+            items: const ['Bodega Concepción', 'Clientes (ruta)', 'Otro']
+                .map((d) => DropdownMenuItem(value: d, child: Text(d))).toList(),
+            onChanged: (v) => setD(() => destino = v ?? destino),
+          ),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('CREAR CARGA')),
+        ],
+      )),
+    );
+    if (ok != true) return;
+    final r = await _accionCarga('wms_carga_crear', {
+      'p_bodega': bodegaActiva,
+      'p_patente': txtPatente.text.trim(),
+      'p_contenedor': txtContenedor.text.trim(),
+      'p_chofer': txtChofer.text.trim(),
+      'p_destino': destino,
+    });
+    if (r != null && mounted) {
+      setState(() => _cargaActiva = r);
+      _notificar('Carga ${r['numero']} creada. Agregue las OT u OV que van en el camión.', color: const Color(0xFF047857));
+    }
+  }
+
+  Future<void> _agregarOrdenCarga() async {
+    final num = _txtOrdenCarga.text.trim();
+    if (num.isEmpty) {
+      _notificar('Escriba o escanee el número de la OT u OV.', color: Colors.orange);
+      return;
+    }
+    final r = await _accionCarga('wms_carga_agregar_orden', {'p_carga_id': _cargaActiva!['id'], 'p_numero': num});
+    if (r != null && mounted) {
+      setState(() {
+        _cargaActiva = r;
+        _txtOrdenCarga.clear();
+      });
+      _notificar('$num agregada a la carga.', color: const Color(0xFF047857));
+      _enfocarScanCarga();
+    }
+  }
+
+  Future<void> _escanearCarga([String? leido]) async {
+    final codigo = (leido ?? _txtScanCarga.text).trim();
+    if (codigo.isEmpty) return;
+    final r = await _accionCarga('wms_carga_escanear', {'p_carga_id': _cargaActiva!['id'], 'p_codigo': codigo});
+    _txtScanCarga.clear();
+    if (r != null && mounted) {
+      setState(() => _cargaActiva = Map<String, dynamic>.from(r['carga'] as Map));
+      final tipo = (r['tipo'] ?? '') == 'PALLET' ? 'Pallet' : 'Bulto';
+      final c = _cargaActiva!;
+      _notificar(
+          r['ya_cargado'] == true
+              ? '$tipo ${r['n']}/${r['total']} de ${r['numero_ov']} ya estaba cargado.'
+              : '$tipo ${r['n']}/${r['total']} de ${r['numero_ov']} CARGADO · van ${c['cargados']} de ${c['total']}',
+          color: r['ya_cargado'] == true ? Colors.orange : const Color(0xFF047857));
+    }
+    _enfocarScanCarga();
+  }
+
+  Future<String?> _pedirMotivoCarga(String titulo, String ayuda) async {
+    final txt = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(titulo, style: const TextStyle(fontWeight: FontWeight.bold)),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(ayuda, style: const TextStyle(fontSize: 12.5)),
+          const SizedBox(height: 8),
+          TextField(controller: txt, autofocus: true, maxLength: 200,
+              decoration: const InputDecoration(labelText: 'Motivo', hintText: 'Ej: no cupo, va mañana')),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('ACEPTAR')),
+        ],
+      ),
+    );
+    if (ok != true) return null;
+    final m = txt.text.trim();
+    if (m.length < 3) {
+      _notificar('Escriba el motivo.', color: Colors.orange);
+      return null;
+    }
+    return m;
+  }
+
+  Future<void> _accionItemCarga(Map item) async {
+    final estado = (item['estado'] ?? '').toString();
+    final etiqueta = '${(item['tipo'] ?? '') == 'PALLET' ? 'Pallet' : 'Bulto'} ${item['n']}/${item['total']} · ${item['codigo']}';
+    final accion = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        ListTile(title: Text(etiqueta, style: const TextStyle(fontWeight: FontWeight.w900))),
+        if (estado != 'CARGADO')
+          ListTile(
+            leading: const Icon(Icons.check_circle_outline, color: Color(0xFF047857)),
+            title: Text(estado == 'QUITADO' ? 'Volver a subirlo a este camión' : 'Marcar como cargado (sin etiqueta)'),
+            onTap: () => Navigator.pop(ctx, 'CARGAR'),
+          ),
+        if (estado == 'CARGADO')
+          ListTile(
+            leading: const Icon(Icons.undo_rounded, color: Color(0xFFB45309)),
+            title: const Text('Se bajó del camión (desmarcar)'),
+            onTap: () => Navigator.pop(ctx, 'DESMARCAR'),
+          ),
+        if (estado != 'QUITADO')
+          ListTile(
+            leading: const Icon(Icons.schedule_rounded, color: Color(0xFF64748B)),
+            title: const Text('Dejar para otro camión'),
+            subtitle: const Text('No va en esta carga; queda en bodega para la próxima'),
+            onTap: () => Navigator.pop(ctx, 'QUITAR'),
+          ),
+      ])),
+    );
+    if (accion == null) return;
+    Map<String, dynamic>? r;
+    if (accion == 'CARGAR') {
+      await _escanearCarga(item['codigo'].toString());
+      return;
+    } else if (accion == 'DESMARCAR') {
+      r = await _accionCarga('wms_carga_cambiar_item',
+          {'p_carga_id': _cargaActiva!['id'], 'p_codigo': item['codigo'], 'p_accion': 'DESMARCAR', 'p_motivo': null});
+    } else {
+      final motivo = await _pedirMotivoCarga('Dejar para otro camión', etiqueta);
+      if (motivo == null) return;
+      r = await _accionCarga('wms_carga_cambiar_item',
+          {'p_carga_id': _cargaActiva!['id'], 'p_codigo': item['codigo'], 'p_accion': 'QUITAR', 'p_motivo': motivo});
+    }
+    if (r != null && mounted) setState(() => _cargaActiva = r);
+  }
+
+  Future<void> _quitarOrdenCarga(Map orden) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('¿Sacar ${orden['numero_ov']} de la carga?', style: const TextStyle(fontWeight: FontWeight.bold)),
+        content: const Text('Sus pallets o bultos dejan de estar en esta carga.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('NO')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('SACAR')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final r = await _accionCarga('wms_carga_quitar_orden', {'p_carga_id': _cargaActiva!['id'], 'p_orden_id': orden['orden_id']});
+    if (r != null && mounted) setState(() => _cargaActiva = r);
+  }
+
+  Future<void> _cerrarCargaCamion() async {
+    final c = _cargaActiva!;
+    final pend = _aEntero(c['pendientes']);
+    final cargados = _aEntero(c['cargados']);
+    if (cargados == 0) {
+      _notificar('No hay nada cargado todavía.', color: Colors.orange);
+      return;
+    }
+    String? motivo;
+    if (pend > 0) {
+      motivo = await _pedirMotivoCarga('Faltan $pend por subir',
+          'Si cierra ahora, esos pallets/bultos quedan fuera de esta carga y siguen en bodega para otro camión.');
+      if (motivo == null) return;
+    } else {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text('¿Cerrar la carga ${c['numero']}?', style: const TextStyle(fontWeight: FontWeight.bold)),
+          content: Text('Patente ${c['patente']} · $cargados cargados.\n\nLas OT saldrán EN TRÁNSITO a Concepción.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('NO')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('CERRAR CARGA')),
+          ],
+        ),
+      );
+      if (ok != true) return;
+    }
+    final r = await _accionCarga('wms_carga_cerrar', {'p_carga_id': c['id'], 'p_motivo_pendientes': motivo});
+    if (r == null || !mounted) return;
+    final ots = ((r['ot_en_transito'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Carga ${r['numero']} cerrada', style: const TextStyle(fontWeight: FontWeight.w900)),
+        content: Text('Patente ${r['patente']} · ${r['cargados']} pallet(s)/bulto(s) arriba del camión.'
+            '${ots.isEmpty ? '' : '\n\nSalen a Concepción: ${ots.map((o) => '${o['numero_ov']} (${o['pallets']} pallets)').join(', ')}.'}'
+            '${_aEntero(r['quitados']) > 0 ? '\n\nQuedaron ${r['quitados']} en bodega para otra carga.' : ''}'),
+        actions: [ElevatedButton(onPressed: () => Navigator.pop(ctx), child: const Text('LISTO'))],
+      ),
+    );
+    _volverListaCargas();
+  }
+
+  Widget _construirVistaCargaCamion() {
+    if (_cargaActiva != null) return _vistaCargaActiva();
+    final abiertas = _cargasCamion.where((c) => c['estado'] == 'ABIERTA').toList();
+    final cerradas = _cargasCamion.where((c) => c['estado'] != 'ABIERTA').toList();
+    return RefreshIndicator(
+      onRefresh: _cargarCargasCamion,
+      child: ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 86), children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(10)),
+          child: Row(children: [
+            const Icon(Icons.local_shipping_outlined, color: Color(0xFF67E8F9), size: 28),
+            const SizedBox(width: 10),
+            const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('CARGA DE CAMIÓN', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 14)),
+              Text('Patente, OT/OV y cada pallet o bulto al subirlo', style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 11)),
+            ])),
+            IconButton(
+              onPressed: _cargandoCargas ? null : _cargarCargasCamion,
+              icon: _cargandoCargas
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : const Icon(Icons.sync, color: Colors.white),
+            ),
+          ]),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(width: double.infinity, height: 50, child: ElevatedButton.icon(
+          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0E7490), foregroundColor: Colors.white),
+          onPressed: _ocupadoCarga ? null : _nuevaCargaCamion,
+          icon: const Icon(Icons.add_rounded),
+          label: const Text('NUEVA CARGA', style: TextStyle(fontWeight: FontWeight.w900)),
+        )),
+        const SizedBox(height: 14),
+        Text('CARGAS ABIERTAS (${abiertas.length})', style: const TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF0E7490))),
+        if (!_cargandoCargas && abiertas.isEmpty)
+          const Padding(padding: EdgeInsets.only(top: 6),
+              child: _TarjetaMovil(child: Text('No hay cargas abiertas. Cree una con NUEVA CARGA.', style: TextStyle(color: Color(0xFF64748B))))),
+        ...abiertas.map((c) {
+          final total = _aEntero(c['total']);
+          final hechos = _aEntero(c['cargados']);
+          return Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(10),
+              onTap: () => _abrirCargaCamion(_aEntero(c['id'])),
+              child: _TarjetaMovil(borderColor: const Color(0xFF06B6D4), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  Expanded(child: Text('${c['numero']} · ${c['patente']}', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16))),
+                  Text('$hechos / $total', style: const TextStyle(fontWeight: FontWeight.w900)),
+                ]),
+                const SizedBox(height: 2),
+                Text('${(c['ordenes'] ?? '').toString().isEmpty ? 'Sin órdenes todavía' : c['ordenes']}'
+                    '${(c['destino'] ?? '').toString().isNotEmpty ? ' · ${c['destino']}' : ''}',
+                    style: const TextStyle(fontSize: 11.5, color: Color(0xFF475569))),
+                const SizedBox(height: 6),
+                LinearProgressIndicator(value: total == 0 ? 0 : hechos / total, minHeight: 6,
+                    backgroundColor: const Color(0xFFE2E8F0), color: const Color(0xFF0E7490)),
+              ])),
+            ),
+          );
+        }),
+        if (cerradas.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          const Text('CERRADAS (ÚLTIMOS 3 DÍAS)', style: TextStyle(fontWeight: FontWeight.w900, color: Color(0xFF64748B))),
+          ...cerradas.map((c) => Card(
+            margin: const EdgeInsets.only(top: 6),
+            child: ListTile(
+              dense: true,
+              leading: Icon(c['estado'] == 'ANULADA' ? Icons.block : Icons.check_circle,
+                  color: c['estado'] == 'ANULADA' ? const Color(0xFF94A3B8) : const Color(0xFF047857)),
+              title: Text('${c['numero']} · ${c['patente']}', style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text('${c['ordenes'] ?? ''}\n${c['cargados']} cargados · ${c['estado']} ${_fechaCortaTraslado(c['cerrado_en'])}'),
+              onTap: () => _abrirCargaCamion(_aEntero(c['id'])),
+            ),
+          )),
+        ],
+      ]),
+    );
+  }
+
+  Widget _vistaCargaActiva() {
+    final c = _cargaActiva!;
+    final abierta = (c['estado'] ?? '') == 'ABIERTA';
+    final total = _aEntero(c['total']);
+    final hechos = _aEntero(c['cargados']);
+    final ordenes = ((c['ordenes'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    return Column(children: [
+      Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 12), children: [
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(10)),
+          child: Row(children: [
+            IconButton(onPressed: _volverListaCargas, icon: const Icon(Icons.arrow_back_rounded, color: Colors.white)),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('${c['numero']} · ${c['patente']}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 15)),
+              Text([
+                if ((c['contenedor'] ?? '').toString().isNotEmpty) 'Cont. ${c['contenedor']}',
+                if ((c['chofer'] ?? '').toString().isNotEmpty) c['chofer'].toString(),
+                if ((c['destino'] ?? '').toString().isNotEmpty) c['destino'].toString(),
+                if (!abierta) c['estado'].toString(),
+              ].join(' · '), style: const TextStyle(color: Color(0xFF67E8F9), fontSize: 10.5, fontWeight: FontWeight.bold)),
+            ])),
+          ]),
+        ),
+        const SizedBox(height: 10),
+        _TarjetaMovil(borderColor: const Color(0xFF06B6D4), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Text('$hechos / $total', style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w900, color: Color(0xFF0E7490))),
+            const SizedBox(width: 10),
+            Expanded(child: Text(
+                total == 0 ? 'Agregue las OT u OV de esta carga' : (hechos == total ? '¡Todo arriba del camión!' : 'cargados · faltan ${total - hechos}'),
+                style: const TextStyle(fontWeight: FontWeight.bold))),
+          ]),
+          const SizedBox(height: 6),
+          LinearProgressIndicator(value: total == 0 ? 0 : hechos / total, minHeight: 8,
+              backgroundColor: const Color(0xFFE2E8F0), color: const Color(0xFF0E7490)),
+          if (abierta) ...[
+            const SizedBox(height: 12),
+            TextField(
+              controller: _txtScanCarga, focusNode: _focoScanCarga, autofocus: true,
+              textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()],
+              onSubmitted: (_) => _escanearCarga(),
+              decoration: InputDecoration(
+                labelText: 'Escanear etiqueta del pallet o bulto', prefixIcon: const Icon(Icons.qr_code_2),
+                suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: () async {
+                  await _escanearParaCampo(_txtScanCarga, 'Escanear pallet o bulto');
+                  if (_txtScanCarga.text.isNotEmpty) _escanearCarga();
+                }),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(width: double.infinity, height: 46, child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0E7490), foregroundColor: Colors.white),
+              onPressed: _ocupadoCarga ? null : () => _escanearCarga(),
+              icon: const Icon(Icons.upload_rounded), label: const Text('SUBIR AL CAMIÓN'))),
+          ],
+        ])),
+        if (abierta) ...[
+          const SizedBox(height: 10),
+          _TarjetaMovil(child: Row(children: [
+            Expanded(child: TextField(
+              controller: _txtOrdenCarga, textCapitalization: TextCapitalization.characters,
+              inputFormatters: [UpperCaseTextFormatter()], onSubmitted: (_) => _agregarOrdenCarga(),
+              decoration: const InputDecoration(labelText: 'Agregar OT u OV', hintText: 'OT-CCP-0102 o 133409'),
+            )),
+            const SizedBox(width: 8),
+            ElevatedButton(onPressed: _ocupadoCarga ? null : _agregarOrdenCarga, child: const Text('AGREGAR')),
+          ])),
+        ],
+        ...ordenes.map((o) {
+          final items = ((o['items'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+          final esOt = (o['tipo'] ?? '') == 'OT';
+          return Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: _TarjetaMovil(
+              borderColor: esOt ? const Color(0xFFC4B5FD) : const Color(0xFFBAE6FD),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  Icon(esOt ? Icons.move_up_rounded : Icons.receipt_long_outlined,
+                      color: esOt ? const Color(0xFF6D28D9) : const Color(0xFF0369A1), size: 20),
+                  const SizedBox(width: 6),
+                  Expanded(child: Text('${o['numero_ov']} · ${o['cargados']}/${o['total']}',
+                      style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 14.5))),
+                  if (abierta && _aEntero(o['cargados']) == 0)
+                    IconButton(tooltip: 'Sacar de la carga', onPressed: () => _quitarOrdenCarga(o),
+                        icon: const Icon(Icons.remove_circle_outline, color: Color(0xFFB91C1C))),
+                ]),
+                if ((o['cliente'] ?? '').toString().isNotEmpty)
+                  Text(o['cliente'].toString(), style: const TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+                ...items.map((i) {
+                  final est = (i['estado'] ?? '').toString();
+                  final color = est == 'CARGADO'
+                      ? const Color(0xFF047857)
+                      : (est == 'QUITADO' ? const Color(0xFF94A3B8) : const Color(0xFFB45309));
+                  return InkWell(
+                    onTap: abierta && !_ocupadoCarga ? () => _accionItemCarga(i) : null,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 6),
+                      child: Row(children: [
+                        Icon(est == 'CARGADO' ? Icons.check_circle : (est == 'QUITADO' ? Icons.schedule_rounded : Icons.radio_button_unchecked),
+                            color: color, size: 22),
+                        const SizedBox(width: 8),
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text('${(i['tipo'] ?? '') == 'PALLET' ? 'Pallet' : 'Bulto'} ${i['n']}/${i['total']} · ${i['codigo']}',
+                              style: TextStyle(fontWeight: FontWeight.bold, color: est == 'QUITADO' ? const Color(0xFF94A3B8) : null)),
+                          Text(est == 'QUITADO'
+                              ? 'Para otro camión: ${i['motivo'] ?? ''}'
+                              : [
+                                  if (_aEntero(i['cajas']) > 0) '${i['cajas']} cj',
+                                  if (_aEntero(i['unidades']) > 0) '${i['unidades']} UN',
+                                  if (est == 'CARGADO') 'subido ${_fechaCortaTraslado(i['cargado_en'])}',
+                                ].join(' · '),
+                              style: const TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+                        ])),
+                        Text(est == 'CARGADO' ? 'CARGADO' : (est == 'QUITADO' ? 'OTRO CAMIÓN' : 'POR SUBIR'),
+                            style: TextStyle(fontSize: 10, fontWeight: FontWeight.w900, color: color)),
+                      ]),
+                    ),
+                  );
+                }),
+              ]),
+            ),
+          );
+        }),
+      ])),
+      if (abierta)
+        SafeArea(top: false, child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 10),
+          child: SizedBox(width: double.infinity, height: 52, child: ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: hechos > 0 && hechos == total ? const Color(0xFF047857) : const Color(0xFF334155),
+              foregroundColor: Colors.white),
+            onPressed: _ocupadoCarga || hechos == 0 ? null : _cerrarCargaCamion,
+            icon: _ocupadoCarga
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.lock_outline_rounded),
+            label: Text(hechos == total ? 'CERRAR CARGA ($hechos)' : 'CERRAR CARGA ($hechos de $total)',
+                style: const TextStyle(fontWeight: FontWeight.w900)),
+          )),
+        )),
+    ]);
+  }
+
   // ===================================================================
   // MÓDULO 10: RECEPCIÓN DE TRASLADOS EN CONCEPCIÓN (OT-CCP en pallets)
   // Paso 0: OT en camino · Paso 1: pallets de la OT · Paso 2: revisar un pallet
@@ -9379,6 +10092,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
     final pallet = encontrados.first;
+    if (pallet['en_santiago'] == true) {
+      _notificar('El pallet $lpn todavía está en Santiago: no ha salido en ningún camión.', color: Colors.orange);
+      return;
+    }
     if (pallet['pendiente'] != true) {
       _notificar('El pallet $lpn ya está registrado (${pallet['estado']}).', color: Colors.orange);
       return;
@@ -9748,10 +10465,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           title: Text(estadoOt == 'RECIBIDO_CCP' ? 'OT recibida completa' : 'OT recibida con diferencias',
               style: const TextStyle(fontWeight: FontWeight.bold)),
           content: Text('${r['numero_ot']}: se recibieron todos los pallets.\n\n'
-              'Los pallets quedaron en el andén de Concepción. Ubíquelos con ALMACENAMIENTO escaneando su LPN.'),
-          actions: [ElevatedButton(onPressed: () => Navigator.pop(ctx), child: const Text('LISTO'))],
+              'Los pallets quedaron en el andén de Concepción. Ubíquelos con ALMACENAMIENTO escaneando su LPN.\n\n'
+              'Se genera el ACTA DE RECEPCIÓN con todas las diferencias para imprimirla o compartirla.'),
+          actions: [ElevatedButton(onPressed: () => Navigator.pop(ctx), child: const Text('VER ACTA'))],
         ),
       );
+      await _imprimirActaTraslado(_aEntero(ot['orden_id']));
       _volverBandejaTraslados();
       return;
     }
@@ -9761,6 +10480,16 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       color: conDif ? const Color(0xFFB45309) : const Color(0xFF047857),
     );
     await _abrirTrasladoCcp(_aEntero(ot['orden_id']));
+  }
+
+  /// Acta de recepción (PDF) con enviado vs recibido, diferencias, lotes y motivos.
+  Future<void> _imprimirActaTraslado(int ordenId) async {
+    try {
+      final det = await rpcLectura('wms_traslado_ccp_detalle', {'p_orden_id': ordenId});
+      await generarPdfActaRecepcionTraslado(Map<String, dynamic>.from(det as Map), usuario: _usuarioRf());
+    } catch (e) {
+      _notificar('No se pudo generar el acta: ${_mensajeError(e)}', color: Colors.orange);
+    }
   }
 
   Future<void> _cerrarTrasladoConPendientes() async {
@@ -9783,6 +10512,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final r = Map<String, dynamic>.from(res as Map);
       _notificar('${r['numero_ov']} cerrada: ${r['pallets_recibidos']} recibido(s), ${r['pallets_no_llegaron']} no llegaron.',
           color: const Color(0xFFB45309));
+      await _imprimirActaTraslado(_aEntero(ot['orden_id']));
       _volverBandejaTraslados();
     } catch (e) {
       _notificar('No se pudo cerrar: ${_mensajeError(e)}', color: Colors.red);
@@ -9903,6 +10633,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final listos = pallets.where((p) => p['pendiente'] != true).toList();
     return ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 86), children: [
       _cabeceraTraslado(alVolver: _volverBandejaTraslados),
+      if (listos.isNotEmpty)
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton.icon(
+            icon: const Icon(Icons.description_outlined, size: 18),
+            label: Text(pendientes.isEmpty ? 'ACTA DE RECEPCIÓN' : 'ACTA PARCIAL (${listos.length} de ${pallets.length})'),
+            onPressed: () => _imprimirActaTraslado(_aEntero(_trasladoActivo?['orden_id'])),
+          ),
+        ),
       const SizedBox(height: 10),
       if (pendientes.isNotEmpty)
         _TarjetaMovil(borderColor: const Color(0xFF14B8A6), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -9928,9 +10667,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           margin: const EdgeInsets.only(top: 6),
           child: ListTile(
             dense: true,
-            leading: const Icon(Icons.inventory_2_outlined, color: Color(0xFFB45309)),
+            leading: Icon(p['en_santiago'] == true ? Icons.schedule_rounded : Icons.inventory_2_outlined,
+                color: p['en_santiago'] == true ? const Color(0xFF64748B) : const Color(0xFFB45309)),
             title: Text((p['lpn'] ?? '').toString(), style: const TextStyle(fontWeight: FontWeight.w900)),
-            subtitle: Text('${p['skus']} SKU · ${p['unidades_despachadas']} UN'),
+            subtitle: Text('${p['skus']} SKU · ${p['unidades_despachadas']} UN'
+                '${p['en_santiago'] == true ? '\nAÚN EN SANTIAGO (viene en otro camión)' : ((p['carga'] ?? '').toString().isNotEmpty ? '\nCamión ${p['carga']}' : '')}'),
             trailing: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
             onTap: () => _seleccionarPalletTraslado((p['lpn'] ?? '').toString()),
           ),
@@ -10082,7 +10823,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       {'indice': 3, 'titulo': 'STOCK Y CONTEO CÍCLICO', 'subtitulo': 'Consulta Rayos-X y toma de inventario en piso', 'icono': Icons.fact_check_rounded, 'color': const Color(0xFF4338CA), 'fondo': const Color(0xFFEEF2FF)},
       {'indice': 4, 'titulo': 'MAESTRA DE PRODUCTOS', 'subtitulo': 'Enrolamiento de SKU, EAN y múltiplos de caja', 'icono': Icons.list_alt_rounded, 'color': const Color(0xFFB45309), 'fondo': const Color(0xFFFFFBEB)},
       {'indice': 9, 'titulo': 'PICKING ESTÁNDAR (OV NORMAL)', 'subtitulo': 'Escribir OV y preparar por marca (Churu -> Ferall -> Giwi -> Arenas)', 'icono': Icons.shopping_cart_checkout_rounded, 'color': const Color(0xFF0284C7), 'fondo': const Color(0xFFE0F2FE)},
-      {'indice': 5, 'titulo': 'PICKING FARMACIA (FA)', 'subtitulo': 'Preparación fármacos y traslados (Escaneo y lote)', 'icono': Icons.medical_services_rounded, 'color': const Color(0xFFE11D48), 'fondo': const Color(0xFFFFE4E6)},
+      {'indice': 5, 'titulo': 'PICKING FARMACIA (FA)', 'subtitulo': 'Preparación de pedidos -FA (escaneo y lote)', 'icono': Icons.medical_services_rounded, 'color': const Color(0xFFE11D48), 'fondo': const Color(0xFFFFE4E6)},
+      if (!_esBodegaConcepcion)
+        {'indice': 12, 'titulo': 'PICKING OT (TRASLADOS)', 'subtitulo': 'OT a Concepción: foto de la fecha y pallets LPN', 'icono': Icons.move_up_rounded, 'color': const Color(0xFF6D28D9), 'fondo': const Color(0xFFF5F3FF)},
+      {'indice': 13, 'titulo': 'CARGA DE CAMIÓN', 'subtitulo': 'Patente, OT/OV y pallets o bultos 1/10, 2/10...', 'icono': Icons.local_shipping_outlined, 'color': const Color(0xFF0E7490), 'fondo': const Color(0xFFECFEFF)},
       {'indice': 8, 'titulo': 'AUDITORÍA PACKING Y LPN', 'subtitulo': 'Revisar Unidades/Lote/Venc y consolidar dentro de un LPN', 'icono': Icons.inventory_rounded, 'color': const Color(0xFF0F766E), 'fondo': const Color(0xFFF0FDFA)},
       {'indice': 7, 'titulo': 'CÍCLICO DIRIGIDO POR SKU', 'subtitulo': 'Auditar todas las ubicaciones de un SKU (1 click OK / 2 click Incidencia)', 'icono': Icons.track_changes_rounded, 'color': const Color(0xFF6D28D9), 'fondo': const Color(0xFFF5F3FF)},
       {'indice': 6, 'titulo': 'UBICACIONES VACÍAS', 'subtitulo': 'Auditoría de espacios libres y registro de hallazgos', 'icono': Icons.check_box_outline_blank_rounded, 'color': const Color(0xFF64748B), 'fondo': const Color(0xFFF1F5F9)},
@@ -11707,12 +12451,25 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           ListTile(
                 leading: const Icon(Icons.medical_services_outlined, color: Color(0xFFD97706)),
                 title: const Text(
-                  'Picking Farmacia (-FA / OT)',
+                  'Picking Farmacia (-FA)',
                   style: TextStyle(fontWeight: FontWeight.bold),
                 ),
                 selected: _tabActual == 5,
                 onTap: () => _abrirModulo(5, desdeDrawer: true),
               ),
+          if (!_esBodegaConcepcion)
+            ListTile(
+              leading: const Icon(Icons.move_up_rounded, color: Color(0xFF6D28D9)),
+              title: const Text('Picking OT (Traslados)', style: TextStyle(fontWeight: FontWeight.bold)),
+              selected: _tabActual == 12,
+              onTap: () => _abrirModulo(12, desdeDrawer: true),
+            ),
+          ListTile(
+            leading: const Icon(Icons.local_shipping_outlined, color: Color(0xFF0E7490)),
+            title: const Text('Carga de camión', style: TextStyle(fontWeight: FontWeight.bold)),
+            selected: _tabActual == 13,
+            onTap: () => _abrirModulo(13, desdeDrawer: true),
+          ),
           ListTile(
             leading: const Icon(Icons.inventory_rounded, color: Color(0xFF0F766E)),
             title: const Text('Auditoría Packing y LPN', style: TextStyle(color: Color(0xFF0F766E), fontWeight: FontWeight.bold)),
@@ -11791,6 +12548,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       case 9: return _construirVistaPickingNormal(); // Picking Estándar separado de Farmacia
       case 10: return _construirVistaTrasladosCcp();
       case 11: return _construirVistaConsultaStock();
+      case 12: return _construirVistaPickingOt();
+      case 13: return _construirVistaCargaCamion();
       default: return _construirMenuCentral();
     }
   }
@@ -11812,6 +12571,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           } else {
             _volverBandejaTraslados();
           }
+          return false;
+        }
+        // Carga de camión: de la carga abierta vuelve a la lista de cargas
+        if (!_mostrarMenuCentral && _tabActual == 13 && _cargaActiva != null) {
+          _volverListaCargas();
           return false;
         }
         // 2. Si está dentro de cualquier módulo, regresar al Menú Principal sin perder datos
