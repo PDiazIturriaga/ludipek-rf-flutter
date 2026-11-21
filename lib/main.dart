@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.21.4';
+const String kVersionApp = '2026.11.21.5';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -3616,6 +3616,47 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     return '5. OTRAS MARCAS';
   }
 
+  // ---------------- RUTA DE PICKING (Bodega Santiago) ----------------
+  // Cada pasillo se sube por un rack y se baja por el otro (el muro no deja pasar arriba):
+  // sube H desde H-01-01 y baja G desde arriba hasta G-01-01; luego F sube / E baja,
+  // D sube / C baja, B sube / A baja (termina junto a recepción y los andenes).
+  static const List<String> _rutaRacks = ['H', 'G', 'F', 'E', 'D', 'C', 'B', 'A'];
+  static final RegExp _reUbicRack = RegExp(r'^([A-H])-(\d{1,2})-(\d{1,2})$');
+
+  /// [tramo, posición, nivel] en la ruta; null si la ubicación no es de los racks A..H
+  List<int>? _claveRutaPicking(Map linea) {
+    final u = (linea['ubicacion_picking'] ?? '').toString().trim().toUpperCase();
+    final m = _reUbicRack.firstMatch(u);
+    if (m == null) return null;
+    final rack = _rutaRacks.indexOf(m.group(1)!);
+    final pos = int.parse(m.group(2)!);
+    final nivel = int.parse(m.group(3)!);
+    final subiendo = rack % 2 == 0;            // H, F, D, B se recorren subiendo; G, E, C, A bajando
+    return [rack, subiendo ? pos : -pos, nivel];
+  }
+
+  /// Ordena la lista según el recorrido de la bodega. Lo que no está en los racks A..H
+  /// (farmacia, arena, otras zonas o sin ubicación) va al final, por marca y SKU.
+  void _ordenarLineasPorRuta(List lista) {
+    if (!bodegaActiva.toUpperCase().contains('SANTIAGO')) {
+      _ordenarLineasPorMarcaYSku(lista);
+      return;
+    }
+    _ordenarLineasPorMarcaYSku(lista);              // desempate estable: marca y SKU
+    final indice = <Object, int>{for (int i = 0; i < lista.length; i++) lista[i] as Object: i};
+    lista.sort((a, b) {
+      final kA = _claveRutaPicking(a as Map);
+      final kB = _claveRutaPicking(b as Map);
+      if (kA == null && kB == null) return indice[a]!.compareTo(indice[b]!);
+      if (kA == null) return 1;
+      if (kB == null) return -1;
+      for (int i = 0; i < 3; i++) {
+        if (kA[i] != kB[i]) return kA[i].compareTo(kB[i]);
+      }
+      return indice[a]!.compareTo(indice[b]!);
+    });
+  }
+
   void _ordenarLineasPorMarcaYSku(List lista) {
     lista.sort((a, b) {
       final mA = a as Map;
@@ -3935,7 +3976,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           }
         } catch (_) {}
 
-        _ordenarLineasPorMarcaYSku(lineasCargadas);
+        _ordenarLineasPorRuta(lineasCargadas);
 
         setState(() {
           _lineasOvFarmacia = lineasCargadas;
@@ -3981,7 +4022,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               Text(tituloMod, style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14, color: colorTema)),
               const SizedBox(height: 4),
               const Text(
-                'Digite o escanee el N° de OV. Orden automático: Churu -> Ferall -> Giwi -> Arenas -> Resto (de menor a mayor SKU).',
+                'Digite o escanee el N° de OV. La lista sigue la ruta: sube H, baja G, sube F, baja E… hasta A. Lo que no está en racks va al final.',
                 style: TextStyle(fontSize: 11, color: Color(0xFF475569)),
               ),
               const SizedBox(height: 10),
@@ -10822,7 +10863,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       {'indice': 11, 'titulo': 'CONSULTA DE STOCK', 'subtitulo': '¿Queda stock? Escanee el producto y vea dónde está', 'icono': Icons.manage_search_rounded, 'color': const Color(0xFF7C3AED), 'fondo': const Color(0xFFF5F3FF)},
       {'indice': 3, 'titulo': 'STOCK Y CONTEO CÍCLICO', 'subtitulo': 'Consulta Rayos-X y toma de inventario en piso', 'icono': Icons.fact_check_rounded, 'color': const Color(0xFF4338CA), 'fondo': const Color(0xFFEEF2FF)},
       {'indice': 4, 'titulo': 'MAESTRA DE PRODUCTOS', 'subtitulo': 'Enrolamiento de SKU, EAN y múltiplos de caja', 'icono': Icons.list_alt_rounded, 'color': const Color(0xFFB45309), 'fondo': const Color(0xFFFFFBEB)},
-      {'indice': 9, 'titulo': 'PICKING ESTÁNDAR (OV NORMAL)', 'subtitulo': 'Escribir OV y preparar por marca (Churu -> Ferall -> Giwi -> Arenas)', 'icono': Icons.shopping_cart_checkout_rounded, 'color': const Color(0xFF0284C7), 'fondo': const Color(0xFFE0F2FE)},
+      {'indice': 9, 'titulo': 'PICKING ESTÁNDAR (OV NORMAL)', 'subtitulo': 'Escribir OV y preparar siguiendo la ruta (H-01-01 en adelante)', 'icono': Icons.shopping_cart_checkout_rounded, 'color': const Color(0xFF0284C7), 'fondo': const Color(0xFFE0F2FE)},
       {'indice': 5, 'titulo': 'PICKING FARMACIA (FA)', 'subtitulo': 'Preparación de pedidos -FA (escaneo y lote)', 'icono': Icons.medical_services_rounded, 'color': const Color(0xFFE11D48), 'fondo': const Color(0xFFFFE4E6)},
       if (!_esBodegaConcepcion)
         {'indice': 12, 'titulo': 'PICKING OT (TRASLADOS)', 'subtitulo': 'OT a Concepción: foto de la fecha y pallets LPN', 'icono': Icons.move_up_rounded, 'color': const Color(0xFF6D28D9), 'fondo': const Color(0xFFF5F3FF)},
