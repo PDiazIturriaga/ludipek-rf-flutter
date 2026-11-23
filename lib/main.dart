@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.23.2';
+const String kVersionApp = '2026.11.23.3';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -7677,15 +7677,40 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       }
     }
 
-    for (final cand in candidatos) {
-      try {
-        final resCb = await supabase
-            .from('maestra_sku')
-            .select()
-            .ilike('codigo_barras', '%$cand%')
-            .limit(1);
-        if (resCb.isNotEmpty) return _empaquetarFilaMaestra(resCb.first);
-      } catch (_) {}
+    // 1) SKU exacto: "7380" es el SKU 7380, aunque algún código de barras contenga "7380"
+    //    (antes se buscaba primero dentro de los códigos y devolvía otro producto, ej. USA605)
+    try {
+      final resExacto = await supabase
+          .from('maestra_sku')
+          .select()
+          .inFilter('sku', [limpio, '$limpio-FA'])
+          .order('multiplo', ascending: false)
+          .limit(1);
+      if (resExacto.isNotEmpty) return _empaquetarFilaMaestra(resExacto.first);
+    } catch (_) {}
+
+    // 2) Código de barras exacto (EAN-13, DUN-14, con o sin ceros a la izquierda)
+    try {
+      final resCbExacto = await supabase
+          .from('maestra_sku')
+          .select()
+          .inFilter('codigo_barras', candidatos.toList())
+          .limit(1);
+      if (resCbExacto.isNotEmpty) return _empaquetarFilaMaestra(resCbExacto.first);
+    } catch (_) {}
+
+    // 3) Código parcial solo si es largo (un código escaneado con dígitos extra); nunca con 3-7 caracteres
+    if (limpio.length >= 8) {
+      for (final cand in candidatos) {
+        try {
+          final resCb = await supabase
+              .from('maestra_sku')
+              .select()
+              .ilike('codigo_barras', '%$cand%')
+              .limit(1);
+          if (resCb.isNotEmpty) return _empaquetarFilaMaestra(resCb.first);
+        } catch (_) {}
+      }
     }
 
     final skuBase = limpio.split('-').first.trim();
@@ -9169,16 +9194,22 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             .or('sku.ilike.%$q%,codigo_barras.ilike.%$q%,descripcion.ilike.%$q%')
             .limit(10);
         final List< Map<String, dynamic> > lista = [];
+        final vistos = <String>{};
         for (final fila in resMaestra) {
           final skuM = (fila['sku'] ?? '').toString().toUpperCase();
+          if (!vistos.add(skuM)) continue;   // una sola fila por SKU (la maestra tiene unidad y caja)
           lista.add({
             'sku': skuM,
             'descripcion': (fila['descripcion'] ?? '').toString().toUpperCase(),
             'multiplo': (fila['multiplo'] as num?)?.toInt() ?? 1,
             'termina_con': skuM.endsWith(q),
+            'exacto': skuM == q || skuM == '$q-FA',
           });
         }
         lista.sort((a, b) {
+          final aE = a['exacto'] == true ? 1 : 0;
+          final bE = b['exacto'] == true ? 1 : 0;
+          if (aE != bE) return bE.compareTo(aE);
           final aT = a['termina_con'] == true ? 1 : 0;
           final bT = b['termina_con'] == true ? 1 : 0;
           if (aT != bT) return bT.compareTo(aT);
