@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.23.3';
+const String kVersionApp = '2026.11.24.1';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -1781,6 +1781,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   // Banderas anti doble-toque: evitan registros duplicados en Supabase
   bool _guardandoPallet = false;
+  bool _finalizandoRecepcion = false;
+  // Recepción por pantallas: 1 OC y contenedor · 2 LPN · 3 productos · 4 cerrar pallet
+  int _pasoRecepcion = 1;
+  List<Map<String, dynamic>> _contenedoresOc = [];
+  bool _cargandoContenedoresOc = false;
   bool _confirmandoPutaway = false;
   bool _moviendoAPicking = false;
   bool _registrandoConteo = false;
@@ -7925,6 +7930,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           _colorEstadoGs1 = const Color(0xFF047857);
         });
         _notificar('LPN validado y disponible: $lpnFinal', color: const Color(0xFF047857));
+        if (_pasoRecepcion == 2) setState(() => _pasoRecepcion = 3);
       }
     } else {
       _txtScanGs1.text = limpio;
@@ -8083,6 +8089,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
     _limpiarFormularioRecepcion();
 
+    setState(() {
+      _txtContenedorManual.clear();
+      _contenedoresOc = [];
+    });
     if (key == 'SIN_ASN') {
       setState(() {
         _asnActualId = null;
@@ -8095,6 +8105,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final id = int.tryParse(key);
     if (id == null) return;
     _asnActualId = id;
+    _cargarContenedoresOc(id);
     try {
       final resDet = await supabase.from('asn_detalle').select().eq('asn_id', id).order('sku');
       await _cargarCajasRecibidasDelAsn(id);
@@ -8105,6 +8116,170 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     } catch (ex) {
       _notificar('Error leyendo ASN: ${_mensajeError(ex)}', color: const Color(0xFFDC2626));
     }
+  }
+
+  /// Contenedores de la OC (uno por packing list) para elegir cuál se está recibiendo. Script 48.
+  Future<void> _cargarContenedoresOc(int asnId) async {
+    setState(() => _cargandoContenedoresOc = true);
+    try {
+      final res = await supabase.rpc('wms_app_contenedores_oc', params: {'p_asn_id': asnId});
+      final lista = res is List ? res.map((e) => Map<String, dynamic>.from(e as Map)).toList() : <Map<String, dynamic>>[];
+      if (!mounted || _asnActualId != asnId) return;
+      setState(() {
+        _contenedoresOc = lista;
+        // si la OC trae un solo contenedor, queda elegido
+        if (lista.length == 1 && _txtContenedorManual.text.trim().isEmpty) {
+          _txtContenedorManual.text = (lista.first['contenedor'] ?? '').toString();
+        }
+      });
+    } catch (_) {
+      // sin el script 48 la recepción con OC funciona igual (contenedor escrito a mano)
+    } finally {
+      if (mounted) setState(() => _cargandoContenedoresOc = false);
+    }
+  }
+
+  void _irPasoRecepcion(int paso) {
+    if (paso >= 2) {
+      final cont = _txtContenedorManual.text.trim();
+      if (_asnActualId == null && cont.isEmpty) {
+        _notificar('Recepción libre: escriba el N° de contenedor / guía.', color: const Color(0xFFD97706));
+        return;
+      }
+      if (_asnActualId != null && _contenedoresOc.length > 1 && cont.isEmpty) {
+        _notificar('Esta OC trae ${_contenedoresOc.length} contenedores: elija cuál está recibiendo.', color: const Color(0xFFD97706));
+        return;
+      }
+    }
+    if (paso == 4 && _palletEnConstruccion.isEmpty) {
+      _notificar('Agregue al menos una línea al pallet.', color: const Color(0xFFD97706));
+      return;
+    }
+    FocusScope.of(context).unfocus();
+    setState(() => _pasoRecepcion = paso);
+  }
+
+  Future<void> _siguienteDesdeLpn() async {
+    final lpn = _txtLpnManual.text.trim().toUpperCase();
+    if (lpn.isNotEmpty && await _validarLpnYaUsado(lpn)) return;
+    _irPasoRecepcion(3);
+  }
+
+  Color _colorEstadoContenedor(String estado) {
+    switch (estado) {
+      case 'RECIBIDO': return const Color(0xFF047857);
+      case 'EN_RECEPCION': return const Color(0xFFB45309);
+      case 'AGENDADO': return const Color(0xFF6D28D9);
+      case 'CITA_VENCIDA': return const Color(0xFFDC2626);
+      case 'PL_CARGADO': return const Color(0xFF0369A1);
+      default: return const Color(0xFF64748B);
+    }
+  }
+
+  String _textoEstadoContenedor(String estado) {
+    switch (estado) {
+      case 'RECIBIDO': return 'Recibido';
+      case 'EN_RECEPCION': return 'En recepción';
+      case 'AGENDADO': return 'Agendado';
+      case 'CITA_VENCIDA': return 'Cita vencida';
+      case 'PL_CARGADO': return 'PL cargado';
+      default: return 'Sin PL';
+    }
+  }
+
+  Widget _indicadorPasosRecepcion() {
+    const titulos = ['OC', 'LPN', 'Productos', 'Cerrar'];
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+      decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(10)),
+      child: Row(
+        children: [
+          for (var i = 0; i < titulos.length; i++) ...[
+            Expanded(
+              child: InkWell(
+                onTap: (i + 1) < _pasoRecepcion ? () => _irPasoRecepcion(i + 1) : null,
+                child: Column(
+                  children: [
+                    CircleAvatar(
+                      radius: 13,
+                      backgroundColor: _pasoRecepcion == i + 1
+                          ? const Color(0xFF10B981)
+                          : (_pasoRecepcion > i + 1 ? const Color(0xFF1D4ED8) : const Color(0xFF334155)),
+                      child: _pasoRecepcion > i + 1
+                          ? const Icon(Icons.check, size: 14, color: Colors.white)
+                          : Text('${i + 1}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(titulos[i], style: TextStyle(color: _pasoRecepcion == i + 1 ? Colors.white : const Color(0xFF94A3B8), fontSize: 11, fontWeight: _pasoRecepcion == i + 1 ? FontWeight.bold : FontWeight.normal)),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Resumen fijo arriba de cada pantalla: qué OC, contenedor y LPN se están recibiendo
+  Widget _resumenRecepcionActual() {
+    final asn = _asnsCabecera.where((r) => r['id'].toString() == _asnSeleccionadoKey).toList();
+    final oc = _asnActualId == null ? 'RECEPCIÓN LIBRE' : 'OC ${asn.isNotEmpty ? (asn.first['numero_oc'] ?? asn.first['codigo_asn'] ?? '') : _asnActualId}';
+    final cont = _txtContenedorManual.text.trim().isEmpty ? 'sin contenedor' : _txtContenedorManual.text.trim().toUpperCase();
+    final lpn = _txtLpnManual.text.trim().isEmpty ? 'LPN automático' : _txtLpnManual.text.trim().toUpperCase();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(color: const Color(0xFFEFF6FF), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFBFDBFE))),
+      child: Text(
+        '$oc  ·  $cont${_pasoRecepcion >= 3 ? '  ·  $lpn' : ''}${_palletEnConstruccion.isNotEmpty ? '  ·  ${_palletEnConstruccion.length} línea(s) en el pallet' : ''}',
+        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A)),
+      ),
+    );
+  }
+
+  Widget _botonesNavRecepcion({VoidCallback? atras, String? textoAtras, VoidCallback? siguiente, String? textoSiguiente, IconData iconoSiguiente = Icons.arrow_forward_rounded}) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Row(
+        children: [
+          if (atras != null)
+            Expanded(
+              child: OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(minimumSize: const Size(0, 48)),
+                onPressed: atras,
+                icon: const Icon(Icons.arrow_back_rounded),
+                label: Text(textoAtras ?? 'ATRÁS'),
+              ),
+            ),
+          if (atras != null && siguiente != null) const SizedBox(width: 8),
+          if (siguiente != null)
+            Expanded(
+              flex: 2,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), foregroundColor: Colors.white, minimumSize: const Size(0, 48)),
+                onPressed: siguiente,
+                icon: Icon(iconoSiguiente),
+                label: Text(textoSiguiente ?? 'SIGUIENTE'),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _botonFinalizarRecepcion() {
+    return SizedBox(
+      width: double.infinity,
+      height: 44,
+      child: OutlinedButton.icon(
+        style: OutlinedButton.styleFrom(foregroundColor: const Color(0xFF0369A1), side: const BorderSide(color: Color(0xFF0369A1))),
+        onPressed: (_finalizandoRecepcion || _guardandoPallet || _palletEnConstruccion.isNotEmpty) ? null : _finalizarRecepcionYEnviarReporte,
+        icon: const Icon(Icons.forward_to_inbox_outlined),
+        label: Text(_finalizandoRecepcion ? 'FINALIZANDO...' : 'TERMINÉ EL CONTENEDOR: FINALIZAR Y ENVIAR REPORTE'),
+      ),
+    );
   }
 
   void _limpiarFormularioRecepcion() {
@@ -8229,6 +8404,60 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       color: const Color(0xFF047857),
     );
   }
+  /// Fin del contenedor: el reporte de recepción física sale solo por correo a los destinatarios
+  /// configurados en el PC (Recepción > Panel de recepciones). Script 46.
+  Future<void> _finalizarRecepcionYEnviarReporte() async {
+    if (_finalizandoRecepcion) return;
+    final contenedor = _txtContenedorManual.text.trim().toUpperCase();
+    if (_asnActualId == null && contenedor.isEmpty) {
+      _notificar('Ingrese el N° de contenedor de la recepción libre.', color: const Color(0xFFD97706));
+      return;
+    }
+    if (_palletEnConstruccion.isNotEmpty) {
+      _notificar('Primero cierre el pallet que está armando.', color: const Color(0xFFD97706));
+      return;
+    }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Finalizar recepción'),
+        content: Text(_asnActualId != null
+            ? '¿Terminó de recibir todo lo de esta OC/PL? Se enviará el reporte de recepción física por correo.'
+            : '¿Terminó de recibir el contenedor $contenedor? Se enviará el reporte de recepción física por correo.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCELAR')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('FINALIZAR Y ENVIAR')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _finalizandoRecepcion = true);
+    try {
+      final res = await supabase.rpc('wms_recepcion_finalizar', params: {
+        'p_bodega': bodegaActiva,
+        'p_asn_id': _asnActualId,
+        'p_contenedor': _asnActualId == null ? contenedor : null,
+        'p_usuario': _usuarioRf(),
+      });
+      final m = res is Map ? res : <String, dynamic>{};
+      final dest = int.tryParse('${m['destinatarios'] ?? 0}') ?? 0;
+      _notificar(
+          dest > 0
+              ? 'Recepción finalizada (${m['pallets'] ?? 0} pallets). El reporte se enviará a $dest destinatario(s).'
+              : 'Recepción finalizada. El reporte queda en cola: falta agregar destinatarios en el PC.',
+          color: dest > 0 ? const Color(0xFF047857) : const Color(0xFFD97706));
+    } catch (e) {
+      final t = e.toString();
+      _notificar(
+          t.contains('PGRST202') || t.contains('Could not find')
+              ? 'Falta actualizar la base (script 46). Avise al administrador.'
+              : 'No se pudo finalizar: ${t.replaceAll('WMS: ', '')}',
+          color: const Color(0xFFB91C1C));
+    } finally {
+      if (mounted) setState(() => _finalizandoRecepcion = false);
+    }
+  }
+
   Future<void> _confirmarYCerrarPallet() async {
     if (_palletEnConstruccion.isEmpty || _guardandoPallet) return;
     setState(() => _guardandoPallet = true);
@@ -8252,9 +8481,10 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         ? lpnEscrito
         : 'LPN-${DateFormat('yyMMdd-HHmmss').format(DateTime.now())}';
 
-    final contenedorStr = _asnActualId == null
+    // Con OC: el contenedor elegido (una OC puede traer varios); si no se indicó, 'PO-id' como antes
+    final contenedorStr = _txtContenedorManual.text.trim().isNotEmpty
         ? _txtContenedorManual.text.trim().toUpperCase()
-        : 'PO-$_asnActualId';
+        : (_asnActualId == null ? '' : 'PO-$_asnActualId');
 
     final ultimaLinea = Map<String, dynamic>.from(_palletEnConstruccion.last);
     final lineas = _palletEnConstruccion.map((item) => {
@@ -8302,6 +8532,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         camposQueSeMantienen: 'Contenedor ($contenedorStr), SKU ${ultimaLinea['sku']}, Lote y Vencimiento',
       );
 
+      if (mounted) setState(() => _pasoRecepcion = 2);   // siguiente pallet: escanear el próximo LPN
+      if (_asnActualId != null) _cargarContenedoresOc(_asnActualId!);
       if (mantener) {
         setState(() {
           _txtSkuDirecto.text = ultimaLinea['sku'].toString();
@@ -11013,222 +11245,330 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final skuActual = _txtSkuDirecto.text.trim().toUpperCase();
     final cajasRecBd = _cajasRecibidasBdPorSku[skuActual] ?? 0;
 
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 86),
-      children: [
-        _TarjetaMovil(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [const Text('1. RECEPCIÓN EN ANDÉN', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)), IconButton(icon: const Icon(Icons.sync, size: 20), onPressed: _cargarAsnsActivos)]),
-              DropdownButtonFormField<String>(
-                value: _asnSeleccionadoKey, isExpanded: true,
-                decoration: const InputDecoration(labelText: '1. Modalidad / Documento OC'),
-                items: [
-                  const DropdownMenuItem(value: 'SIN_ASN', child: Text('RECEPCIÓN LIBRE (SIN OC)', overflow: TextOverflow.ellipsis)),
-                  ..._asnsCabecera.map((r) => DropdownMenuItem(value: r['id'].toString(), child: Text('${r['codigo_asn']} | ${r['proveedor']} | OC: ${r['numero_oc'] ?? ''}', overflow: TextOverflow.ellipsis))),
-                ],
-                onChanged: _seleccionarAsn,
-              ),
-              if (_asnSeleccionadoKey == 'SIN_ASN') ...[
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      flex: 2,
-                      child: TextField(
-                        controller: _txtContenedorManual,
-                        textCapitalization: TextCapitalization.characters,
-                        inputFormatters: [UpperCaseTextFormatter()],
-                        decoration: const InputDecoration(
-                          labelText: 'N° Contenedor / Guía (Obligatorio sin PO)',
-                          prefixIcon: Icon(Icons.directions_boat_filled_outlined, color: Color(0xFF1D4ED8)),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      flex: 1,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFEFF6FF),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: const Color(0xFFBFDBFE)),
-                        ),
-                        child: Column(
-                          children: [
-                            const Text('FECHA RECEPCIÓN', style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
-                            Text(DateFormat('dd-MM-yyyy').format(DateTime.now()), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w900, color: Color(0xFF0F172A))),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
+    // ---------------- PANTALLA 1: OC Y CONTENEDOR ----------------
+    Widget pantallaDocumento() {
+      final contSel = _txtContenedorManual.text.trim().toUpperCase();
+      return _TarjetaMovil(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [const Text('1. ¿QUÉ ESTÁ RECIBIENDO?', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)), IconButton(icon: const Icon(Icons.sync, size: 20), onPressed: _cargarAsnsActivos)]),
+            DropdownButtonFormField<String>(
+              value: _asnSeleccionadoKey, isExpanded: true,
+              decoration: const InputDecoration(labelText: 'Orden de compra (OC)'),
+              items: [
+                const DropdownMenuItem(value: 'SIN_ASN', child: Text('RECEPCIÓN LIBRE (SIN OC)', overflow: TextOverflow.ellipsis)),
+                ..._asnsCabecera.map((r) => DropdownMenuItem(value: r['id'].toString(), child: Text('${r['codigo_asn']} | ${r['proveedor']} | OC: ${r['numero_oc'] ?? ''}', overflow: TextOverflow.ellipsis))),
               ],
+              onChanged: _seleccionarAsn,
+            ),
+            const SizedBox(height: 6),
+            Text(_resumenAsn, style: const TextStyle(fontSize: 11, color: Color(0xFF475569))),
+            if (_asnActualId != null) ...[
+              const SizedBox(height: 10),
+              Row(children: [
+                const Expanded(child: Text('Contenedor que está recibiendo', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+                if (_cargandoContenedoresOc) const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+              ]),
               const SizedBox(height: 6),
-              Text(_resumenAsn, style: const TextStyle(fontSize: 11, color: Color(0xFF475569))),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(child: TextField(controller: _txtLpnManual, textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()], onSubmitted: (val) => _validarLpnYaUsado(val), decoration: const InputDecoration(labelText: 'LPN Pre-impreso (Vacío = Auto)', prefixIcon: Icon(Icons.qr_code_2_rounded)))),
-                  const SizedBox(width: 6),
-                  ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F172A), foregroundColor: Colors.white, minimumSize: const Size(0, 46)), onPressed: () => _abrirEscanerCodigoEnVivo(modo: 'SOLO_LPN'), icon: const Icon(Icons.qr_code_scanner_rounded, size: 18), label: const Text('Escanear LPN')),
-                ],
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 10),
-
-        _TarjetaMovil(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('2. LECTURA DE ETIQUETA Y BUSCADOR RÁPIDO SKU', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(child: ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F172A), foregroundColor: Colors.white, minimumSize: const Size(0, 44)), onPressed: _capturarEtiquetaCompletaVisionIA, icon: const Icon(Icons.camera_alt_outlined, size: 18), label: const Text('CAPTURAR ETIQUETA (IA)', style: TextStyle(fontSize: 12)))),
-                  const SizedBox(width: 6),
-                  ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), foregroundColor: Colors.white, minimumSize: const Size(0, 44)), onPressed: () => _abrirEscanerCodigoEnVivo(modo: 'CODIGO_QR_BARRAS'), icon: const Icon(Icons.qr_code_2_rounded, size: 18), label: const Text('Escanear QR')),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(child: TextField(controller: _txtScanGs1, textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()], onSubmitted: (_) => _procesarPistoleoGs1OEan(), decoration: const InputDecoration(labelText: 'Escanear Código GS1-128, QR, EAN o SKU', prefixIcon: Icon(Icons.barcode_reader)))),
-                  const SizedBox(width: 6),
-                  ElevatedButton(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), foregroundColor: Colors.white, minimumSize: const Size(0, 44)), onPressed: _procesarPistoleoGs1OEan, child: const Text('Validar')),
-                ],
-              ),
-              const SizedBox(height: 6),
-              Text(_estadoGs1, style: TextStyle(fontSize: 11, color: _colorEstadoGs1)),
-              const SizedBox(height: 8),
-              TextField(
-                controller: _txtSkuDirecto, textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()],
-                onChanged: _onChangedBusquedaSkuRecepcion, onSubmitted: (_) => _sincronizarSkuConMaestra(fijarSkuEnCampo: true),
-                decoration: InputDecoration(
-                  labelText: 'SKU (Escriba últimos 3-4 dígitos ej: 8217 o escanee)', prefixIcon: const Icon(Icons.search_rounded),
-                  suffixIcon: _txtSkuDirecto.text.isNotEmpty ? IconButton(icon: const Icon(Icons.clear, size: 18), onPressed: _limpiarFormularioRecepcion) : null,
-                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: _colorBordeSku, width: 1.8)),
-                ),
-              ),
-              _construirListaSugerenciasSku(_sugerenciasSkuRecepcion, esRecepcion: true),
-              const SizedBox(height: 8),
-              Container(
-                width: double.infinity, padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(color: const Color(0xFFEFF6FF), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFBFDBFE))),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(_infoSkuTitulo, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                    const SizedBox(height: 2),
-                    Text(_infoSkuSub, style: const TextStyle(fontSize: 11, color: Color(0xFF475569))),
-                    if (_asnActualId != null && _cajasEsperadasSkuActual > 0)
-                      Padding(padding: const EdgeInsets.only(top: 4), child: Text('ASN Esperado: $_cajasEsperadasSkuActual Cj | Ya Recibidas: $cajasRecBd Cj | Saldo Vivo: ${_txtCajasTotalesASN.text} Cj', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF1D4ED8)))),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(child: TextField(controller: _txtCajasTotalesASN, readOnly: true, textAlign: TextAlign.center, style: TextStyle(fontWeight: FontWeight.w900, color: (int.tryParse(_txtCajasTotalesASN.text) ?? 0) < 0 ? const Color(0xFFDC2626) : const Color(0xFF1E3A8A)), decoration: const InputDecoration(labelText: 'Saldo ASN (Cj)', filled: true, fillColor: Color(0xFFEFF6FF)))),
-                  const SizedBox(width: 6),
-                  Expanded(child: TextField(controller: _txtCantAIngresar, keyboardType: TextInputType.number, textAlign: TextAlign.center, onChanged: (_) => _recalcularUnidadesEnVivo(), decoration: const InputDecoration(labelText: 'Cant. Agregar'))),
-                  const SizedBox(width: 6),
-                  Expanded(child: TextField(controller: _txtMultiplo, keyboardType: TextInputType.number, textAlign: TextAlign.center, onChanged: (_) => _recalcularUnidadesEnVivo(), decoration: const InputDecoration(labelText: 'Múltiplo (UN/Cj)'))),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _txtLote, textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()],
-                      decoration: InputDecoration(
-                        labelText: 'Lote (MAYÚSCULA)',
-                        suffixIcon: _opcionesLote.isNotEmpty ? PopupMenuButton<String>(icon: const Icon(Icons.arrow_drop_down, color: Color(0xFF1D4ED8)), onSelected: (val) => setState(() => _txtLote.text = val), itemBuilder: (_) => _opcionesLote.map((e) => PopupMenuItem(value: e, child: Text(e))).toList()) : null,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: TextField(
-                      controller: _txtVencimiento, keyboardType: TextInputType.number, inputFormatters: [FechaInputFormatter()],
-                      decoration: InputDecoration(
-                        labelText: 'Venc. (DD/MM/YYYY)', hintText: 'DD/MM/YYYY',
-                        suffixIcon: _opcionesVencimiento.isNotEmpty ? PopupMenuButton<String>(icon: const Icon(Icons.arrow_drop_down, color: Color(0xFF1D4ED8)), onSelected: (val) => setState(() => _txtVencimiento.text = val), itemBuilder: (_) => _opcionesVencimiento.map((e) => PopupMenuItem(value: e, child: Text(e))).toList()) : null,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const Divider(height: 20),
-              const Text('3. INSPECCIÓN DE CALIDAD (QA)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-              const SizedBox(height: 8),
-              DropdownButtonFormField<String>(
-                value: _estadoCalidad,
-                decoration: const InputDecoration(labelText: 'Dictamen Control Calidad (QA)'),
-                items: const [
-                  DropdownMenuItem(value: 'LIBERADO', child: Text('LIBERADO (CONFORME)')),
-                  DropdownMenuItem(value: 'CUARENTENA', child: Text('CUARENTENA (RETENIDO QA)')),
-                  DropdownMenuItem(value: 'RECHAZADO', child: Text('RECHAZADO (MERMA / DAÑO)')),
-                ],
-                onChanged: (v) => setState(() => _estadoCalidad = v ?? 'LIBERADO'),
-              ),
-              CheckboxListTile(
-                contentPadding: EdgeInsets.zero,
-                value: _embalajeOk,
-                onChanged: (v) => setState(() => _embalajeOk = v ?? true),
-                title: const Text('Embalaje íntegro y rotulado conforme', style: TextStyle(fontSize: 13)),
-              ),
-              Text(_calculoEnVivo, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF047857))),
-              const SizedBox(height: 8),
-              SizedBox(width: double.infinity, height: 44, child: ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), foregroundColor: Colors.white), onPressed: _agregarLineaAlPallet, icon: const Icon(Icons.add_box_outlined), label: const Text('AGREGAR LÍNEA AL PALLET'))),
-            ],
-          ),
-        ),
-        const SizedBox(height: 10),
-
-        _TarjetaMovil(
-          borderColor: const Color(0xFFA7F3D0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('4. CONSOLIDACIÓN DE LPN', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-              const SizedBox(height: 4),
-              Text('Pallet en armado: ${_palletEnConstruccion.length} líneas | $totalCajasPallet Bultos | $totalUnidPallet UN', style: const TextStyle(fontSize: 12, color: Color(0xFF475569), fontWeight: FontWeight.w600)),
-              const SizedBox(height: 8),
-              ..._palletEnConstruccion.asMap().entries.map((entry) {
-                final idx = entry.key;
-                final item = entry.value;
+              if (_contenedoresOc.isEmpty && !_cargandoContenedoresOc)
+                const Text('La OC no tiene packing list por contenedor. Escriba el contenedor si lo conoce (opcional).', style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+              ..._contenedoresOc.map((c) {
+                final nombre = (c['contenedor'] ?? '').toString();
+                final estado = (c['estado'] ?? '').toString();
+                final elegido = nombre == contSel;
+                final unPl = (c['unidades_pl'] as num?)?.toInt();
+                final unRec = (c['unidades_recibidas'] as num?)?.toInt() ?? 0;
                 return Container(
-                  margin: const EdgeInsets.only(bottom: 6), padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(color: const Color(0xFFF8FAFC), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFE2E8F0))),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('${item['sku']} | ${item['unidades_totales']} UN (${item['cajas']} Bultos x${item['multiplo_aplicado']})', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                            Text('Lote: ${item['lote']} | Venc: ${item['fecha_vencimiento_cl'] ?? 'S/F'}', style: const TextStyle(fontSize: 11, color: Color(0xFF475569))),
-                          ],
-                        ),
-                      ),
-                      IconButton(icon: const Icon(Icons.delete_outline, color: Color(0xFFDC2626)), onPressed: () { setState(() { _palletEnConstruccion.removeAt(idx); _actualizarSaldoCajasAsnEnVivo(); }); }),
-                    ],
+                  margin: const EdgeInsets.only(bottom: 6),
+                  decoration: BoxDecoration(
+                    color: elegido ? const Color(0xFFEFF6FF) : null,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: elegido ? const Color(0xFF1D4ED8) : const Color(0xFFE2E8F0), width: elegido ? 2 : 1),
+                  ),
+                  child: ListTile(
+                    dense: true,
+                    onTap: () => setState(() => _txtContenedorManual.text = nombre),
+                    leading: Icon(elegido ? Icons.radio_button_checked : Icons.radio_button_off, color: const Color(0xFF1D4ED8)),
+                    title: Text(nombre, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                    subtitle: Text('${unPl != null ? 'PL: $unPl UN' : 'Sin PL'}${unRec > 0 ? ' · recibido: $unRec UN' : ''}${c['cita'] != null ? ' · cita ${c['cita']}' : ''}', style: const TextStyle(fontSize: 11)),
+                    trailing: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(color: _colorEstadoContenedor(estado).withOpacity(0.12), borderRadius: BorderRadius.circular(4)),
+                      child: Text(_textoEstadoContenedor(estado), style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: _colorEstadoContenedor(estado))),
+                    ),
                   ),
                 );
               }),
-              const SizedBox(height: 6),
-              SizedBox(width: double.infinity, height: 48, child: ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF047857), foregroundColor: Colors.white), onPressed: (_palletEnConstruccion.isEmpty || _guardandoPallet) ? null : _confirmarYCerrarPallet, icon: const Icon(Icons.verified_outlined), label: Text(_guardandoPallet ? 'GUARDANDO PALLET...' : 'CERRAR PALLET Y EMITIR AVISO DE INGRESO'))),
+              const SizedBox(height: 4),
             ],
-          ),
+            Row(
+              children: [
+                Expanded(
+                  flex: 2,
+                  child: TextField(
+                    controller: _txtContenedorManual,
+                    textCapitalization: TextCapitalization.characters,
+                    inputFormatters: [UpperCaseTextFormatter()],
+                    onChanged: (_) => setState(() {}),
+                    decoration: InputDecoration(
+                      labelText: _asnActualId == null ? 'N° Contenedor / Guía (obligatorio)' : 'Otro contenedor (escribir)',
+                      prefixIcon: const Icon(Icons.directions_boat_filled_outlined, color: Color(0xFF1D4ED8)),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  flex: 1,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+                    decoration: BoxDecoration(color: const Color(0xFFEFF6FF), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFBFDBFE))),
+                    child: Column(
+                      children: [
+                        const Text('FECHA RECEPCIÓN', style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
+                        Text(DateFormat('dd-MM-yyyy').format(DateTime.now()), style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w900, color: Color(0xFF0F172A))),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            _botonesNavRecepcion(siguiente: () => _irPasoRecepcion(2), textoSiguiente: 'SIGUIENTE: ESCANEAR LPN'),
+            const SizedBox(height: 10),
+            _botonFinalizarRecepcion(),
+          ],
         ),
+      );
+    }
+
+    // ---------------- PANTALLA 2: LPN ----------------
+    Widget pantallaLpn() {
+      return _TarjetaMovil(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('2. ESCANEE LA ETIQUETA LPN DEL PALLET', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+            const SizedBox(height: 4),
+            const Text('Si el pallet no tiene etiqueta pre-impresa, deje el campo vacío y el WMS genera el LPN.', style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              height: 56,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F172A), foregroundColor: Colors.white),
+                onPressed: () => _abrirEscanerCodigoEnVivo(modo: 'SOLO_LPN'),
+                icon: const Icon(Icons.qr_code_scanner_rounded, size: 24),
+                label: const Text('ESCANEAR LPN', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _txtLpnManual,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [UpperCaseTextFormatter()],
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) => _siguienteDesdeLpn(),
+              decoration: const InputDecoration(labelText: 'LPN pre-impreso (vacío = automático)', prefixIcon: Icon(Icons.qr_code_2_rounded)),
+            ),
+            if (_estadoGs1.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 6), child: Text(_estadoGs1, style: TextStyle(fontSize: 11, color: _colorEstadoGs1))),
+            _botonesNavRecepcion(
+              atras: () => _irPasoRecepcion(1), textoAtras: 'OC',
+              siguiente: _siguienteDesdeLpn,
+              textoSiguiente: _txtLpnManual.text.trim().isEmpty ? 'SIGUIENTE (LPN AUTOMÁTICO)' : 'SIGUIENTE: PRODUCTOS',
+            ),
+            const SizedBox(height: 10),
+            _botonFinalizarRecepcion(),
+          ],
+        ),
+      );
+    }
+
+    // ---------------- PANTALLA 3: PRODUCTOS (cantidades, lote, vencimiento, QA) ----------------
+    Widget pantallaProductos() {
+      return _TarjetaMovil(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('3. PRODUCTO, CANTIDAD Y LOTE', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(child: ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0F172A), foregroundColor: Colors.white, minimumSize: const Size(0, 44)), onPressed: _capturarEtiquetaCompletaVisionIA, icon: const Icon(Icons.camera_alt_outlined, size: 18), label: const Text('CAPTURAR ETIQUETA (IA)', style: TextStyle(fontSize: 12)))),
+                const SizedBox(width: 6),
+                ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), foregroundColor: Colors.white, minimumSize: const Size(0, 44)), onPressed: () => _abrirEscanerCodigoEnVivo(modo: 'CODIGO_QR_BARRAS'), icon: const Icon(Icons.qr_code_2_rounded, size: 18), label: const Text('Escanear QR')),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(child: TextField(controller: _txtScanGs1, textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()], onSubmitted: (_) => _procesarPistoleoGs1OEan(), decoration: const InputDecoration(labelText: 'Escanear Código GS1-128, QR, EAN o SKU', prefixIcon: Icon(Icons.barcode_reader)))),
+                const SizedBox(width: 6),
+                ElevatedButton(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), foregroundColor: Colors.white, minimumSize: const Size(0, 44)), onPressed: _procesarPistoleoGs1OEan, child: const Text('Validar')),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(_estadoGs1, style: TextStyle(fontSize: 11, color: _colorEstadoGs1)),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _txtSkuDirecto, textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()],
+              onChanged: _onChangedBusquedaSkuRecepcion, onSubmitted: (_) => _sincronizarSkuConMaestra(fijarSkuEnCampo: true),
+              decoration: InputDecoration(
+                labelText: 'SKU (Escriba últimos 3-4 dígitos ej: 8217 o escanee)', prefixIcon: const Icon(Icons.search_rounded),
+                suffixIcon: _txtSkuDirecto.text.isNotEmpty ? IconButton(icon: const Icon(Icons.clear, size: 18), onPressed: _limpiarFormularioRecepcion) : null,
+                enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: _colorBordeSku, width: 1.8)),
+              ),
+            ),
+            _construirListaSugerenciasSku(_sugerenciasSkuRecepcion, esRecepcion: true),
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity, padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(color: const Color(0xFFEFF6FF), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFBFDBFE))),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(_infoSkuTitulo, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                  const SizedBox(height: 2),
+                  Text(_infoSkuSub, style: const TextStyle(fontSize: 11, color: Color(0xFF475569))),
+                  if (_asnActualId != null && _cajasEsperadasSkuActual > 0)
+                    Padding(padding: const EdgeInsets.only(top: 4), child: Text('ASN Esperado: $_cajasEsperadasSkuActual Cj | Ya Recibidas: $cajasRecBd Cj | Saldo Vivo: ${_txtCajasTotalesASN.text} Cj', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF1D4ED8)))),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(child: TextField(controller: _txtCajasTotalesASN, readOnly: true, textAlign: TextAlign.center, style: TextStyle(fontWeight: FontWeight.w900, color: (int.tryParse(_txtCajasTotalesASN.text) ?? 0) < 0 ? const Color(0xFFDC2626) : const Color(0xFF1E3A8A)), decoration: const InputDecoration(labelText: 'Saldo ASN (Cj)', filled: true, fillColor: Color(0xFFEFF6FF)))),
+                const SizedBox(width: 6),
+                Expanded(child: TextField(controller: _txtCantAIngresar, keyboardType: TextInputType.number, textAlign: TextAlign.center, onChanged: (_) => _recalcularUnidadesEnVivo(), decoration: const InputDecoration(labelText: 'Cant. Agregar'))),
+                const SizedBox(width: 6),
+                Expanded(child: TextField(controller: _txtMultiplo, keyboardType: TextInputType.number, textAlign: TextAlign.center, onChanged: (_) => _recalcularUnidadesEnVivo(), decoration: const InputDecoration(labelText: 'Múltiplo (UN/Cj)'))),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _txtLote, textCapitalization: TextCapitalization.characters, inputFormatters: [UpperCaseTextFormatter()],
+                    decoration: InputDecoration(
+                      labelText: 'Lote (MAYÚSCULA)',
+                      suffixIcon: _opcionesLote.isNotEmpty ? PopupMenuButton<String>(icon: const Icon(Icons.arrow_drop_down, color: Color(0xFF1D4ED8)), onSelected: (val) => setState(() => _txtLote.text = val), itemBuilder: (_) => _opcionesLote.map((e) => PopupMenuItem(value: e, child: Text(e))).toList()) : null,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: TextField(
+                    controller: _txtVencimiento, keyboardType: TextInputType.number, inputFormatters: [FechaInputFormatter()],
+                    decoration: InputDecoration(
+                      labelText: 'Venc. (DD/MM/YYYY)', hintText: 'DD/MM/YYYY',
+                      suffixIcon: _opcionesVencimiento.isNotEmpty ? PopupMenuButton<String>(icon: const Icon(Icons.arrow_drop_down, color: Color(0xFF1D4ED8)), onSelected: (val) => setState(() => _txtVencimiento.text = val), itemBuilder: (_) => _opcionesVencimiento.map((e) => PopupMenuItem(value: e, child: Text(e))).toList()) : null,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const Divider(height: 20),
+            const Text('INSPECCIÓN DE CALIDAD (QA)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<String>(
+              value: _estadoCalidad,
+              decoration: const InputDecoration(labelText: 'Dictamen Control Calidad (QA)'),
+              items: const [
+                DropdownMenuItem(value: 'LIBERADO', child: Text('LIBERADO (CONFORME)')),
+                DropdownMenuItem(value: 'CUARENTENA', child: Text('CUARENTENA (RETENIDO QA)')),
+                DropdownMenuItem(value: 'RECHAZADO', child: Text('RECHAZADO (MERMA / DAÑO)')),
+              ],
+              onChanged: (v) => setState(() => _estadoCalidad = v ?? 'LIBERADO'),
+            ),
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              value: _embalajeOk,
+              onChanged: (v) => setState(() => _embalajeOk = v ?? true),
+              title: const Text('Embalaje íntegro y rotulado conforme', style: TextStyle(fontSize: 13)),
+            ),
+            Text(_calculoEnVivo, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF047857))),
+            const SizedBox(height: 8),
+            SizedBox(width: double.infinity, height: 46, child: ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), foregroundColor: Colors.white), onPressed: _agregarLineaAlPallet, icon: const Icon(Icons.add_box_outlined), label: const Text('AGREGAR LÍNEA AL PALLET'))),
+            if (_palletEnConstruccion.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text('En el pallet: ${_palletEnConstruccion.length} línea(s) · $totalCajasPallet bultos · $totalUnidPallet UN', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xFF047857))),
+              ),
+            _botonesNavRecepcion(
+              atras: () => _irPasoRecepcion(2), textoAtras: 'LPN',
+              siguiente: _palletEnConstruccion.isEmpty ? null : () => _irPasoRecepcion(4),
+              textoSiguiente: 'REVISAR Y CERRAR PALLET (${_palletEnConstruccion.length})',
+              iconoSiguiente: Icons.inventory_2_outlined,
+            ),
+          ],
+        ),
+      );
+    }
+
+    // ---------------- PANTALLA 4: CERRAR PALLET ----------------
+    Widget pantallaCerrar() {
+      return _TarjetaMovil(
+        borderColor: const Color(0xFFA7F3D0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('4. REVISAR Y CERRAR EL PALLET', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+            const SizedBox(height: 4),
+            Text('Pallet en armado: ${_palletEnConstruccion.length} líneas | $totalCajasPallet Bultos | $totalUnidPallet UN', style: const TextStyle(fontSize: 12, color: Color(0xFF475569), fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            ..._palletEnConstruccion.asMap().entries.map((entry) {
+              final idx = entry.key;
+              final item = entry.value;
+              return Container(
+                margin: const EdgeInsets.only(bottom: 6), padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: const Color(0xFFF8FAFC), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFE2E8F0))),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('${item['sku']} | ${item['unidades_totales']} UN (${item['cajas']} Bultos x${item['multiplo_aplicado']})', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                          Text('Lote: ${item['lote']} | Venc: ${item['fecha_vencimiento_cl'] ?? 'S/F'}', style: const TextStyle(fontSize: 11, color: Color(0xFF475569))),
+                        ],
+                      ),
+                    ),
+                    IconButton(icon: const Icon(Icons.delete_outline, color: Color(0xFFDC2626)), onPressed: () { setState(() { _palletEnConstruccion.removeAt(idx); _actualizarSaldoCajasAsnEnVivo(); if (_palletEnConstruccion.isEmpty) _pasoRecepcion = 3; }); }),
+                  ],
+                ),
+              );
+            }),
+            const SizedBox(height: 6),
+            SizedBox(width: double.infinity, height: 52, child: ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF047857), foregroundColor: Colors.white), onPressed: (_palletEnConstruccion.isEmpty || _guardandoPallet) ? null : _confirmarYCerrarPallet, icon: const Icon(Icons.verified_outlined), label: Text(_guardandoPallet ? 'GUARDANDO PALLET...' : 'CERRAR PALLET Y EMITIR AVISO DE INGRESO'))),
+            _botonesNavRecepcion(atras: () => _irPasoRecepcion(3), textoAtras: 'AGREGAR OTRA LÍNEA'),
+          ],
+        ),
+      );
+    }
+
+    final Widget pantalla;
+    switch (_pasoRecepcion) {
+      case 2:
+        pantalla = pantallaLpn();
+        break;
+      case 3:
+        pantalla = pantallaProductos();
+        break;
+      case 4:
+        pantalla = pantallaCerrar();
+        break;
+      default:
+        pantalla = pantallaDocumento();
+    }
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 86),
+      children: [
+        _indicadorPasosRecepcion(),
+        if (_pasoRecepcion > 1) _resumenRecepcionActual(),
+        pantalla,
       ],
     );
   }
