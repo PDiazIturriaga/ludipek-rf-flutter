@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.25.1';
+const String kVersionApp = '2026.11.25.3';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -8145,12 +8145,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   void _irPasoRecepcion(int paso) {
     if (paso >= 2) {
       final cont = _txtContenedorManual.text.trim();
-      if (_asnActualId == null && cont.isEmpty) {
-        _notificar('Recepción libre: escriba el N° de contenedor / guía.', color: const Color(0xFFD97706));
-        return;
-      }
-      if (_asnActualId != null && _contenedoresOc.length > 1 && cont.isEmpty) {
-        _notificar('Esta OC trae ${_contenedoresOc.length} contenedores: elija cuál está recibiendo.', color: const Color(0xFFD97706));
+      if (cont.isEmpty) {
+        _notificar(
+            _contenedoresOc.length > 1
+                ? 'Esta OC trae ${_contenedoresOc.length} contenedores: elija cuál está recibiendo.'
+                : 'Escriba el N° de contenedor o, si no lo tiene, el N° de guía de despacho.',
+            color: const Color(0xFFD97706));
         return;
       }
     }
@@ -8331,9 +8331,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       return;
     }
 
-    // Validar Contenedor obligatorio cuando es Recepción sin PO
-    if (_asnActualId == null && _txtContenedorManual.text.trim().isEmpty) {
-      _notificar('En Recepción sin PO debe ingresar el N° de Contenedor o Referencia.', color: const Color(0xFFD97706));
+    // Contenedor o guía obligatorio en toda recepción (con o sin OC): así cada LPN queda asociado a su contenedor
+    if (_txtContenedorManual.text.trim().isEmpty) {
+      _notificar('Ingrese el N° de contenedor o de guía antes de agregar productos.', color: const Color(0xFFD97706));
       return;
     }
 
@@ -8472,8 +8472,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   }
 
   Future<void> _confirmarYCerrarPalletInterno() async {
-    if (_asnActualId == null && _txtContenedorManual.text.trim().isEmpty) {
-      _notificar('Ingrese el N° de Contenedor antes de cerrar el pallet.', color: const Color(0xFFD97706));
+    if (_txtContenedorManual.text.trim().isEmpty) {
+      _notificar('Ingrese el N° de contenedor o de guía antes de cerrar el pallet.', color: const Color(0xFFD97706));
       return;
     }
 
@@ -8484,10 +8484,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         ? lpnEscrito
         : 'LPN-${DateFormat('yyMMdd-HHmmss').format(DateTime.now())}';
 
-    // Con OC: el contenedor elegido (una OC puede traer varios); si no se indicó, 'PO-id' como antes
-    final contenedorStr = _txtContenedorManual.text.trim().isNotEmpty
-        ? _txtContenedorManual.text.trim().toUpperCase()
-        : (_asnActualId == null ? '' : 'PO-$_asnActualId');
+    // Contenedor o guía escrito/elegido por el operador (obligatorio; ya no se genera 'PO-id' automático)
+    final contenedorStr = _txtContenedorManual.text.trim().toUpperCase();
 
     final ultimaLinea = Map<String, dynamic>.from(_palletEnConstruccion.last);
     final lineas = _palletEnConstruccion.map((item) => {
@@ -9845,10 +9843,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
   String _empaqueTxt(dynamic emp) {
     final e = _mapa(emp);
-    final partes = <String>['${_milesDespacho(e['cajas'])} cj'];
+    final partes = <String>[];
+    if (_aEntero(e['cajas']) > 0) partes.add('${_milesDespacho(e['cajas'])} cj');
     if (_aEntero(e['displays']) > 0) partes.add('${_milesDespacho(e['displays'])} dsp');
     if (_aEntero(e['sueltas']) > 0) partes.add('${_milesDespacho(e['sueltas'])} un');
-    return partes.join(' + ');
+    return partes.isEmpty ? '0 cj' : partes.join(' + ');
   }
 
   Future<void> _cargarDespachos() async {
@@ -10034,6 +10033,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final abierto = cab['estado'] == 'ABIERTO';
     final ped = _aEntero(tot['pedido_unidades']);
     final un = _aEntero(tot['unidades']);
+    final sinPedido = ped == 0;
 
     Widget tarjetaSku(Map<String, dynamic> s) {
       final pedido = s['pedido_unidades'] == null ? null : _aEntero(s['pedido_unidades']);
@@ -10041,10 +10041,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       final falta = _aEntero(s['falta']);
       final sobra = _aEntero(s['sobra']);
       final enPedido = s['en_pedido'] == true;
-      final Color color = !enPedido
+      final Color color = sinPedido
+          ? const Color(0xFF64748B)
+          : !enPedido
           ? const Color(0xFFB45309)
           : (falta > 0 ? (esc == 0 ? const Color(0xFF64748B) : const Color(0xFFB45309)) : (sobra > 0 ? const Color(0xFFB45309) : const Color(0xFF047857)));
-      final estado = !enPedido ? 'FUERA DEL PEDIDO' : (falta > 0 ? 'FALTAN ${_milesDespacho(falta)}' : (sobra > 0 ? 'SOBRAN ${_milesDespacho(sobra)}' : 'COMPLETO'));
+      final estado = sinPedido ? 'SIN PEDIDO CARGADO' : !enPedido ? 'FUERA DEL PEDIDO' : (falta > 0 ? 'FALTAN ${_milesDespacho(falta)}' : (sobra > 0 ? 'SOBRAN ${_milesDespacho(sobra)}' : 'COMPLETO'));
       final lotes = _listaMapas(s['lotes']);
       return Container(
         margin: const EdgeInsets.only(bottom: 8),
@@ -10065,7 +10067,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               padding: const EdgeInsets.symmetric(vertical: 4),
               child: LinearProgressIndicator(value: (esc / pedido).clamp(0, 1).toDouble(), color: color, backgroundColor: const Color(0xFFE2E8F0)),
             ),
-          Text('${_empaqueTxt(s['empaque'])}  (caja x${s['multiplo_caja']}${_aEntero(s['multiplo_display']) > 1 ? ', display x${s['multiplo_display']}' : ''})',
+          Text('${_empaqueTxt(s['empaque'])}  (${_aEntero(s['multiplo_caja']) == 0 ? 'solo display x${s['multiplo_display']}' : 'caja x${s['multiplo_caja']}${_aEntero(s['multiplo_display']) > 1 && _aEntero(s['multiplo_display']) < _aEntero(s['multiplo_caja']) ? ', display x${s['multiplo_display']}' : ''}'})',
               style: const TextStyle(fontSize: 11.5)),
           ...lotes.map((l) => Text('· Lote ${l['lote']} · vence ${l['vencimiento']} · ${_milesDespacho(l['unidades'])} UN (${_empaqueTxt(l['empaque'])})',
               style: const TextStyle(fontSize: 11, color: Color(0xFF334155)))),
@@ -10114,6 +10116,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
           ]),
         ),
         const SizedBox(height: 10),
+        if (sinPedido)
+          Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(color: const Color(0xFFFFFBEB), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFFCD34D))),
+            child: const Text('Este despacho no tiene pedido cargado: se puede escanear igual, pero no se compara contra lo pedido. '
+                'El pedido se carga en el PC (Despachos de exportación › Cargar pedido).',
+                style: TextStyle(fontSize: 11.5, color: Color(0xFF92400E))),
+          ),
         if (abierto)
           _TarjetaMovil(
             child: Column(children: [
@@ -11625,7 +11636,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               ]),
               const SizedBox(height: 6),
               if (_contenedoresOc.isEmpty && !_cargandoContenedoresOc)
-                const Text('La OC no tiene packing list por contenedor. Escriba el contenedor si lo conoce (opcional).', style: TextStyle(fontSize: 11, color: Color(0xFF64748B))),
+                const Text('La OC no tiene packing list por contenedor. Escriba el N° de contenedor o, si no lo tiene, el N° de guía (obligatorio).', style: TextStyle(fontSize: 11, color: Color(0xFFB45309), fontWeight: FontWeight.w600)),
               ..._contenedoresOc.map((c) {
                 final nombre = (c['contenedor'] ?? '').toString();
                 final estado = (c['estado'] ?? '').toString();
@@ -11665,7 +11676,9 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
                     inputFormatters: [UpperCaseTextFormatter()],
                     onChanged: (_) => setState(() {}),
                     decoration: InputDecoration(
-                      labelText: _asnActualId == null ? 'N° Contenedor / Guía (obligatorio)' : 'Otro contenedor (escribir)',
+                      labelText: _asnActualId != null && _contenedoresOc.isNotEmpty
+                          ? 'Otro contenedor o guía (escribir)'
+                          : 'N° Contenedor / Guía (obligatorio)',
                       prefixIcon: const Icon(Icons.directions_boat_filled_outlined, color: Color(0xFF1D4ED8)),
                     ),
                   ),
