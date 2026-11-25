@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.24.1';
+const String kVersionApp = '2026.11.25.1';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -2182,6 +2182,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     11: 'APP_CONSULTA_STOCK',
     12: 'APP_PICKING_OT',
     13: 'APP_CARGA_CAMION',
+    14: 'APP_DESPACHO_EXPORT',
   };
 
   /// Cada orden se pickea en su módulo: OT (traslado) en Picking OT (12), -FA en Picking farmacia (5)
@@ -2233,6 +2234,8 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       _cargarTrasladosCcp();
     } else if (idx == 13) {
       _cargarCargasCamion();
+    } else if (idx == 14) {
+      _cargarDespachos();
     } else if (idx == 1) {
       _cargarMisAlmacenamientos();
     } else if (idx == 3) {
@@ -2308,7 +2311,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   String _nombreModuloActual() {
     const nombres = {0: 'RECEPCION', 1: 'ALMACENAMIENTO', 2: 'REABASTECIMIENTO', 3: 'STOCK_CONTEO', 4: 'MAESTRA',
                      5: 'PICKING_FARMACIA', 6: 'VACIAS', 7: 'CICLICO_SKU', 8: 'PACKING', 9: 'PICKING', 10: 'TRASLADOS_CCP',
-                     11: 'CONSULTA_STOCK', 12: 'PICKING_OT', 13: 'CARGA_CAMION'};
+                     11: 'CONSULTA_STOCK', 12: 'PICKING_OT', 13: 'CARGA_CAMION', 14: 'DESPACHO_EXPORT'};
     return _mostrarMenuCentral ? 'MENU' : (nombres[_tabActual] ?? 'MODULO_$_tabActual');
   }
 
@@ -9806,6 +9809,355 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
 
 
   // ===================================================================
+  // MÓDULO 14: DESPACHO EXPORTACIÓN (script 50) — ej. traslado Chile → Perú
+  // Se elige el despacho (creado en el PC con su pedido) y se escanea cada LPN que sube.
+  // El WMS lee del stock el SKU, lote, vencimiento y unidades y calcula cajas y displays.
+  // ===================================================================
+  List<Map<String, dynamic>> _despachos = [];
+  Map<String, dynamic>? _despachoActivo; // wms_despacho_detalle
+  bool _cargandoDespachos = false;
+  bool _ocupadoDespacho = false;
+  bool _verLpnsDespacho = false;
+  final TextEditingController _txtScanDespacho = TextEditingController();
+  final FocusNode _focoScanDespacho = FocusNode();
+
+  String _errorDespacho(Object e) {
+    final m = _mensajeError(e);
+    if (m.contains('PGRST202') || (m.contains('wms_despacho') && (m.contains('Could not find') || m.contains('does not exist')))) {
+      return 'Falta ejecutar 50_despachos_exportacion.sql en Supabase.';
+    }
+    return m;
+  }
+
+  Map<String, dynamic> _mapa(dynamic v) => v is Map ? Map<String, dynamic>.from(v) : <String, dynamic>{};
+  List<Map<String, dynamic>> _listaMapas(dynamic v) =>
+      v is List ? v.map((e) => Map<String, dynamic>.from(e as Map)).toList() : <Map<String, dynamic>>[];
+
+  String _milesDespacho(dynamic v) {
+    final s = _aEntero(v).toString();
+    final b = StringBuffer();
+    for (var i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0 && s[i - 1] != '-') b.write('.');
+      b.write(s[i]);
+    }
+    return b.toString();
+  }
+
+  String _empaqueTxt(dynamic emp) {
+    final e = _mapa(emp);
+    final partes = <String>['${_milesDespacho(e['cajas'])} cj'];
+    if (_aEntero(e['displays']) > 0) partes.add('${_milesDespacho(e['displays'])} dsp');
+    if (_aEntero(e['sueltas']) > 0) partes.add('${_milesDespacho(e['sueltas'])} un');
+    return partes.join(' + ');
+  }
+
+  Future<void> _cargarDespachos() async {
+    if (!mounted) return;
+    setState(() => _cargandoDespachos = true);
+    try {
+      final res = await rpcLectura('wms_despachos_lista', {'p_bodega': bodegaActiva, 'p_dias': 30});
+      if (mounted) setState(() => _despachos = _listaMapas(res));
+    } catch (e) {
+      _notificar('No se pudieron leer los despachos: ${_errorDespacho(e)}', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _cargandoDespachos = false);
+    }
+  }
+
+  Future<void> _abrirDespacho(dynamic id) async {
+    setState(() => _cargandoDespachos = true);
+    try {
+      final res = await rpcLectura('wms_despacho_detalle', {'p_id': _aEntero(id)});
+      if (mounted) setState(() => _despachoActivo = _mapa(res));
+      _enfocarScanDespacho();
+    } catch (e) {
+      _notificar('No se pudo abrir el despacho: ${_errorDespacho(e)}', color: Colors.red);
+    } finally {
+      if (mounted) setState(() => _cargandoDespachos = false);
+    }
+  }
+
+  void _volverListaDespachos() {
+    setState(() {
+      _despachoActivo = null;
+      _txtScanDespacho.clear();
+      _verLpnsDespacho = false;
+    });
+    _cargarDespachos();
+  }
+
+  bool get _despachoAbierto => (_mapa(_despachoActivo?['despacho'])['estado'] ?? '') == 'ABIERTO';
+
+  void _enfocarScanDespacho() {
+    Future.delayed(const Duration(milliseconds: 150), () {
+      if (mounted && _despachoActivo != null && _despachoAbierto) _focoScanDespacho.requestFocus();
+    });
+  }
+
+  Future<void> _escanearDespacho([String? leido]) async {
+    final codigo = (leido ?? _txtScanDespacho.text).trim().toUpperCase();
+    if (codigo.isEmpty || _ocupadoDespacho || _despachoActivo == null) return;
+    setState(() => _ocupadoDespacho = true);
+    try {
+      final id = _mapa(_despachoActivo!['despacho'])['id'];
+      final res = _mapa(await supabase.rpc('wms_despacho_escanear',
+          params: {'p_id': _aEntero(id), 'p_lpn': codigo, 'p_usuario': _usuarioRf()}));
+      if (!mounted) return;
+      setState(() {
+        _despachoActivo = _mapa(res['detalle']);
+        _txtScanDespacho.clear();
+      });
+      if (res['resultado'] == 'YA_ESTABA') {
+        _notificar('${res['lpn']} ya estaba en este despacho.', color: Colors.orange);
+      } else {
+        final avisos = (res['avisos'] as List?)?.map((e) => e.toString()).toList() ?? [];
+        final tot = _mapa(_despachoActivo!['totales']);
+        _notificar(
+            '${res['lpn']} AGREGADO · van ${tot['pallets']} pallets / ${_milesDespacho(tot['unidades'])} UN'
+            '${avisos.isEmpty ? '' : '\nOjo: ${avisos.join('; ')}'}',
+            color: avisos.isEmpty ? const Color(0xFF047857) : const Color(0xFFB45309));
+      }
+    } catch (e) {
+      _txtScanDespacho.clear();
+      if (mounted) {
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('No se pudo agregar', style: TextStyle(fontWeight: FontWeight.bold)),
+            content: Text(_errorDespacho(e)),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('ENTENDIDO'))],
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _ocupadoDespacho = false);
+      _enfocarScanDespacho();
+    }
+  }
+
+  Future<void> _camaraDespacho() async {
+    final cod = await showDialog<String>(
+      context: context,
+      builder: (_) => const _DialogoEscanerVivo(titulo: 'Escanear LPN del pallet'),
+    );
+    if (cod != null && cod.trim().isNotEmpty) {
+      final limpio = cod.trim().toUpperCase();
+      await _escanearDespacho((limpio.length == 18 && RegExp(r'^\d+$').hasMatch(limpio)) ? 'SSCC-$limpio' : limpio);
+    }
+  }
+
+  Future<void> _quitarLpnDespacho(String lpn) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('¿Quitar $lpn?', style: const TextStyle(fontWeight: FontWeight.bold)),
+        content: const Text('El pallet sale de este despacho (no se mueve el stock).'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('NO')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('QUITAR')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      final id = _mapa(_despachoActivo!['despacho'])['id'];
+      final res = await supabase.rpc('wms_despacho_quitar_lpn', params: {'p_id': _aEntero(id), 'p_lpn': lpn, 'p_usuario': _usuarioRf()});
+      if (mounted) setState(() => _despachoActivo = _mapa(res));
+      _notificar('$lpn quitado del despacho.', color: const Color(0xFF047857));
+    } catch (e) {
+      _notificar('No se pudo quitar: ${_errorDespacho(e)}', color: Colors.red);
+    }
+  }
+
+  Widget _construirVistaDespacho() {
+    if (_despachoActivo != null) return _vistaDespachoActivo();
+    final abiertos = _despachos.where((d) => d['estado'] == 'ABIERTO').toList();
+    final otros = _despachos.where((d) => d['estado'] != 'ABIERTO').toList();
+    Widget tarjeta(Map<String, dynamic> d) {
+      final abierto = d['estado'] == 'ABIERTO';
+      final ped = _aEntero(d['pedido_unidades']);
+      final un = _aEntero(d['unidades']);
+      return Card(
+        margin: const EdgeInsets.only(bottom: 8),
+        child: ListTile(
+          onTap: () => _abrirDespacho(d['id']),
+          leading: Icon(abierto ? Icons.flight_takeoff_rounded : Icons.verified_rounded,
+              color: abierto ? const Color(0xFFBE185D) : const Color(0xFF64748B)),
+          title: Text('${d['numero']} · ${d['destino']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5)),
+          subtitle: Text(
+              '${d['referencia'] ?? 'Sin referencia'}${d['contenedor'] != null ? ' · ${d['contenedor']}' : ''}\n'
+              '${d['pallets']} pallets · ${_milesDespacho(un)}${ped > 0 ? ' de ${_milesDespacho(ped)}' : ''} UN · ${d['estado']}',
+              style: const TextStyle(fontSize: 11.5)),
+          isThreeLine: true,
+          trailing: const Icon(Icons.chevron_right_rounded),
+        ),
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: _cargarDespachos,
+      child: ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 86), children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(10)),
+          child: const Row(children: [
+            Icon(Icons.flight_takeoff_rounded, color: Color(0xFFF9A8D4), size: 28),
+            SizedBox(width: 10),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('DESPACHO EXPORTACIÓN', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 14)),
+              Text('Elija el despacho y escanee cada LPN que sube', style: TextStyle(color: Color(0xFFCBD5E1), fontSize: 11.5)),
+            ])),
+          ]),
+        ),
+        const SizedBox(height: 10),
+        if (_cargandoDespachos) const LinearProgressIndicator(),
+        if (!_cargandoDespachos && abiertos.isEmpty)
+          const Padding(
+            padding: EdgeInsets.all(16),
+            child: Text('No hay despachos abiertos. Se crean en el PC (Despachos de exportación) con su pedido.',
+                textAlign: TextAlign.center, style: TextStyle(color: Color(0xFF64748B))),
+          ),
+        ...abiertos.map(tarjeta),
+        if (otros.isNotEmpty) ...[
+          const Padding(padding: EdgeInsets.fromLTRB(4, 12, 4, 6), child: Text('CERRADOS (ÚLTIMOS 30 DÍAS)', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF64748B)))),
+          ...otros.map(tarjeta),
+        ],
+      ]),
+    );
+  }
+
+  Widget _vistaDespachoActivo() {
+    final cab = _mapa(_despachoActivo!['despacho']);
+    final tot = _mapa(_despachoActivo!['totales']);
+    final skus = _listaMapas(_despachoActivo!['sku']);
+    final lpns = _listaMapas(_despachoActivo!['lpns']);
+    final abierto = cab['estado'] == 'ABIERTO';
+    final ped = _aEntero(tot['pedido_unidades']);
+    final un = _aEntero(tot['unidades']);
+
+    Widget tarjetaSku(Map<String, dynamic> s) {
+      final pedido = s['pedido_unidades'] == null ? null : _aEntero(s['pedido_unidades']);
+      final esc = _aEntero(s['unidades']);
+      final falta = _aEntero(s['falta']);
+      final sobra = _aEntero(s['sobra']);
+      final enPedido = s['en_pedido'] == true;
+      final Color color = !enPedido
+          ? const Color(0xFFB45309)
+          : (falta > 0 ? (esc == 0 ? const Color(0xFF64748B) : const Color(0xFFB45309)) : (sobra > 0 ? const Color(0xFFB45309) : const Color(0xFF047857)));
+      final estado = !enPedido ? 'FUERA DEL PEDIDO' : (falta > 0 ? 'FALTAN ${_milesDespacho(falta)}' : (sobra > 0 ? 'SOBRAN ${_milesDespacho(sobra)}' : 'COMPLETO'));
+      final lotes = _listaMapas(s['lotes']);
+      return Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8), border: Border.all(color: color.withOpacity(0.5))),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Expanded(child: Text('${s['sku']}', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13))),
+            Text(estado, style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: color)),
+          ]),
+          if ((s['descripcion'] ?? '').toString().isNotEmpty)
+            Text('${s['descripcion']}', style: const TextStyle(fontSize: 11, color: Color(0xFF475569)), maxLines: 1, overflow: TextOverflow.ellipsis),
+          const SizedBox(height: 4),
+          Text('Escaneado: ${_milesDespacho(esc)} UN${pedido != null ? ' de ${_milesDespacho(pedido)}' : ''} · ${s['pallets']} pallet(s)',
+              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+          if (pedido != null && pedido > 0)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: LinearProgressIndicator(value: (esc / pedido).clamp(0, 1).toDouble(), color: color, backgroundColor: const Color(0xFFE2E8F0)),
+            ),
+          Text('${_empaqueTxt(s['empaque'])}  (caja x${s['multiplo_caja']}${_aEntero(s['multiplo_display']) > 1 ? ', display x${s['multiplo_display']}' : ''})',
+              style: const TextStyle(fontSize: 11.5)),
+          ...lotes.map((l) => Text('· Lote ${l['lote']} · vence ${l['vencimiento']} · ${_milesDespacho(l['unidades'])} UN (${_empaqueTxt(l['empaque'])})',
+              style: const TextStyle(fontSize: 11, color: Color(0xFF334155)))),
+        ]),
+      );
+    }
+
+    Widget tarjetaLpn(Map<String, dynamic> l) {
+      final contenido = _listaMapas(l['contenido']);
+      return Container(
+        margin: const EdgeInsets.only(bottom: 6),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(color: const Color(0xFFF8FAFC), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFE2E8F0))),
+        child: Row(children: [
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('${l['lpn']} · ${l['ubicacion'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12.5)),
+            ...contenido.map((c) => Text('${c['sku']} · lote ${c['lote']} · vence ${c['vencimiento']} · ${_empaqueTxt(c['empaque'])} = ${_milesDespacho(c['unidades'])} UN',
+                style: const TextStyle(fontSize: 11, color: Color(0xFF475569)))),
+          ])),
+          if (abierto)
+            IconButton(icon: const Icon(Icons.delete_outline, color: Color(0xFFDC2626)), onPressed: () => _quitarLpnDespacho('${l['lpn']}')),
+        ]),
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: () => _abrirDespacho(cab['id']),
+      child: ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 86), children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(10)),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              IconButton(icon: const Icon(Icons.arrow_back, color: Colors.white), onPressed: _volverListaDespachos),
+              Expanded(child: Text('${cab['numero']} · ${cab['destino']}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 14))),
+              Text('${cab['estado']}', style: TextStyle(color: abierto ? const Color(0xFF67E8F9) : const Color(0xFF94A3B8), fontWeight: FontWeight.bold, fontSize: 11)),
+            ]),
+            Text('${cab['referencia'] ?? 'Sin referencia'}${cab['contenedor'] != null ? ' · contenedor ${cab['contenedor']}' : ''}',
+                style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 11.5)),
+            const SizedBox(height: 8),
+            if (ped > 0) LinearProgressIndicator(value: (un / ped).clamp(0, 1).toDouble(), color: const Color(0xFF10B981), backgroundColor: const Color(0xFF334155)),
+            const SizedBox(height: 6),
+            Text('${tot['pallets']} pallets · ${_milesDespacho(tot['cajas'])} cajas · ${_milesDespacho(tot['displays'])} displays · ${_milesDespacho(un)} UN'
+                '${ped > 0 ? ' de ${_milesDespacho(ped)} (${(un * 100 / ped).floor()}%)' : ''}',
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
+          ]),
+        ),
+        const SizedBox(height: 10),
+        if (abierto)
+          _TarjetaMovil(
+            child: Column(children: [
+              SizedBox(
+                width: double.infinity,
+                height: 54,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFBE185D), foregroundColor: Colors.white),
+                  onPressed: _ocupadoDespacho ? null : _camaraDespacho,
+                  icon: const Icon(Icons.qr_code_scanner_rounded),
+                  label: const Text('ESCANEAR LPN (CÁMARA)', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _txtScanDespacho,
+                focusNode: _focoScanDespacho,
+                textCapitalization: TextCapitalization.characters,
+                inputFormatters: [UpperCaseTextFormatter()],
+                onSubmitted: (_) => _escanearDespacho(),
+                decoration: InputDecoration(
+                  labelText: 'LPN (pistola o escribir)',
+                  prefixIcon: const Icon(Icons.qr_code_2_rounded),
+                  suffixIcon: _ocupadoDespacho
+                      ? const Padding(padding: EdgeInsets.all(12), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)))
+                      : IconButton(icon: const Icon(Icons.send_rounded), onPressed: () => _escanearDespacho()),
+                ),
+              ),
+            ]),
+          ),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(child: ChoiceChip(label: Text('POR SKU (${skus.length})'), selected: !_verLpnsDespacho, onSelected: (_) => setState(() => _verLpnsDespacho = false))),
+          const SizedBox(width: 8),
+          Expanded(child: ChoiceChip(label: Text('LPN ESCANEADOS (${lpns.length})'), selected: _verLpnsDespacho, onSelected: (_) => setState(() => _verLpnsDespacho = true))),
+        ]),
+        const SizedBox(height: 8),
+        if (!_verLpnsDespacho) ...(skus.isEmpty ? <Widget>[const Text('El despacho no tiene pedido ni LPN todavía.', style: TextStyle(color: Color(0xFF64748B)))] : skus.map(tarjetaSku)),
+        if (_verLpnsDespacho) ...(lpns.isEmpty ? <Widget>[const Text('Todavía no se escanea ningún LPN.', style: TextStyle(color: Color(0xFF64748B)))] : lpns.map(tarjetaLpn)),
+      ]),
+    );
+  }
+
+  // ===================================================================
   // MÓDULO 13: CARGA DE CAMIÓN (script 40)
   // Patente/contenedor -> se anclan OT u OV -> se escanea cada pallet o bulto al subirlo.
   // Al cerrar la carga la OT sale de Santiago (EN_TRANSITO_CCP). Las OV solo quedan registradas.
@@ -11159,6 +11511,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       if (!_esBodegaConcepcion)
         {'indice': 12, 'titulo': 'PICKING OT (TRASLADOS)', 'subtitulo': 'OT a Concepción: foto de la fecha y pallets LPN', 'icono': Icons.move_up_rounded, 'color': const Color(0xFF6D28D9), 'fondo': const Color(0xFFF5F3FF)},
       {'indice': 13, 'titulo': 'CARGA DE CAMIÓN', 'subtitulo': 'Patente, OT/OV y pallets o bultos 1/10, 2/10...', 'icono': Icons.local_shipping_outlined, 'color': const Color(0xFF0E7490), 'fondo': const Color(0xFFECFEFF)},
+      {'indice': 14, 'titulo': 'DESPACHO EXPORTACIÓN', 'subtitulo': 'Escanear LPN (ej. Perú): cajas, displays, lote y fecha', 'icono': Icons.flight_takeoff_rounded, 'color': const Color(0xFFBE185D), 'fondo': const Color(0xFFFDF2F8)},
       {'indice': 8, 'titulo': 'AUDITORÍA PACKING Y LPN', 'subtitulo': 'Revisar Unidades/Lote/Venc y consolidar dentro de un LPN', 'icono': Icons.inventory_rounded, 'color': const Color(0xFF0F766E), 'fondo': const Color(0xFFF0FDFA)},
       {'indice': 7, 'titulo': 'CÍCLICO DIRIGIDO POR SKU', 'subtitulo': 'Auditar todas las ubicaciones de un SKU (1 click OK / 2 click Incidencia)', 'icono': Icons.track_changes_rounded, 'color': const Color(0xFF6D28D9), 'fondo': const Color(0xFFF5F3FF)},
       {'indice': 6, 'titulo': 'UBICACIONES VACÍAS', 'subtitulo': 'Auditoría de espacios libres y registro de hallazgos', 'icono': Icons.check_box_outline_blank_rounded, 'color': const Color(0xFF64748B), 'fondo': const Color(0xFFF1F5F9)},
@@ -12911,6 +13264,12 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             onTap: () => _abrirModulo(13, desdeDrawer: true),
           ),
           ListTile(
+            leading: const Icon(Icons.flight_takeoff_rounded, color: Color(0xFFBE185D)),
+            title: const Text('Despacho exportación', style: TextStyle(fontWeight: FontWeight.bold)),
+            selected: _tabActual == 14,
+            onTap: () => _abrirModulo(14, desdeDrawer: true),
+          ),
+          ListTile(
             leading: const Icon(Icons.inventory_rounded, color: Color(0xFF0F766E)),
             title: const Text('Auditoría Packing y LPN', style: TextStyle(color: Color(0xFF0F766E), fontWeight: FontWeight.bold)),
             onTap: () => _abrirModulo(8, desdeDrawer: true),
@@ -12990,6 +13349,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       case 11: return _construirVistaConsultaStock();
       case 12: return _construirVistaPickingOt();
       case 13: return _construirVistaCargaCamion();
+      case 14: return _construirVistaDespacho();
       default: return _construirMenuCentral();
     }
   }
@@ -13016,6 +13376,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         // Carga de camión: de la carga abierta vuelve a la lista de cargas
         if (!_mostrarMenuCentral && _tabActual == 13 && _cargaActiva != null) {
           _volverListaCargas();
+          return false;
+        }
+        // Despacho exportación: del despacho abierto vuelve a la lista
+        if (!_mostrarMenuCentral && _tabActual == 14 && _despachoActivo != null) {
+          _volverListaDespachos();
           return false;
         }
         // 2. Si está dentro de cualquier módulo, regresar al Menú Principal sin perder datos
