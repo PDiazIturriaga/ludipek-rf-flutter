@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.25.3';
+const String kVersionApp = '2026.11.26.1';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -10307,7 +10307,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
   Future<void> _agregarOrdenCarga() async {
     final num = _txtOrdenCarga.text.trim();
     if (num.isEmpty) {
-      _notificar('Escriba o escanee el número de la OT u OV.', color: Colors.orange);
+      _notificar('Escriba o escanee el número de la OT, OV o despacho EXP.', color: Colors.orange);
       return;
     }
     final r = await _accionCarga('wms_carga_agregar_orden', {'p_carga_id': _cargaActiva!['id'], 'p_numero': num});
@@ -10424,7 +10424,11 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
       ),
     );
     if (ok != true) return;
-    final r = await _accionCarga('wms_carga_quitar_orden', {'p_carga_id': _cargaActiva!['id'], 'p_orden_id': orden['orden_id']});
+    final r = await _accionCarga('wms_carga_quitar_orden', {
+      'p_carga_id': _cargaActiva!['id'],
+      'p_orden_id': orden['orden_id'],
+      if (orden['despacho_id'] != null) 'p_despacho_id': orden['despacho_id'],   // despacho de exportación (EXP-...)
+    });
     if (r != null && mounted) setState(() => _cargaActiva = r);
   }
 
@@ -10614,7 +10618,7 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
             Expanded(child: TextField(
               controller: _txtOrdenCarga, textCapitalization: TextCapitalization.characters,
               inputFormatters: [UpperCaseTextFormatter()], onSubmitted: (_) => _agregarOrdenCarga(),
-              decoration: const InputDecoration(labelText: 'Agregar OT u OV', hintText: 'OT-CCP-0102 o 133409'),
+              decoration: const InputDecoration(labelText: 'Agregar OT, OV o despacho EXP', hintText: 'OT-CCP-0102, 133409 o EXP-261125-134757'),
             )),
             const SizedBox(width: 8),
             ElevatedButton(onPressed: _ocupadoCarga ? null : _agregarOrdenCarga, child: const Text('AGREGAR')),
@@ -10623,14 +10627,15 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
         ...ordenes.map((o) {
           final items = ((o['items'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
           final esOt = (o['tipo'] ?? '') == 'OT';
+          final esExp = (o['tipo'] ?? '') == 'EXP';
           return Padding(
             padding: const EdgeInsets.only(top: 10),
             child: _TarjetaMovil(
-              borderColor: esOt ? const Color(0xFFC4B5FD) : const Color(0xFFBAE6FD),
+              borderColor: esExp ? const Color(0xFFFED7AA) : (esOt ? const Color(0xFFC4B5FD) : const Color(0xFFBAE6FD)),
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Row(children: [
-                  Icon(esOt ? Icons.move_up_rounded : Icons.receipt_long_outlined,
-                      color: esOt ? const Color(0xFF6D28D9) : const Color(0xFF0369A1), size: 20),
+                  Icon(esExp ? Icons.flight_takeoff_rounded : (esOt ? Icons.move_up_rounded : Icons.receipt_long_outlined),
+                      color: esExp ? const Color(0xFFC2410C) : (esOt ? const Color(0xFF6D28D9) : const Color(0xFF0369A1)), size: 20),
                   const SizedBox(width: 6),
                   Expanded(child: Text('${o['numero_ov']} · ${o['cargados']}/${o['total']}',
                       style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 14.5))),
