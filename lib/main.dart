@@ -186,7 +186,7 @@ const bool kDescontarStockAlPickear = true;
 
 /// Versión de esta app (AAAA.MM.DD). Debe ser >= wms_config.version_minima_rf (script 12);
 /// si no, la app pide recargar para que nadie trabaje con una versión antigua.
-const String kVersionApp = '2026.11.26.1';
+const String kVersionApp = '2026.11.27.1';
 
 /// Devuelve la versión mínima exigida por el servidor, o null si no se pudo consultar.
 Future<String?> versionMinimaServidor() async {
@@ -2662,6 +2662,45 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
     final ocupadasRojo = registros.where((r) => (r as Map)['resultado_auditoria'].toString().startsWith('OCUPADA')).length;
     final sinRevisar = registros.where((r) => (r as Map)['resultado_auditoria'] == 'SIN_REVISAR').length;
 
+    // Resumen tipo tabla dinámica: resultado de la auditoría x tipo de ubicación
+    String tipoUbic(String u) {
+      final c = u.toUpperCase().trim();
+      if (RegExp(r'^(MK|ME|BE)-\d{2}-\d{2}$').hasMatch(c) || c.startsWith('ZONA-')) return 'ARENA';
+      if (RegExp(r'^[A-Z]-\d{2}-01$').hasMatch(c)) return 'PICKING';
+      return 'RESERVA';
+    }
+    String grupoRes(String r) =>
+        r == 'CONFIRMADA_VACIA' ? 'OK' : (r.startsWith('OCUPADA') ? 'DESCUADRE' : 'SIN_REVISAR');
+    const tiposUbic = ['PICKING', 'RESERVA', 'ARENA'];
+    const gruposRes = ['OK', 'DESCUADRE', 'SIN_REVISAR'];
+    final cuenta = <String, int>{};
+    for (final raw in registros) {
+      final r = raw as Map;
+      final k = '${grupoRes(r['resultado_auditoria'].toString())}|${tipoUbic(r['codigo_ubicacion'].toString())}';
+      cuenta[k] = (cuenta[k] ?? 0) + 1;
+    }
+    int nRes(String g, String t) => cuenta['$g|$t'] ?? 0;
+    int totRes(String g) => tiposUbic.fold(0, (a, t) => a + nRes(g, t));
+    int totTipo(String t) => gruposRes.fold(0, (a, g) => a + nRes(g, t));
+    final revisadas = totRes('OK') + totRes('DESCUADRE');
+    String pctDe(int a, int b) => b == 0 ? '-' : '${(a * 100 / b).round()}%';
+    List<String> filaRes(String nombre, String g, {bool conPct = true}) => [
+          nombre,
+          for (final t in tiposUbic) '${nRes(g, t)}',
+          '${totRes(g)}',
+          conPct ? pctDe(totRes(g), revisadas) : '-',
+        ];
+    final filasResumen = <List<String>>[
+      filaRes('Ubi OK (vacía confirmada)', 'OK'),
+      filaRes('Ubi con descuadre (ocupada sin registro)', 'DESCUADRE'),
+      filaRes('Sin revisar', 'SIN_REVISAR', conPct: false),
+      ['Ubi totales', for (final t in tiposUbic) '${totTipo(t)}', '${registros.length}', ''],
+    ];
+    final revReserva = nRes('OK', 'RESERVA') + nRes('DESCUADRE', 'RESERVA');
+    final notaResumen = 'Revisadas: $revisadas de ${registros.length}. '
+        'Descuadre en reserva: ${nRes('DESCUADRE', 'RESERVA')} de $revReserva revisadas (${pctDe(nRes('DESCUADRE', 'RESERVA'), revReserva)}). '
+        'Picking con producto sin registro: ${nRes('DESCUADRE', 'PICKING')} (revisar bajadas a picking no escaneadas).';
+
     doc.addPage(
       pw.MultiPage(
         pageFormat: PdfPageFormat.a4,
@@ -2697,6 +2736,34 @@ class _TerminalRfScreenState extends State<TerminalRfScreen> {
               ),
             ),
             pw.SizedBox(height: 14),
+            pw.Text('RESUMEN DE LA AUDITORÍA', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('#0F172A'))),
+            pw.SizedBox(height: 6),
+            pw.TableHelper.fromTextArray(
+              headers: ['Resultado', 'Picking (nivel 01)', 'Reserva', 'Arena / zonas', 'Total', '% s/ revisadas'],
+              data: filasResumen,
+              headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white, fontSize: 9),
+              headerDecoration: pw.BoxDecoration(color: PdfColor.fromHex('#0F172A')),
+              cellStyle: const pw.TextStyle(fontSize: 9.5),
+              cellAlignments: {
+                1: pw.Alignment.centerRight, 2: pw.Alignment.centerRight, 3: pw.Alignment.centerRight,
+                4: pw.Alignment.centerRight, 5: pw.Alignment.centerRight,
+              },
+              columnWidths: {
+                0: const pw.FlexColumnWidth(2.8), 1: const pw.FlexColumnWidth(1.2), 2: const pw.FlexColumnWidth(1),
+                3: const pw.FlexColumnWidth(1.1), 4: const pw.FlexColumnWidth(0.8), 5: const pw.FlexColumnWidth(1.1),
+              },
+              cellDecoration: (index, data, rowNum) {
+                if (rowNum == 2) return pw.BoxDecoration(color: PdfColor.fromHex('#FEE2E2'));
+                if (rowNum == 1) return pw.BoxDecoration(color: PdfColor.fromHex('#DCFCE7'));
+                if (rowNum == 4) return pw.BoxDecoration(color: PdfColor.fromHex('#E2E8F0'));
+                return const pw.BoxDecoration();
+              },
+            ),
+            pw.SizedBox(height: 4),
+            pw.Text(notaResumen, style: const pw.TextStyle(fontSize: 8.5, color: PdfColors.grey800)),
+            pw.SizedBox(height: 14),
+            pw.Text('DETALLE POR UBICACIÓN', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 11, color: PdfColor.fromHex('#0F172A'))),
+            pw.SizedBox(height: 6),
             pw.TableHelper.fromTextArray(
               headers: ['Pasillo', 'Ubicación', 'Estado Sistema', 'Resultado Auditoría / Detalle', 'Auditor'],
               headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white, fontSize: 9),
